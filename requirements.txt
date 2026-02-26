@@ -1,0 +1,2 @@
+# El superbot usa solo librerias de Python incluidas por defecto
+# No necesita instalar nada externo
