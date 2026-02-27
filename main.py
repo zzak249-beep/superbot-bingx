@@ -46,22 +46,31 @@ TF         = os.environ.get("TIMEFRAME",  "5m")
 HTF1       = os.environ.get("HTF1",       "15m")
 HTF2       = os.environ.get("HTF2",       "1h")
 POLL_SECS  = int(os.environ.get("POLL_SECONDS",  "60"))
-# Telegram leído en tiempo real (no en import) para captar sync de main.py
-def _tg_token():   return os.environ.get("TELEGRAM_BOT_TOKEN", "") or os.environ.get("TG_TOKEN", "")
-def _tg_chat_id(): return os.environ.get("TELEGRAM_CHAT_ID", "")   or os.environ.get("TG_CHAT_ID", "")
+
+# Telegram — acepta múltiples nombres de variable
+def _tg_token():   return (os.environ.get("TELEGRAM_BOT_TOKEN", "") or
+                            os.environ.get("TG_TOKEN", "") or
+                            os.environ.get("BOT_TOKEN", ""))
+def _tg_chat_id(): return (os.environ.get("TELEGRAM_CHAT_ID", "") or
+                            os.environ.get("TG_CHAT_ID", "") or
+                            os.environ.get("CHAT_ID", ""))
 
 _bl = os.environ.get("BLACKLIST", "")
 BLACKLIST: List[str] = [s.strip() for s in _bl.split(",") if s.strip()]
 
-FIXED_USDT       = float(os.environ.get("FIXED_USDT",       "10.0"))
-MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",    "10"))
+# Acepta FIXED_USDT o USDT_PER_TRADE
+FIXED_USDT       = float(os.environ.get("FIXED_USDT",       os.environ.get("USDT_PER_TRADE",    "10.0")))
+# Acepta MAX_OPEN_TRADES o MAX_POSITIONS
+MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",    os.environ.get("MAX_POSITIONS",     "150")))
 MIN_SCORE        = int(os.environ.get("MIN_SCORE",          "5"))
 CB_DD            = float(os.environ.get("MAX_DRAWDOWN",     "15.0"))
-DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", "8.0"))
+DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", os.environ.get("MAX_DAILY_LOSS",    "8.0")))
 COOLDOWN_MIN     = int(os.environ.get("COOLDOWN_MIN",       "20"))
 MAX_SPREAD_PCT   = float(os.environ.get("MAX_SPREAD_PCT",   "1.0"))
-MIN_VOLUME_USDT  = float(os.environ.get("MIN_VOLUME_USDT",  "10000"))
-TOP_N_SYMBOLS    = int(os.environ.get("TOP_N_SYMBOLS",      "500"))
+# Volumen mínimo bajo para captar más monedas
+MIN_VOLUME_USDT  = float(os.environ.get("MIN_VOLUME_USDT",  os.environ.get("MIN_VOLUME_USDT",   "100")))
+# Sin límite práctico de símbolos — analiza todo BingX
+TOP_N_SYMBOLS    = int(os.environ.get("TOP_N_SYMBOLS",      "9999"))
 BTC_FILTER       = os.environ.get("BTC_FILTER", "true").lower() == "true"
 
 # Indicadores
@@ -154,7 +163,7 @@ class BotState:
         return (self.wins / t * 100) if t else 0.0
     def profit_factor(self):
         return (self.gross_profit / self.gross_loss) if self.gross_loss else 0.0
-    def score_bar(self, score, mx=12):
+    def score_bar(self, score, mx=15):
         return "█" * min(score, mx) + "░" * (mx - min(score, mx))
     def cb_active(self):
         if self.peak_equity <= 0: return False
@@ -196,7 +205,34 @@ def log_csv(action, t, price, pnl=0.0):
 # ══════════════════════════════════════════════════════════
 # TELEGRAM — MENSAJES COMPLETOS
 # ══════════════════════════════════════════════════════════
-def tg(msg: str, parse_mode="HTML"):
+def tg_test():
+    """Prueba Telegram al arranque y loguea el resultado detallado."""
+    token   = _tg_token()
+    chat_id = _tg_chat_id()
+    if not token:
+        log.error("❌ TELEGRAM: No se encontró token. Configura TELEGRAM_BOT_TOKEN en Railway Variables.")
+        return False
+    if not chat_id:
+        log.error("❌ TELEGRAM: No se encontró chat_id. Configura TELEGRAM_CHAT_ID en Railway Variables.")
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": "🤖 <b>SATY v11 — Telegram OK ✅</b>", "parse_mode": "HTML"},
+            timeout=15
+        )
+        if r.ok:
+            log.info("✅ TELEGRAM: Conexión OK — mensajes funcionando")
+            return True
+        else:
+            log.error(f"❌ TELEGRAM: Error {r.status_code} — {r.text[:300]}")
+            log.error("   Verifica que el token sea correcto y el bot no esté bloqueado")
+            return False
+    except Exception as e:
+        log.error(f"❌ TELEGRAM: Excepción — {e}")
+        return False
+
+
     token   = _tg_token()
     chat_id = _tg_chat_id()
     if not token or not chat_id:
@@ -235,7 +271,7 @@ def tg_startup(balance: float, n: int):
         f"💰 Balance: <b>${balance:.2f} USDT</b>\n"
         f"📊 Universo: <b>{n} pares</b> BingX\n"
         f"⏱ TF: {TF} · {HTF1} · {HTF2}\n"
-        f"🎯 Score mín: {MIN_SCORE}/12\n"
+        f"🎯 Score mín: {MIN_SCORE}/15\n"
         f"📈 Max trades: {MAX_OPEN_TRADES}\n"
         f"💵 Por trade: ${FIXED_USDT:.0f} USDT\n"
         f"🛡 Circuit Breaker: -{CB_DD}%\n"
@@ -262,7 +298,7 @@ def tg_signal(t: TradeState, row: pd.Series):
     tg(
         f"{emoji} <b>{accion} — {t.symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 Score: <b>{t.entry_score}/12</b>  {state.score_bar(t.entry_score)}\n"
+        f"🎯 Score: <b>{t.entry_score}/15</b>  {state.score_bar(t.entry_score)}\n"
         f"💵 Entrada: <code>{t.entry_price:.6g}</code>\n"
         f"🟡 TP1 (50%): <code>{t.tp1_price:.6g}</code>  +{tp1_pct:.2f}%  R:R 1:{rr1:.1f}\n"
         f"🟢 TP2 (50%): <code>{t.tp2_price:.6g}</code>  +{tp2_pct:.2f}%  R:R 1:{rr2:.1f}\n"
@@ -296,11 +332,12 @@ def tg_tp1_be(t: TradeState, price: float, pnl_est: float):
 
 # ── Trailing activo ──────────────────────────────────────
 def tg_trail_phase(t: TradeState, phase: str, price: float, retrace: float, trail_m: float):
-    icons = {"normal": "🏃", "tight": "⚡", "locked": "🔒"}
+    icons = {"trending": "🚀", "normal": "🏃", "tight": "⚡", "locked": "🔒"}
     desc  = {
-        "normal": "Siguiendo el precio",
-        "tight":  "Precio lateral — trailing apretado",
-        "locked": "Retroceso fuerte — bloqueando ganancias"
+        "trending": "Tendencia activa — dejando correr el trade",
+        "normal":   "Siguiendo el precio",
+        "tight":    "Precio lateral — trailing apretado",
+        "locked":   "Retroceso fuerte — bloqueando ganancias"
     }
     tg(
         f"{icons.get(phase,'⚡')} <b>TRAILING {phase.upper()}</b> — {t.symbol}\n"
@@ -334,7 +371,7 @@ def tg_close(reason: str, t: TradeState, exit_p: float, pnl: float):
     tg(
         f"{emoji} <b>TRADE CERRADO — {t.symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 {t.side.upper()} | Score: {t.entry_score}/12 | {reason}\n"
+        f"📋 {t.side.upper()} | Score: {t.entry_score}/15 | {reason}\n"
         f"🚪 Entrada: <code>{t.entry_price:.6g}</code>\n"
         f"🚪 Salida:  <code>{exit_p:.6g}</code>\n"
         f"{'📈' if win else '📉'} Resultado: <b>{pct:+.2f}%</b>  ${pnl:+.2f}{duracion}\n"
@@ -359,8 +396,8 @@ def tg_rsi_alert(symbol: str, rsi_v: float, ls: int, ss: int, price: float):
         f"📊 {rsi_zone_label(rsi_v)}\n"
         f"💵 Precio: <code>{price:.6g}</code>\n"
         f"{direction}\n"
-        f"🎯 Score LONG: {ls}/12  {state.score_bar(ls)}\n"
-        f"🎯 Score SHORT: {ss}/12  {state.score_bar(ss)}\n"
+        f"🎯 Score LONG: {ls}/15  {state.score_bar(ls)}\n"
+        f"🎯 Score SHORT: {ss}/15  {state.score_bar(ss)}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"ℹ️ Solo alerta — no es entrada automática\n"
         f"⏰ {utcnow()}"
@@ -406,7 +443,7 @@ def tg_summary(new_signals: list, n_scanned: int):
     top = "\n".join(
         f"  {'🟢' if s['side']=='long' else '🔴'} {s['symbol']} "
         f"{'LONG' if s['side']=='long' else 'SHORT'} "
-        f"Score:{s['score']}/12 RSI:{s['rsi']:.0f}"
+        f"Score:{s['score']}/15 RSI:{s['rsi']:.0f}"
         for s in new_signals[:5]
     ) or "  (ninguna)"
 
@@ -604,6 +641,27 @@ def compute(df):
         (h > h.shift(1)) & (h.shift(1) > h.shift(2)) &
         (r < r.shift(1)) & (r.shift(1) < r.shift(2)) & (r > 58)
     )
+
+    # ── Estructura de tendencia HH/HL y LL/LH ─────────────
+    pivot_hi = h.rolling(5, center=True).max() == h
+    pivot_lo = l.rolling(5, center=True).min() == l
+    ph = h.where(pivot_hi).ffill()
+    pl = l.where(pivot_lo).ffill()
+    ph_prev = ph.shift(1)
+    pl_prev = pl.shift(1)
+    df["trend_up"]   = (ph > ph_prev) & (pl > pl_prev)   # HH + HL = tendencia alcista
+    df["trend_down"] = (ph < ph_prev) & (pl < pl_prev)   # LH + LL = tendencia bajista
+
+    # ── Breakout de resistencia/soporte con volumen ────────
+    resist = h.rolling(20).max().shift(1)
+    supprt = l.rolling(20).min().shift(1)
+    df["breakout_up"]   = (c > resist) & (v > df["vol_ma"] * 1.5)   # cierre sobre max20 con volumen
+    df["breakout_down"] = (c < supprt) & (v > df["vol_ma"] * 1.5)   # cierre bajo min20 con volumen
+
+    # ── Momentum sostenido (3 velas consecutivas en dirección) ─
+    df["momentum_up"]   = (c > c.shift(1)) & (c.shift(1) > c.shift(2)) & (c.shift(2) > c.shift(3))
+    df["momentum_down"] = (c < c.shift(1)) & (c.shift(1) < c.shift(2)) & (c.shift(2) < c.shift(3))
+
     return df
 
 def htf_bias(df):
@@ -617,11 +675,12 @@ def htf2_macro(df):
             bool(row["close"] < row["ema48"] and row["ema48"] < row["ema200"]))
 
 # ══════════════════════════════════════════════════════════
-# SCORE 12 PUNTOS
+# SCORE 15 PUNTOS (ampliado con tendencia y breakouts)
 # ══════════════════════════════════════════════════════════
 def confluence_score(row, htf1_bull, htf1_bear, htf2_bull, htf2_bear):
     rsi_v = float(row["rsi"])
     ls = sum([
+        # Originales (12)
         bool(row["close"] > row["ema48"] and row["ema8"] > row["ema21"]),
         bool(row["osc_up"]),
         htf1_bull, htf2_bull,
@@ -633,8 +692,13 @@ def confluence_score(row, htf1_bull, htf1_bear, htf2_bull, htf2_bear):
         bool(row["stoch_bull"] or (row["stoch_k"] > row["stoch_d"] and row["stoch_k"] < 75)),
         rsi_extreme_long(rsi_v),
         bool(row["bull_engulf"] or row["bull_div"]),
+        # Nuevos: tendencia estructural, breakout, momentum (+3)
+        bool(row["trend_up"]),
+        bool(row["breakout_up"]),
+        bool(row["momentum_up"]),
     ])
     ss = sum([
+        # Originales (12)
         bool(row["close"] < row["ema48"] and row["ema8"] < row["ema21"]),
         bool(row["osc_dn"]),
         htf1_bear, htf2_bear,
@@ -646,6 +710,10 @@ def confluence_score(row, htf1_bull, htf1_bear, htf2_bull, htf2_bear):
         bool(row["stoch_bear"] or (row["stoch_k"] < row["stoch_d"] and row["stoch_k"] > 25)),
         rsi_extreme_short(rsi_v),
         bool(row["bear_engulf"] or row["bear_div"]),
+        # Nuevos: tendencia estructural, breakout, momentum (+3)
+        bool(row["trend_down"]),
+        bool(row["breakout_down"]),
+        bool(row["momentum_down"]),
     ])
     return ls, ss
 
@@ -795,7 +863,7 @@ def open_trade(ex, symbol, base, side, score, row):
             log.warning(f"[{symbol}] amount inválido: {amount:.6f}")
             return None
 
-        log.info(f"[OPEN] {symbol} {side.upper()} score={score}/12 ${usdt:.1f} @ {price:.6g}")
+        log.info(f"[OPEN] {symbol} {side.upper()} score={score}/15 ${usdt:.1f} @ {price:.6g}")
         order       = ex.create_order(symbol, "market", side, amount, params=entry_params(side))
         entry_price = float(order.get("average") or price)
         trade_side  = "long" if side == "buy" else "short"
@@ -893,17 +961,57 @@ def close_trade(ex, symbol, reason, price):
     del state.trades[symbol]
 
 # ══════════════════════════════════════════════════════════
-# GESTIÓN DEL TRADE
+# GESTIÓN DEL TRADE — Trailing inteligente por tendencia
 # ══════════════════════════════════════════════════════════
+def _trend_still_alive(t: TradeState, row) -> bool:
+    """Devuelve True si la tendencia del trade sigue activa — no cerrar todavía."""
+    try:
+        if t.side == "long":
+            return (bool(row["trend_up"]) or bool(row["momentum_up"]) or
+                    (float(row["adx"]) > ADX_MIN and float(row["dip"]) > float(row["dim"])) or
+                    bool(row["macd_bull"]))
+        else:
+            return (bool(row["trend_down"]) or bool(row["momentum_down"]) or
+                    (float(row["adx"]) > ADX_MIN and float(row["dim"]) > float(row["dip"])) or
+                    bool(row["macd_bear"]))
+    except Exception:
+        return False
+
+def _exhaustion_score(t: TradeState, row, rsi_v: float, adx_v: float, vol_ratio: float) -> int:
+    """Cuenta señales de agotamiento. >=4 de 8 = cerrar."""
+    if t.side == "long":
+        return sum([
+            bool(row["macd_bear"]),
+            bool(row["macd_cross_down"]),
+            adx_v < ADX_MIN,
+            vol_ratio < 0.6,
+            bool(row["bear_div"]),
+            bool(row["osc_dn"]),
+            rsi_v > 75,
+            bool(row["trend_down"]),          # estructura rota
+        ])
+    else:
+        return sum([
+            bool(row["macd_bull"]),
+            bool(row["macd_cross_up"]),
+            adx_v < ADX_MIN,
+            vol_ratio < 0.6,
+            bool(row["bull_div"]),
+            bool(row["osc_up"]),
+            rsi_v < 25,
+            bool(row["trend_up"]),            # estructura rota
+        ])
+
 def manage_trade(ex, symbol, live_price, atr_v, long_score, short_score, live_pos, result=None):
     if symbol not in state.trades: return
     t = state.trades[symbol]
 
-    # Cerrado externamente (TP2 o SL ejecutado por BingX)
+    # ── Cerrado externamente (TP2 o SL ejecutado por BingX) ──
     if live_pos is None:
-        pnl = ((live_price - t.entry_price) if t.side == "long" else (t.entry_price - live_price)) * t.contracts
+        pnl = ((live_price - t.entry_price) if t.side == "long"
+               else (t.entry_price - live_price)) * t.contracts
         reason = ("TP2 ALCANZADO"
-                  if (t.side=="long" and live_price >= t.tp2_price) or
+                  if (t.side=="long"  and live_price >= t.tp2_price) or
                      (t.side=="short" and live_price <= t.tp2_price)
                   else "SL ALCANZADO")
         if pnl > 0: state.wins += 1; state.gross_profit += pnl; state.consec_losses = 0
@@ -914,38 +1022,18 @@ def manage_trade(ex, symbol, live_price, atr_v, long_score, short_score, live_po
         tg_close(reason, t, live_price, pnl)
         del state.trades[symbol]; return
 
-    # Cierre por pérdida dinámica (pre-TP1)
+    # ── Cierre rápido por pérdida dinámica (pre-TP1) ──────
     if not t.tp1_hit:
         atr_now   = atr_v if atr_v > 0 else t.atr_entry
-        loss_dist = (t.entry_price - live_price if t.side == "long" else live_price - t.entry_price)
+        loss_dist = (t.entry_price - live_price if t.side == "long"
+                     else live_price - t.entry_price)
         if loss_dist >= atr_now * 0.8:
             close_trade(ex, symbol, "PÉRDIDA DINÁMICA (0.8×ATR)", live_price); return
 
-    # Cierre por agotamiento (en ganancia)
-    if result and symbol in state.trades:
-        row = result["row"]
-        try:
-            in_profit = (t.side == "long" and live_price > t.entry_price) or \
-                        (t.side == "short" and live_price < t.entry_price)
-            if in_profit:
-                rsi_v     = float(row["rsi"])
-                adx_v     = float(row["adx"])
-                vol_ratio = float(row["volume"]) / max(float(row["vol_ma"]), 1)
-                if t.side == "long":
-                    exh = sum([bool(row["macd_bear"]), adx_v < 20, vol_ratio < 0.7,
-                               bool(row["bear_div"]), bool(row["osc_dn"]), rsi_v > 72])
-                else:
-                    exh = sum([bool(row["macd_bull"]), adx_v < 20, vol_ratio < 0.7,
-                               bool(row["bull_div"]), bool(row["osc_up"]), rsi_v < 28])
-                if exh >= 3:
-                    close_trade(ex, symbol, f"AGOTAMIENTO ({exh}/6 señales)", live_price); return
-        except Exception as e:
-            log.debug(f"[{symbol}] agotamiento: {e}")
-
-    # TP1 → Break-even
+    # ── TP1 → mover SL a break-even ──────────────────────
     if not t.tp1_hit:
-        hit = (t.side == "long" and live_price >= t.tp1_price) or \
-              (t.side == "short" and live_price <= t.tp1_price)
+        hit = ((t.side == "long"  and live_price >= t.tp1_price) or
+               (t.side == "short" and live_price <= t.tp1_price))
         if hit:
             t.tp1_hit    = True
             t.peak_price = live_price
@@ -954,7 +1042,7 @@ def manage_trade(ex, symbol, live_price, atr_v, long_score, short_score, live_po
             move_be(ex, symbol)
             tg_tp1_be(t, live_price, pnl_est)
 
-    # Trailing dinámico (post TP1)
+    # ── Trailing inteligente post-TP1 ─────────────────────
     if t.tp1_hit and symbol in state.trades:
         atr_t = atr_v if atr_v > 0 else t.atr_entry
 
@@ -962,34 +1050,67 @@ def manage_trade(ex, symbol, live_price, atr_v, long_score, short_score, live_po
                    else (t.entry_price - live_price) / t.entry_price * 100)
         t.max_profit_pct = max(t.max_profit_pct, cur_pct)
 
-        new_peak = (live_price > t.peak_price if t.side == "long" else live_price < t.peak_price)
-        if new_peak: t.peak_price = live_price; t.stall_count = 0
-        else:        t.stall_count += 1
+        new_peak = (live_price > t.peak_price if t.side == "long"
+                    else live_price < t.peak_price)
+        if new_peak:
+            t.peak_price  = live_price
+            t.stall_count = 0
+        else:
+            t.stall_count += 1
 
         denom   = abs(t.peak_price - t.entry_price)
         retrace = ((t.peak_price - live_price) / max(denom, 1e-9) * 100 if t.side == "long"
                    else (live_price - t.peak_price) / max(denom, 1e-9) * 100)
 
-        prev_phase    = t.trail_phase
-        if retrace > 30:         t.trail_phase = "locked"
-        elif t.stall_count >= 3: t.trail_phase = "tight"
-        else:                    t.trail_phase = "normal"
+        # ── Determinar fase del trailing ──────────────────
+        # Si la tendencia sigue viva usamos trailing AMPLIO para no cerrar antes de tiempo
+        row  = result["row"] if result else None
+        alive = _trend_still_alive(t, row) if row is not None else False
 
-        trail_m = {"normal": 0.8, "tight": 0.4, "locked": 0.2}[t.trail_phase]
+        prev_phase = t.trail_phase
+        if retrace > 35:
+            t.trail_phase = "locked"           # retroceso fuerte → proteger
+        elif alive and t.stall_count < 5:
+            t.trail_phase = "trending"         # tendencia activa → dejar correr
+        elif t.stall_count >= 4:
+            t.trail_phase = "tight"            # lateral → apretamos
+        else:
+            t.trail_phase = "normal"
+
+        # Multiplicador ATR por fase — trending es el más amplio (deja correr)
+        trail_m = {
+            "trending": 1.8,   # muy amplio mientras hay tendencia
+            "normal":   0.8,
+            "tight":    0.4,
+            "locked":   0.2,
+        }[t.trail_phase]
 
         if t.trail_phase != prev_phase:
             tg_trail_phase(t, t.trail_phase, live_price, retrace, trail_m)
 
+        # ── Agotamiento: solo cerrar si NO hay tendencia activa ─
+        if row is not None and not alive:
+            try:
+                rsi_v     = float(row["rsi"])
+                adx_v     = float(row["adx"])
+                vol_ratio = float(row["volume"]) / max(float(row["vol_ma"]), 1)
+                exh = _exhaustion_score(t, row, rsi_v, adx_v, vol_ratio)
+                if exh >= 4:
+                    close_trade(ex, symbol, f"AGOTAMIENTO ({exh}/8 señales)", live_price); return
+            except Exception as e:
+                log.debug(f"[{symbol}] agotamiento: {e}")
+
+        # ── Ejecutar trailing stop ─────────────────────────
         if t.side == "long":
             t.trail_high = max(t.trail_high, live_price)
             if live_price <= t.trail_high - atr_t * trail_m:
                 close_trade(ex, symbol, f"TRAILING {t.trail_phase.upper()}", live_price); return
         else:
-            t.trail_low = min(t.trail_low, live_price)
+            t.trail_low = min(t.trail_low if t.trail_low > 0 else live_price, live_price)
             if live_price >= t.trail_low + atr_t * trail_m:
                 close_trade(ex, symbol, f"TRAILING {t.trail_phase.upper()}", live_price); return
 
-    # Flip de señal
+    # ── Flip de señal ─────────────────────────────────────
     if symbol in state.trades:
         if t.side == "long"  and short_score >= MIN_SCORE + 2:
             close_trade(ex, symbol, f"FLIP SHORT (score {short_score})", live_price)
@@ -1043,6 +1164,9 @@ def main():
         log.error("BINGX_API_KEY y BINGX_API_SECRET no configuradas")
         tg_error("Bot no iniciado: faltan API Keys de BingX")
         sys.exit(1)
+
+    # Test Telegram al arranque
+    tg_test()
 
     ex = None
     for attempt in range(10):
