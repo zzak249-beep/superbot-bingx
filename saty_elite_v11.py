@@ -775,18 +775,51 @@ def open_trade(ex, symbol, base, side, score, row):
             log.warning(f"[{symbol}] spread {spread:.3f}% — skip")
             return None
 
-        price   = get_last_price(ex, symbol)
-        atr_v   = float(row["atr"])
-        usdt    = FIXED_USDT * state.risk_mult()
-        leverage = float(os.environ.get('LEVERAGE', '9'))
-        amount  = float(ex.amount_to_precision(symbol, usdt * leverage / price))
-        min_amt = get_min_amount(ex, symbol)
+        price    = get_last_price(ex, symbol)
+        atr_v    = float(row["atr"])
+        usdt     = FIXED_USDT * state.risk_mult()
+        leverage = float(os.environ.get('LEVERAGE', '10'))
 
-        if amount <= 0 or amount < min_amt or amount * price < 3:
-            log.warning(f"[{symbol}] amount inválido: {amount:.6f}")
+        # Obtener el tamaño de contrato real del mercado (BingX usa contractSize)
+        mkt           = ex.markets.get(symbol, {})
+        contract_size = float(mkt.get("contractSize", None) or
+                              mkt.get("info", {}).get("contractSize", None) or
+                              mkt.get("info", {}).get("multiplier", None) or 1.0)
+
+        # Notional total = FIXED_USDT * leverage
+        # contratos = notional / (precio * contractSize)
+        notional = usdt * leverage
+        raw_amt  = notional / (price * contract_size)
+        amount   = float(ex.amount_to_precision(symbol, raw_amt))
+        min_amt  = get_min_amount(ex, symbol)
+
+        log.info(
+            f"[SIZE] {symbol} | FIXED_USDT={usdt:.2f} | leverage={leverage} "
+            f"| notional=${notional:.2f} | price={price:.6g} "
+            f"| contractSize={contract_size} | raw={raw_amt:.6f} | amount={amount:.6f}"
+        )
+
+        if amount <= 0 or amount < min_amt or amount * price * contract_size < 3:
+            log.warning(
+                f"[{symbol}] amount inválido: {amount:.6f} "
+                f"(min={min_amt}, valor=${amount * price * contract_size:.2f})"
+            )
             return None
 
-        log.info(f"[OPEN] {symbol} {side.upper()} score={score}/12 ${usdt:.1f} @ {price:.6g}")
+        log.info(f"[OPEN] {symbol} {side.upper()} score={score}/12 ${usdt:.1f}×{leverage}=${notional:.0f} @ {price:.6g}")
+
+        # Aplicar apalancamiento en BingX para este par (requerido antes de la orden)
+        try:
+            lev_int = int(leverage)
+            if HEDGE_MODE:
+                ex.set_leverage(lev_int, symbol, params={"positionSide": "LONG"})
+                ex.set_leverage(lev_int, symbol, params={"positionSide": "SHORT"})
+            else:
+                ex.set_leverage(lev_int, symbol)
+            log.info(f"[LEVERAGE] {symbol} → {lev_int}×")
+        except Exception as e:
+            log.warning(f"[{symbol}] set_leverage: {e} (puede que ya esté configurado)")
+
         order       = ex.create_order(symbol, "market", side, amount, params=entry_params(side))
         entry_price = float(order.get("average") or price)
         trade_side  = "long" if side == "buy" else "short"
