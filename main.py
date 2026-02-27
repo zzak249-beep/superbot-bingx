@@ -1,20 +1,45 @@
 """
-╔══════════════════════════════════════════════════════════╗
-║          SATY ELITE v8 - CONFLUENCE ENGINE               ║
-║  Python Bot para BingX Futures + Telegram               ║
-║                                                          ║
-║  Features:                                               ║
-║  - Sistema de 8 puntos de confluencia (min 5/8)          ║
-║  - 3 Timeframes: 5m entrada / 15m HTF / 1h macro        ║
-║  - Partial TP: 50% en TP1, 50% trailing a TP2           ║
-║  - SL basado en estructura (swing high/low)              ║
-║  - Deteccion de regimen de mercado                       ║
-║  - Session filter (London + NY)                          ║
-║  - Risk dinamico por score y racha perdedora             ║
-║  - Circuit breaker + proteccion perdidas consecutivas    ║
-║  - Divergencia RSI                                       ║
-║  - Notificaciones Telegram completas                     ║
-╚══════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════╗
+║         SATY ELITE v8 - MULTI-SYMBOL CONFLUENCE ENGINE          ║
+║   Python Bot para BingX Futures + Telegram                       ║
+║                                                                  ║
+║  Features:                                                       ║
+║  - Escaneo de TODOS los pares USDT perpetuos de BingX            ║
+║  - Sistema de 8 puntos de confluencia (min configurable)         ║
+║  - 3 Timeframes: 5m entrada / 15m HTF / 1h macro                 ║
+║  - Partial TP: 50% en TP1, 50% trailing a TP2                    ║
+║  - SL basado en estructura (swing high/low)                      ║
+║  - Deteccion de regimen de mercado                               ║
+║  - Session filter (London + NY)                                  ║
+║  - Risk dinamico por score y racha perdedora                     ║
+║  - Circuit breaker + proteccion perdidas consecutivas            ║
+║  - Divergencia RSI                                               ║
+║  - Gestion de multiples posiciones simultaneas                   ║
+║  - Notificaciones Telegram completas                             ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Instalacion:
+    pip install ccxt pandas numpy requests
+
+Variables de entorno necesarias:
+    BINGX_API_KEY        - API Key de BingX
+    BINGX_API_SECRET     - API Secret de BingX
+    TELEGRAM_BOT_TOKEN   - Token del bot de Telegram
+    TELEGRAM_CHAT_ID     - Chat ID de Telegram
+
+Variables opcionales:
+    SYMBOL_FILTER        - Filtrar por moneda base, ej: "BTC,ETH,SOL" (vacío = todas)
+    BLACKLIST            - Pares excluidos, ej: "LUNA/USDT:USDT,FTT/USDT:USDT"
+    MAX_OPEN_TRADES      - Máximo de posiciones simultáneas (default: 3)
+    MIN_SCORE            - Score mínimo para entrar (default: 5)
+    BASE_RISK            - % del capital por operación (default: 2.0)
+    MAX_DRAWDOWN         - % máximo drawdown antes de circuit breaker (default: 15.0)
+    MIN_VOLUME_USDT      - Volumen mínimo 24h en USDT (default: 5000000)
+    POLL_SECONDS         - Segundos entre cada ciclo de escaneo (default: 60)
+    TIMEFRAME            - TF de entrada (default: 5m)
+    HTF1                 - Primer HTF (default: 15m)
+    HTF2                 - Segundo HTF / macro (default: 1h)
+    TOP_N_SYMBOLS        - Número máximo de pares a escanear (0 = todos, default: 50)
 """
 
 import os
@@ -26,7 +51,8 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Dict, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ══════════════════════════════════════════════════════════
 # LOGGING
@@ -36,14 +62,13 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler()]
 )
-log = logging.getLogger("saty_v8")
+log = logging.getLogger("saty_v8_multi")
 
 # ══════════════════════════════════════════════════════════
 # CONFIG - Variables de entorno
 # ══════════════════════════════════════════════════════════
 API_KEY    = os.environ.get("BINGX_API_KEY",    "")
 API_SECRET = os.environ.get("BINGX_API_SECRET", "")
-SYMBOL     = os.environ.get("SYMBOL",           "BTC/USDT:USDT")
 TF         = os.environ.get("TIMEFRAME",        "5m")
 HTF1       = os.environ.get("HTF1",             "15m")
 HTF2       = os.environ.get("HTF2",             "1h")
@@ -51,8 +76,21 @@ POLL_SECS  = int(os.environ.get("POLL_SECONDS", "60"))
 TG_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID",   "")
 
+# ── Filtros de universo ──
+_sym_filter  = os.environ.get("SYMBOL_FILTER", "")
+SYMBOL_FILTER: List[str] = [s.strip().upper() for s in _sym_filter.split(",") if s.strip()]
+
+_blacklist   = os.environ.get("BLACKLIST", "")
+BLACKLIST: List[str] = [s.strip() for s in _blacklist.split(",") if s.strip()]
+
+MIN_VOLUME_USDT = float(os.environ.get("MIN_VOLUME_USDT", "5000000"))  # 5M USDT/24h
+TOP_N_SYMBOLS   = int(os.environ.get("TOP_N_SYMBOLS", "50"))           # 0 = todos
+
+# ── Gestion de posiciones multiples ──
+MAX_OPEN_TRADES = int(os.environ.get("MAX_OPEN_TRADES", "3"))
+
 # ── Confluencia ──
-MIN_SCORE      = int(os.environ.get("MIN_SCORE",    "5"))   # 3-8
+MIN_SCORE       = int(os.environ.get("MIN_SCORE",    "5"))  # 3-8
 
 # ── Indicadores ──
 FAST_LEN       = 8
@@ -65,19 +103,19 @@ RSI_LEN        = 14
 ATR_LEN        = 14
 VOL_LEN        = 20
 OSC_LEN        = 3
-SWING_LB       = 8     # lookback para swing SL
+SWING_LB       = 8
 
 # ── Exits ──
-TP1_MULT       = 1.0   # TP1 = 1x ATR (cierra 50%)
-TP2_MULT       = 2.5   # TP2 = 2.5x ATR (cierra resto)
-SL_ATR         = 1.0   # SL base ATR
-USE_SWING_SL   = True  # SL basado en estructura
-TRAIL_MULT     = 1.0   # Trailing post-TP1
+TP1_MULT       = 1.0
+TP2_MULT       = 2.5
+SL_ATR         = 1.0
+USE_SWING_SL   = True
+TRAIL_MULT     = 1.0
 
 # ── Risk dinamico ──
-BASE_RISK      = float(os.environ.get("BASE_RISK",   "10.0"))  # % equity
-RISK_BOOST     = 1.5   # multiplicador si score >= 7
-RISK_CUT       = 0.5   # multiplicador tras perdidas consecutivas
+BASE_RISK      = float(os.environ.get("BASE_RISK",   "2.0"))  # % equity por trade
+RISK_BOOST     = 1.5
+RISK_CUT       = 0.5
 
 # ── Session ──
 USE_SESSION    = True
@@ -86,9 +124,9 @@ LONDON_CLOSE   = 16
 NY_OPEN        = 13
 NY_CLOSE       = 21
 
-# ── Proteccion ──
-USE_CB         = True
-CB_DD          = float(os.environ.get("MAX_DRAWDOWN", "15.0"))  # % drawdown max
+# ── Proteccion global ──
+USE_CB          = True
+CB_DD           = float(os.environ.get("MAX_DRAWDOWN", "15.0"))
 MAX_CONSEC_LOSS = 3
 
 
@@ -96,8 +134,24 @@ MAX_CONSEC_LOSS = 3
 # ESTADO DEL BOT
 # ══════════════════════════════════════════════════════════
 @dataclass
+class TradeState:
+    """Estado de una posicion abierta en un simbolo."""
+    symbol:       str   = ""
+    side:         str   = ""     # "long" | "short"
+    entry_price:  float = 0.0
+    tp1_price:    float = 0.0
+    tp2_price:    float = 0.0
+    sl_price:     float = 0.0
+    tp1_hit:      bool  = False
+    trail_high:   float = 0.0
+    trail_low:    float = 0.0
+    entry_score:  int   = 0
+    entry_time:   str   = ""
+
+
+@dataclass
 class BotState:
-    # Performance tracking
+    # Performance
     wins:          int   = 0
     losses:        int   = 0
     gross_profit:  float = 0.0
@@ -106,18 +160,11 @@ class BotState:
     peak_equity:   float = 0.0
     total_pnl:     float = 0.0
 
-    # Position tracking
-    in_trade:       bool  = False
-    trade_side:     str   = ""        # "long" | "short"
-    entry_price:    float = 0.0
-    tp1_hit:        bool  = False
-    trail_high:     float = 0.0
-    trail_low:      float = 0.0
-    tp1_price:      float = 0.0
-    tp2_price:      float = 0.0
-    sl_price:       float = 0.0
-    entry_score:    int   = 0
-    entry_time:     str   = ""
+    # Posiciones activas: symbol -> TradeState
+    trades: Dict[str, TradeState] = field(default_factory=dict)
+
+    def open_count(self) -> int:
+        return len(self.trades)
 
     def win_rate(self) -> float:
         total = self.wins + self.losses
@@ -127,14 +174,13 @@ class BotState:
         return (self.gross_profit / self.gross_loss) if self.gross_loss > 0 else 0.0
 
     def score_bar(self, score: int) -> str:
-        filled = "█" * score
-        empty  = "░" * (8 - score)
-        return filled + empty
+        return "█" * score + "░" * (8 - score)
 
     def cb_active(self) -> bool:
         if not USE_CB or self.peak_equity <= 0:
             return False
-        dd = (self.peak_equity - (self.peak_equity + self.total_pnl)) / self.peak_equity * 100
+        current = self.peak_equity + self.total_pnl
+        dd = (self.peak_equity - current) / self.peak_equity * 100
         return dd >= CB_DD
 
     def risk_mult(self, score: int) -> float:
@@ -164,97 +210,109 @@ def tg(msg: str):
         log.warning(f"Telegram error: {e}")
 
 
-def tg_startup(balance: float):
+def utcnow() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def tg_startup(balance: float, n_symbols: int):
+    filter_str = ", ".join(SYMBOL_FILTER) if SYMBOL_FILTER else "TODOS"
     tg(
-        f"<b>SATY ELITE v8 - INICIADO</b>\n"
-        f"══════════════════════\n"
-        f"📊 <b>Par:</b> {SYMBOL}\n"
+        f"<b>SATY ELITE v8 MULTI - INICIADO</b>\n"
+        f"══════════════════════════════\n"
+        f"🌍 <b>Universo:</b> {n_symbols} pares USDT perpetuos\n"
+        f"🔍 <b>Filtro base:</b> {filter_str}\n"
         f"⏱ <b>TF:</b> {TF} | <b>HTF1:</b> {HTF1} | <b>HTF2:</b> {HTF2}\n"
-        f"🎯 <b>Score min:</b> {MIN_SCORE}/8\n"
+        f"🎯 <b>Score min:</b> {MIN_SCORE}/8 | <b>Max trades:</b> {MAX_OPEN_TRADES}\n"
         f"💰 <b>Balance:</b> ${balance:.2f} USDT\n"
-        f"⚙️ <b>Risk base:</b> {BASE_RISK}% | <b>CB:</b> -{CB_DD}%\n"
-        f"🕐 <b>Sesion:</b> London {LONDON_OPEN}-{LONDON_CLOSE}h UTC | NY {NY_OPEN}-{NY_CLOSE}h UTC\n"
+        f"⚙️ <b>Risk/trade:</b> {BASE_RISK}% | <b>CB:</b> -{CB_DD}%\n"
+        f"📊 <b>Vol mínimo:</b> ${MIN_VOLUME_USDT/1e6:.1f}M USDT/24h\n"
         f"⏰ {utcnow()}"
     )
 
 
-def tg_signal(side: str, score: int, price: float, tp1: float, tp2: float,
-              sl: float, risk_pct: float, row: pd.Series):
-    emoji  = "🟢" if side == "long" else "🔴"
-    label  = "LONG" if side == "long" else "SHORT"
-    rr1    = abs(tp1 - price) / max(abs(sl - price), 0.0001)
-    rr2    = abs(tp2 - price) / max(abs(sl - price), 0.0001)
+def tg_signal(t: TradeState, risk_pct: float, row: pd.Series):
+    emoji = "🟢" if t.side == "long" else "🔴"
+    label = "LONG" if t.side == "long" else "SHORT"
+    rr1   = abs(t.tp1_price - t.entry_price) / max(abs(t.sl_price - t.entry_price), 1e-9)
+    rr2   = abs(t.tp2_price - t.entry_price) / max(abs(t.sl_price - t.entry_price), 1e-9)
     tg(
-        f"{emoji} <b>{label} ABIERTO</b> - {SYMBOL}\n"
-        f"══════════════════════\n"
-        f"🎯 <b>Score:</b> {score}/8 {state.score_bar(score)}\n"
-        f"💵 <b>Entrada:</b> <code>{price:.4f}</code>\n"
-        f"🟡 <b>TP1 (50%):</b> <code>{tp1:.4f}</code> (R:R 1:{rr1:.1f})\n"
-        f"🟢 <b>TP2 (50%):</b> <code>{tp2:.4f}</code> (R:R 1:{rr2:.1f})\n"
-        f"🛑 <b>SL:</b> <code>{sl:.4f}</code>\n"
-        f"══════════════════════\n"
+        f"{emoji} <b>{label} ABIERTO</b> — {t.symbol}\n"
+        f"══════════════════════════════\n"
+        f"🎯 <b>Score:</b> {t.entry_score}/8 {state.score_bar(t.entry_score)}\n"
+        f"💵 <b>Entrada:</b> <code>{t.entry_price:.6g}</code>\n"
+        f"🟡 <b>TP1 (50%):</b> <code>{t.tp1_price:.6g}</code> (R:R 1:{rr1:.1f})\n"
+        f"🟢 <b>TP2 (50%):</b> <code>{t.tp2_price:.6g}</code> (R:R 1:{rr2:.1f})\n"
+        f"🛑 <b>SL:</b> <code>{t.sl_price:.6g}</code>\n"
+        f"══════════════════════════════\n"
         f"📊 <b>ADX:</b> {row['adx']:.1f} | <b>RSI:</b> {row['rsi']:.1f}\n"
         f"📈 <b>Vol:</b> {row['volume']/row['vol_ma']:.2f}x | <b>OSC:</b> {row['osc']:.2f}\n"
-        f"💼 <b>Risk:</b> {risk_pct:.1f}% equity\n"
+        f"💼 <b>Risk:</b> {risk_pct:.1f}% | <b>Trades abiertos:</b> {state.open_count()}/{MAX_OPEN_TRADES}\n"
         f"⏰ {utcnow()}"
     )
 
 
-def tg_tp1(side: str, price: float, pnl: float):
+def tg_tp1(t: TradeState, price: float, pnl: float):
     tg(
-        f"🟡 <b>TP1 TOCADO</b> - 50% cerrado\n"
-        f"══════════════════════\n"
-        f"💵 <b>Precio:</b> <code>{price:.4f}</code>\n"
-        f"💰 <b>PnL parcial:</b> ${pnl:+.2f}\n"
+        f"🟡 <b>TP1 TOCADO</b> — {t.symbol}\n"
+        f"══════════════════════════════\n"
+        f"💵 <b>Precio:</b> <code>{price:.6g}</code>\n"
+        f"💰 <b>PnL parcial est.:</b> ${pnl:+.2f}\n"
         f"🔄 Trailing activo en el 50% restante\n"
         f"⏰ {utcnow()}"
     )
 
 
-def tg_close(reason: str, side: str, entry: float, exit_p: float, pnl: float, score: int):
+def tg_close(reason: str, t: TradeState, exit_p: float, pnl: float):
     emoji = "✅" if pnl > 0 else "❌"
     tg(
-        f"{emoji} <b>POSICION CERRADA</b> - {SYMBOL}\n"
-        f"══════════════════════\n"
-        f"📋 <b>Lado:</b> {side.upper()} | <b>Score entrada:</b> {score}/8\n"
-        f"📌 <b>Razon:</b> {reason}\n"
-        f"💵 <b>Entrada:</b> <code>{entry:.4f}</code>\n"
-        f"💵 <b>Salida:</b>  <code>{exit_p:.4f}</code>\n"
+        f"{emoji} <b>CERRADO</b> — {t.symbol}\n"
+        f"══════════════════════════════\n"
+        f"📋 <b>Lado:</b> {t.side.upper()} | <b>Score:</b> {t.entry_score}/8\n"
+        f"📌 <b>Razón:</b> {reason}\n"
+        f"💵 <b>Entrada:</b> <code>{t.entry_price:.6g}</code>\n"
+        f"💵 <b>Salida:</b>  <code>{exit_p:.6g}</code>\n"
         f"{'💰' if pnl > 0 else '💸'} <b>PnL:</b> ${pnl:+.2f}\n"
-        f"══════════════════════\n"
+        f"══════════════════════════════\n"
         f"📊 <b>W/L:</b> {state.wins}W / {state.losses}L | "
         f"<b>WR:</b> {state.win_rate():.1f}% | "
-        f"<b>PF:</b> {state.profit_factor():.2f}\n"
+        f"<b>PF:</b> {state.profit_factor():.2f} | "
+        f"<b>PnL total:</b> ${state.total_pnl:+.2f}\n"
         f"⏰ {utcnow()}"
     )
 
 
-def tg_scan(row: pd.Series, long_score: int, short_score: int,
-            htf1_bull: bool, htf2_bull: bool, session: bool):
-    regime = "TRENDING" if row["is_trending"] else "RANGING"
-    cb_str = f"ACTIVO -{CB_DD}%" if state.cb_active() else "OK"
+def tg_scan_summary(signals: List[dict], scanned: int, session: bool):
+    """Resumen periódico del escaneo de todos los pares."""
+    cb_str   = f"⛔ ACTIVO -{CB_DD}%" if state.cb_active() else "✅ OK"
+    open_str = "\n".join(
+        f"  • {sym} {ts.side.upper()} score={ts.entry_score}/8"
+        for sym, ts in state.trades.items()
+    ) or "  (ninguna)"
+
+    top_sigs = signals[:5]  # Top 5 señales del ciclo
+    sigs_str = "\n".join(
+        f"  {'🟢' if s['side']=='long' else '🔴'} {s['symbol']} "
+        f"{s['score']}/8 {'↑' if s['side']=='long' else '↓'}"
+        for s in top_sigs
+    ) or "  (ninguna este ciclo)"
+
     tg(
-        f"📡 <b>SCAN</b> - {SYMBOL} {TF}\n"
-        f"══════════════════════\n"
-        f"<b>LONG</b>  {long_score}/8  {state.score_bar(long_score)}\n"
-        f"<b>SHORT</b> {short_score}/8 {state.score_bar(short_score)}\n"
-        f"══════════════════════\n"
-        f"ADX {row['adx']:.1f} | RSI {row['rsi']:.1f} | "
-        f"Vol {row['volume']/row['vol_ma']:.2f}x\n"
-        f"HTF1 {'BULL' if htf1_bull else 'BEAR'} | "
-        f"HTF2 {'BULL' if htf2_bull else 'BEAR'}\n"
-        f"Regimen: {regime} | Sesion: {'ACTIVA' if session else 'CERRADA'}\n"
-        f"CB: {cb_str} | Racha: {state.consec_losses} perdidas\n"
+        f"📡 <b>SCAN MULTISIMBOLO</b>\n"
+        f"══════════════════════════════\n"
+        f"🔍 <b>Escaneados:</b> {scanned} pares\n"
+        f"⚡ <b>Señales encontradas:</b> {len(signals)}\n"
+        f"🏆 <b>Top señales:</b>\n{sigs_str}\n"
+        f"══════════════════════════════\n"
+        f"📂 <b>Posiciones abiertas ({state.open_count()}/{MAX_OPEN_TRADES}):</b>\n{open_str}\n"
+        f"══════════════════════════════\n"
+        f"CB: {cb_str} | Racha perdidas: {state.consec_losses}\n"
+        f"Sesión: {'ACTIVA' if session else 'CERRADA'}\n"
         f"⏰ {utcnow()}"
     )
 
 
 def tg_error(msg: str):
-    tg(f"🔥 <b>ERROR:</b> <code>{msg}</code>\n⏰ {utcnow()}")
-
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    tg(f"🔥 <b>ERROR:</b> <code>{msg[:300]}</code>\n⏰ {utcnow()}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -272,20 +330,21 @@ def calc_atr(df: pd.DataFrame, n: int) -> pd.Series:
     return tr.ewm(span=n, adjust=False).mean()
 
 def calc_rsi(s: pd.Series, n: int) -> pd.Series:
-    d = s.diff()
-    g = d.clip(lower=0).ewm(span=n, adjust=False).mean()
-    l = (-d.clip(upper=0)).ewm(span=n, adjust=False).mean()
-    return 100 - (100 / (1 + g / l.replace(0, np.nan)))
+    d  = s.diff()
+    g  = d.clip(lower=0).ewm(span=n, adjust=False).mean()
+    lo = (-d.clip(upper=0)).ewm(span=n, adjust=False).mean()
+    return 100 - (100 / (1 + g / lo.replace(0, np.nan)))
 
 def calc_adx(df: pd.DataFrame, n: int):
-    h, l = df["high"], df["low"]
-    up, dn = h.diff(), -l.diff()
-    pdm = up.where((up > dn) & (up > 0), 0.0)
-    mdm = dn.where((dn > up) & (dn > 0), 0.0)
-    atr = calc_atr(df, n)
-    dip = 100 * pdm.ewm(span=n, adjust=False).mean() / atr
-    dim = 100 * mdm.ewm(span=n, adjust=False).mean() / atr
-    dx  = 100 * (dip - dim).abs() / (dip + dim).replace(0, np.nan)
+    h, l  = df["high"], df["low"]
+    up    = h.diff()
+    dn    = -l.diff()
+    pdm   = up.where((up > dn) & (up > 0), 0.0)
+    mdm   = dn.where((dn > up) & (dn > 0), 0.0)
+    atr   = calc_atr(df, n)
+    dip   = 100 * pdm.ewm(span=n, adjust=False).mean() / atr
+    dim   = 100 * mdm.ewm(span=n, adjust=False).mean() / atr
+    dx    = 100 * (dip - dim).abs() / (dip + dim).replace(0, np.nan)
     return dip, dim, dx.ewm(span=n, adjust=False).mean()
 
 
@@ -293,7 +352,6 @@ def compute(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     c, h, l, v, o = df["close"], df["high"], df["low"], df["volume"], df["open"]
 
-    # EMAs
     df["ema8"]   = ema(c, FAST_LEN)
     df["ema21"]  = ema(c, PIVOT_LEN)
     df["ema48"]  = ema(c, BIAS_LEN)
@@ -306,81 +364,73 @@ def compute(df: pd.DataFrame) -> pd.DataFrame:
     df["dim"] = dim
     df["adx"] = adx
 
-    # Oscillator
-    df["osc_raw"] = ((c - df["ema21"]) / (3.0 * df["atr"])) * 100
-    df["osc"]     = ema(df["osc_raw"], OSC_LEN)
-    df["osc_up"]  = (df["osc"] > 0) & (df["osc"].shift() <= 0)
-    df["osc_dn"]  = (df["osc"] < 0) & (df["osc"].shift() >= 0)
+    df["osc_raw"]  = ((c - df["ema21"]) / (3.0 * df["atr"])) * 100
+    df["osc"]      = ema(df["osc_raw"], OSC_LEN)
+    df["osc_up"]   = (df["osc"] > 0) & (df["osc"].shift() <= 0)
+    df["osc_dn"]   = (df["osc"] < 0) & (df["osc"].shift() >= 0)
 
-    # Squeeze
-    bb_std       = c.rolling(PIVOT_LEN).std()
-    bb_up        = df["ema21"] + 2.0 * bb_std
-    kc_up        = df["ema21"] + 2.0 * df["atr"]
-    df["squeeze"]= bb_up < kc_up
+    bb_std         = c.rolling(PIVOT_LEN).std()
+    bb_up          = df["ema21"] + 2.0 * bb_std
+    kc_up          = df["ema21"] + 2.0 * df["atr"]
+    df["squeeze"]  = bb_up < kc_up
 
-    # Market regime
-    bb_lo        = df["ema21"] - 2.0 * bb_std
-    bb_width     = (bb_up - bb_lo) / df["ema21"]
-    bb_width_ma  = sma(bb_width, 20)
+    bb_lo          = df["ema21"] - 2.0 * bb_std
+    bb_width       = (bb_up - bb_lo) / df["ema21"]
+    bb_width_ma    = sma(bb_width, 20)
     df["is_trending"] = (adx > ADX_MIN) & (bb_width > bb_width_ma * 0.9)
 
-    # Volume
-    rng          = (h - l).replace(0, np.nan)
-    df["buy_vol"]  = v * (c - l) / rng
-    df["sell_vol"] = v * (h - c) / rng
-    df["vol_ma"]   = sma(v, VOL_LEN)
-    df["vol_spike"]= v > df["vol_ma"] * 1.1
-    df["vol_bull"] = df["buy_vol"] > df["sell_vol"]
-    df["vol_bear"] = df["sell_vol"] > df["buy_vol"]
+    rng              = (h - l).replace(0, np.nan)
+    df["buy_vol"]    = v * (c - l) / rng
+    df["sell_vol"]   = v * (h - c) / rng
+    df["vol_ma"]     = sma(v, VOL_LEN)
+    df["vol_spike"]  = v > df["vol_ma"] * 1.1
+    df["vol_bull"]   = df["buy_vol"] > df["sell_vol"]
+    df["vol_bear"]   = df["sell_vol"] > df["buy_vol"]
 
-    # Candle quality
-    body          = (c - o).abs()
-    body_pct      = body / rng.replace(0, np.nan)
+    body              = (c - o).abs()
+    body_pct          = body / rng.replace(0, np.nan)
     df["bull_candle"] = (c > o) & (body_pct >= 0.4)
     df["bear_candle"] = (c < o) & (body_pct >= 0.4)
 
-    # Swing structure for SL
-    df["swing_low"]  = l.rolling(SWING_LB).min()
-    df["swing_high"] = h.rolling(SWING_LB).max()
+    df["swing_low"]   = l.rolling(SWING_LB).min()
+    df["swing_high"]  = h.rolling(SWING_LB).max()
 
-    # RSI divergence
-    df["price_ll"] = (l  < l.shift())  & (l.shift()  < l.shift(2))
+    df["price_ll"] = (l < l.shift())  & (l.shift()  < l.shift(2))
     df["rsi_hl"]   = (df["rsi"] > df["rsi"].shift()) & (df["rsi"].shift() > df["rsi"].shift(2))
     df["bull_div"] = df["price_ll"] & df["rsi_hl"] & (df["rsi"] < 45)
 
-    df["price_hh"] = (h  > h.shift())  & (h.shift()  > h.shift(2))
+    df["price_hh"] = (h > h.shift())  & (h.shift()  > h.shift(2))
     df["rsi_lh"]   = (df["rsi"] < df["rsi"].shift()) & (df["rsi"].shift() < df["rsi"].shift(2))
     df["bear_div"] = df["price_hh"] & df["rsi_lh"] & (df["rsi"] > 55)
 
     return df
 
 
-def htf_bias(df: pd.DataFrame) -> tuple[bool, bool]:
-    """Returns (is_bull, is_bear) based on HTF dataframe."""
+def htf_bias(df: pd.DataFrame) -> tuple:
+    """Returns (is_bull, is_bear)."""
     df  = compute(df)
     row = df.iloc[-2]
-    bull = (row["close"] > row["ema48"]) and (row["ema21"] > row["ema48"])
-    bear = (row["close"] < row["ema48"]) and (row["ema21"] < row["ema48"])
+    bull = bool(row["close"] > row["ema48"] and row["ema21"] > row["ema48"])
+    bear = bool(row["close"] < row["ema48"] and row["ema21"] < row["ema48"])
     return bull, bear
 
 
-def htf2_macro(df: pd.DataFrame) -> tuple[bool, bool]:
-    """1h macro bias: price > ema48 AND ema48 > ema200."""
+def htf2_macro(df: pd.DataFrame) -> tuple:
+    """1h macro: price > ema48 AND ema48 > ema200."""
     df  = compute(df)
     row = df.iloc[-2]
-    bull = (row["close"] > row["ema48"]) and (row["ema48"] > row["ema200"])
-    bear = (row["close"] < row["ema48"]) and (row["ema48"] < row["ema200"])
+    bull = bool(row["close"] > row["ema48"] and row["ema48"] > row["ema200"])
+    bear = bool(row["close"] < row["ema48"] and row["ema48"] < row["ema200"])
     return bull, bear
 
 
 # ══════════════════════════════════════════════════════════
 # CONFLUENCE SCORE
 # ══════════════════════════════════════════════════════════
-def confluence_score(row: pd.Series, htf1_bull: bool, htf1_bear: bool,
-                     htf2_bull: bool, htf2_bear: bool) -> tuple[int, int]:
+def confluence_score(row: pd.Series,
+                     htf1_bull: bool, htf1_bear: bool,
+                     htf2_bull: bool, htf2_bear: bool) -> tuple:
     """Returns (long_score, short_score) 0-8."""
-
-    # LONG — 8 puntos
     l1 = bool(row["close"] > row["ema48"] and row["ema8"] > row["ema21"])
     l2 = bool(row["osc_up"])
     l3 = htf1_bull
@@ -390,7 +440,6 @@ def confluence_score(row: pd.Series, htf1_bull: bool, htf1_bear: bool,
     l7 = bool(row["vol_bull"] and row["vol_spike"] and not row["squeeze"])
     l8 = bool(row["bull_candle"] and row["close"] > row["ema21"])
 
-    # SHORT — 8 puntos
     s1 = bool(row["close"] < row["ema48"] and row["ema8"] < row["ema21"])
     s2 = bool(row["osc_dn"])
     s3 = htf1_bear
@@ -400,19 +449,7 @@ def confluence_score(row: pd.Series, htf1_bull: bool, htf1_bear: bool,
     s7 = bool(row["vol_bear"] and row["vol_spike"] and not row["squeeze"])
     s8 = bool(row["bear_candle"] and row["close"] < row["ema21"])
 
-    ls = sum([l1, l2, l3, l4, l5, l6, l7, l8])
-    ss = sum([s1, s2, s3, s4, s5, s6, s7, s8])
-
-    log.info(
-        f"LONG  score {ls}/8: ribbon={l1} osc={l2} htf1={l3} htf2={l4} "
-        f"adx={l5} rsi={l6} vol={l7} candle={l8}"
-    )
-    log.info(
-        f"SHORT score {ss}/8: ribbon={s1} osc={s2} htf1={s3} htf2={s4} "
-        f"adx={s5} rsi={s6} vol={s7} candle={s8}"
-    )
-
-    return ls, ss
+    return sum([l1, l2, l3, l4, l5, l6, l7, l8]), sum([s1, s2, s3, s4, s5, s6, s7, s8])
 
 
 # ══════════════════════════════════════════════════════════
@@ -422,9 +459,7 @@ def in_session() -> bool:
     if not USE_SESSION:
         return True
     h = datetime.now(timezone.utc).hour
-    in_london = LONDON_OPEN <= h < LONDON_CLOSE
-    in_ny     = NY_OPEN     <= h < NY_CLOSE
-    return in_london or in_ny
+    return (LONDON_OPEN <= h < LONDON_CLOSE) or (NY_OPEN <= h < NY_CLOSE)
 
 
 # ══════════════════════════════════════════════════════════
@@ -459,347 +494,485 @@ def get_position(ex: ccxt.Exchange, symbol: str) -> Optional[dict]:
     return None
 
 
+def get_all_positions(ex: ccxt.Exchange) -> Dict[str, dict]:
+    """Retorna un dict symbol->position de todas las posiciones abiertas."""
+    result = {}
+    try:
+        for p in ex.fetch_positions():
+            if abs(float(p.get("contracts", 0) or 0)) > 0:
+                result[p["symbol"]] = p
+    except Exception as e:
+        log.warning(f"fetch_positions (all) error: {e}")
+    return result
+
+
 def get_last_price(ex: ccxt.Exchange, symbol: str) -> float:
     return float(ex.fetch_ticker(symbol)["last"])
 
 
 # ══════════════════════════════════════════════════════════
+# UNIVERSE: OBTENER TODOS LOS PARES DE BINGX
+# ══════════════════════════════════════════════════════════
+def get_tradeable_symbols(ex: ccxt.Exchange) -> List[str]:
+    """
+    Retorna la lista de pares USDT perpetuos de BingX ordenados por
+    volumen 24h, filtrados por MIN_VOLUME_USDT y SYMBOL_FILTER.
+    """
+    symbols = []
+    for sym, mkt in ex.markets.items():
+        # Solo perpetuos USDT
+        if not (mkt.get("swap") and mkt.get("quote") == "USDT" and mkt.get("active", True)):
+            continue
+        # Lista negra
+        if sym in BLACKLIST:
+            continue
+        # Filtro de base opcional
+        if SYMBOL_FILTER and mkt.get("base", "") not in SYMBOL_FILTER:
+            continue
+        symbols.append(sym)
+
+    if not symbols:
+        log.warning("No symbols found after filters.")
+        return []
+
+    # Filtrar por volumen usando tickers
+    log.info(f"Obteniendo tickers para {len(symbols)} pares...")
+    try:
+        tickers = ex.fetch_tickers(symbols)
+    except Exception as e:
+        log.warning(f"fetch_tickers error: {e} — usando lista sin filtro de volumen")
+        return symbols[:TOP_N_SYMBOLS] if TOP_N_SYMBOLS > 0 else symbols
+
+    ranked = []
+    for sym in symbols:
+        tk = tickers.get(sym, {})
+        vol_usdt = float(tk.get("quoteVolume", 0) or 0)
+        if vol_usdt >= MIN_VOLUME_USDT:
+            ranked.append((sym, vol_usdt))
+
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    log.info(f"Pares con volumen > ${MIN_VOLUME_USDT/1e6:.1f}M: {len(ranked)}")
+
+    result = [sym for sym, _ in ranked]
+    if TOP_N_SYMBOLS > 0:
+        result = result[:TOP_N_SYMBOLS]
+
+    log.info(f"Universo final: {len(result)} pares")
+    return result
+
+
+# ══════════════════════════════════════════════════════════
 # ORDER MANAGEMENT
 # ══════════════════════════════════════════════════════════
-def open_trade(ex: ccxt.Exchange, side: str, score: int, row: pd.Series):
-    """Open market entry with TP1, TP2 (partial) and SL."""
-    balance   = get_balance(ex)
-    mult      = state.risk_mult(score)
-    risk_pct  = BASE_RISK * mult
-    usdt_qty  = balance * (risk_pct / 100)
+def open_trade(ex: ccxt.Exchange, symbol: str, side: str,
+               score: int, row: pd.Series) -> Optional[TradeState]:
+    """Abre posicion en el simbolo dado. Retorna TradeState o None si falla."""
+    try:
+        balance  = get_balance(ex)
+        mult     = state.risk_mult(score)
+        risk_pct = BASE_RISK * mult
+        usdt_qty = balance * (risk_pct / 100)
 
-    price  = get_last_price(ex, SYMBOL)
-    amount = float(ex.amount_to_precision(SYMBOL, usdt_qty / price))
+        price  = get_last_price(ex, symbol)
+        amount = float(ex.amount_to_precision(symbol, usdt_qty / price))
 
-    log.info(f"[ENTRY] {side.upper()} score={score}/8 risk={risk_pct:.1f}% size={amount} @ {price:.4f}")
+        log.info(f"[ENTRY] {symbol} {side.upper()} score={score}/8 "
+                 f"risk={risk_pct:.1f}% size={amount} @ {price:.6g}")
 
-    order       = ex.create_order(SYMBOL, "market", side, amount)
-    entry_price = float(order.get("average") or price)
+        order       = ex.create_order(symbol, "market", side, amount)
+        entry_price = float(order.get("average") or price)
 
-    atr = row["atr"]
+        atr = row["atr"]
 
-    # Swing-based SL
-    if USE_SWING_SL:
+        if USE_SWING_SL:
+            if side == "buy":
+                sl_p = min(row["swing_low"] - atr * 0.2, entry_price - atr * SL_ATR)
+            else:
+                sl_p = max(row["swing_high"] + atr * 0.2, entry_price + atr * SL_ATR)
+        else:
+            sl_p = (entry_price - atr * SL_ATR if side == "buy"
+                    else entry_price + atr * SL_ATR)
+
         if side == "buy":
-            sl_p = min(row["swing_low"] - atr * 0.2, entry_price - atr * SL_ATR)
+            tp1_p = entry_price + atr * TP1_MULT
+            tp2_p = entry_price + atr * TP2_MULT
         else:
-            sl_p = max(row["swing_high"] + atr * 0.2, entry_price + atr * SL_ATR)
-    else:
-        sl_p = entry_price - atr * SL_ATR if side == "buy" else entry_price + atr * SL_ATR
+            tp1_p = entry_price - atr * TP1_MULT
+            tp2_p = entry_price - atr * TP2_MULT
 
-    if side == "buy":
-        tp1_p = entry_price + atr * TP1_MULT
-        tp2_p = entry_price + atr * TP2_MULT
-    else:
-        tp1_p = entry_price - atr * TP1_MULT
-        tp2_p = entry_price - atr * TP2_MULT
+        tp1_p = float(ex.price_to_precision(symbol, tp1_p))
+        tp2_p = float(ex.price_to_precision(symbol, tp2_p))
+        sl_p  = float(ex.price_to_precision(symbol, sl_p))
 
-    tp1_p = float(ex.price_to_precision(SYMBOL, tp1_p))
-    tp2_p = float(ex.price_to_precision(SYMBOL, tp2_p))
-    sl_p  = float(ex.price_to_precision(SYMBOL, sl_p))
+        close_side = "sell" if side == "buy" else "buy"
+        half_amt   = float(ex.amount_to_precision(symbol, amount * 0.5))
 
-    close_side = "sell" if side == "buy" else "buy"
-    half_amt   = float(ex.amount_to_precision(SYMBOL, amount * 0.5))
+        try:
+            ex.create_order(symbol, "limit", close_side, half_amt, tp1_p, {"reduceOnly": True})
+        except Exception as e:
+            log.warning(f"[{symbol}] TP1 order failed: {e}")
 
-    # TP1 — 50% de la posicion
-    try:
-        ex.create_order(SYMBOL, "limit", close_side, half_amt, tp1_p, {"reduceOnly": True})
-        log.info(f"[TP1] @ {tp1_p:.4f}")
+        try:
+            ex.create_order(symbol, "limit", close_side, half_amt, tp2_p, {"reduceOnly": True})
+        except Exception as e:
+            log.warning(f"[{symbol}] TP2 order failed: {e}")
+
+        try:
+            ex.create_order(symbol, "stop_market", close_side, amount, None,
+                            {"stopPrice": sl_p, "reduceOnly": True})
+        except Exception as e:
+            log.warning(f"[{symbol}] SL order failed: {e}")
+
+        t = TradeState(
+            symbol      = symbol,
+            side        = "long" if side == "buy" else "short",
+            entry_price = entry_price,
+            tp1_price   = tp1_p,
+            tp2_price   = tp2_p,
+            sl_price    = sl_p,
+            tp1_hit     = False,
+            entry_score = score,
+            entry_time  = utcnow(),
+        )
+        if side == "buy":
+            t.trail_high = entry_price
+        else:
+            t.trail_low  = entry_price
+
+        tg_signal(t, risk_pct, row)
+        return t
+
     except Exception as e:
-        log.warning(f"TP1 order failed: {e}")
-
-    # TP2 — 50% restante (limit)
-    try:
-        ex.create_order(SYMBOL, "limit", close_side, half_amt, tp2_p, {"reduceOnly": True})
-        log.info(f"[TP2] @ {tp2_p:.4f}")
-    except Exception as e:
-        log.warning(f"TP2 order failed: {e}")
-
-    # SL
-    try:
-        ex.create_order(SYMBOL, "stop_market", close_side, amount, None,
-                        {"stopPrice": sl_p, "reduceOnly": True})
-        log.info(f"[SL]  @ {sl_p:.4f}")
-    except Exception as e:
-        log.warning(f"SL order failed: {e}")
-
-    # Actualizar estado
-    state.in_trade    = True
-    state.trade_side  = side
-    state.entry_price = entry_price
-    state.tp1_price   = tp1_p
-    state.tp2_price   = tp2_p
-    state.sl_price    = sl_p
-    state.tp1_hit     = False
-    state.entry_score = score
-    state.entry_time  = utcnow()
-
-    if side == "buy":
-        state.trail_high = entry_price
-    else:
-        state.trail_low  = entry_price
-
-    tg_signal(side, score, entry_price, tp1_p, tp2_p, sl_p, risk_pct, row)
-    return entry_price
+        log.error(f"[{symbol}] open_trade error: {e}")
+        tg_error(f"open_trade {symbol}: {e}")
+        return None
 
 
-def close_trade(ex: ccxt.Exchange, reason: str, current_price: float):
-    """Force-close remaining position."""
-    pos = get_position(ex, SYMBOL)
-    if pos is None:
-        state.in_trade = False
+def close_trade(ex: ccxt.Exchange, symbol: str, reason: str, current_price: float):
+    """Cierra la posicion en symbol y actualiza estadísticas globales."""
+    if symbol not in state.trades:
         return
+    t = state.trades[symbol]
 
     try:
-        ex.cancel_all_orders(SYMBOL)
+        ex.cancel_all_orders(symbol)
     except Exception as e:
-        log.warning(f"Cancel orders: {e}")
+        log.warning(f"[{symbol}] cancel_all_orders: {e}")
 
-    contracts  = float(pos.get("contracts", 0))
-    side       = pos.get("side", "long")
-    close_side = "sell" if side == "long" else "buy"
-    pnl        = 0.0
+    pos = get_position(ex, symbol)
+    pnl = 0.0
 
-    try:
-        ex.create_order(SYMBOL, "market", close_side, abs(contracts),
-                        params={"reduceOnly": True})
+    if pos:
+        contracts  = abs(float(pos.get("contracts", 0)))
+        close_side = "sell" if t.side == "long" else "buy"
+        try:
+            ex.create_order(symbol, "market", close_side, contracts,
+                            params={"reduceOnly": True})
+            if t.side == "long":
+                pnl = (current_price - t.entry_price) * contracts
+            else:
+                pnl = (t.entry_price - current_price) * contracts
+            log.info(f"[{symbol}] CLOSE {reason} pnl={pnl:+.2f}")
+        except Exception as e:
+            log.error(f"[{symbol}] close market order failed: {e}")
+            tg_error(f"close_trade {symbol}: {e}")
 
-        if state.trade_side == "long":
-            pnl = (current_price - state.entry_price) * abs(contracts)
-        else:
-            pnl = (state.entry_price - current_price) * abs(contracts)
-
-        log.info(f"[CLOSE] {reason} pnl={pnl:+.2f}")
-
-    except Exception as e:
-        log.error(f"Close failed: {e}")
-        tg_error(f"Close position failed: {e}")
-
-    # Update stats
+    # Actualizar estadísticas
     if pnl > 0:
         state.wins         += 1
         state.gross_profit += pnl
         state.consec_losses = 0
     elif pnl < 0:
-        state.losses       += 1
-        state.gross_loss   += abs(pnl)
+        state.losses        += 1
+        state.gross_loss    += abs(pnl)
         state.consec_losses += 1
 
-    state.total_pnl    += pnl
-    state.peak_equity   = max(state.peak_equity, state.peak_equity + pnl)
+    state.total_pnl   += pnl
+    state.peak_equity  = max(state.peak_equity, state.peak_equity + pnl)
 
-    tg_close(reason, state.trade_side, state.entry_price, current_price,
-             pnl, state.entry_score)
-
-    state.in_trade    = False
-    state.trade_side  = ""
-    state.tp1_hit     = False
+    tg_close(reason, t, current_price, pnl)
+    del state.trades[symbol]
 
 
 # ══════════════════════════════════════════════════════════
 # TRAILING STOP POST TP1
 # ══════════════════════════════════════════════════════════
-def check_trailing(ex: ccxt.Exchange, price: float, atr: float) -> bool:
-    """Returns True if trailing stop was hit and position was closed."""
-    if not state.tp1_hit:
-        return False
+def manage_open_trade(ex: ccxt.Exchange, symbol: str,
+                      live_price: float, atr: float,
+                      long_score: int, short_score: int,
+                      live_pos: Optional[dict]):
+    """Gestiona TP1, trailing y flip para un trade abierto."""
+    if symbol not in state.trades:
+        return
+    t = state.trades[symbol]
 
-    if state.trade_side == "long":
-        if price > state.trail_high:
-            state.trail_high = price
-        stop = state.trail_high - atr * TRAIL_MULT
-        if price < stop:
-            log.info(f"[TRAIL] Long trail stop hit @ {price:.4f}")
-            close_trade(ex, "TRAILING STOP", price)
-            return True
+    # Posicion cerrada externamente (TP o SL del exchange)
+    if live_pos is None:
+        log.info(f"[{symbol}] Posicion cerrada externamente (TP/SL)")
+        pnl_est = 0.0
+        if t.side == "long":
+            pnl_est = live_price - t.entry_price
+            reason  = "TP ALCANZADO" if live_price >= t.tp2_price else "SL ALCANZADO"
+        else:
+            pnl_est = t.entry_price - live_price
+            reason  = "TP ALCANZADO" if live_price <= t.tp2_price else "SL ALCANZADO"
 
-    elif state.trade_side == "short":
-        if price < state.trail_low:
-            state.trail_low = price
-        stop = state.trail_low + atr * TRAIL_MULT
-        if price > stop:
-            log.info(f"[TRAIL] Short trail stop hit @ {price:.4f}")
-            close_trade(ex, "TRAILING STOP", price)
-            return True
+        if pnl_est > 0:
+            state.wins         += 1
+            state.gross_profit += abs(pnl_est)
+            state.consec_losses = 0
+        else:
+            state.losses        += 1
+            state.gross_loss    += abs(pnl_est)
+            state.consec_losses += 1
 
-    return False
+        state.total_pnl += pnl_est
+        tg_close(reason, t, live_price, pnl_est)
+        del state.trades[symbol]
+        return
+
+    # Detectar TP1 hit
+    if not t.tp1_hit:
+        tp1_hit = (t.side == "long"  and live_price >= t.tp1_price) or \
+                  (t.side == "short" and live_price <= t.tp1_price)
+        if tp1_hit:
+            t.tp1_hit = True
+            contracts = float(live_pos.get("contracts", 0))
+            pnl_est   = abs(t.tp1_price - t.entry_price) * contracts * 0.5
+            log.info(f"[{symbol}] TP1 HIT @ {live_price:.6g} — activando trailing")
+            tg_tp1(t, live_price, pnl_est)
+
+    # Trailing stop post TP1
+    if t.tp1_hit:
+        if t.side == "long":
+            if live_price > t.trail_high:
+                t.trail_high = live_price
+            stop = t.trail_high - atr * TRAIL_MULT
+            if live_price < stop:
+                log.info(f"[{symbol}] TRAILING STOP long @ {live_price:.6g}")
+                close_trade(ex, symbol, "TRAILING STOP", live_price)
+                return
+        else:
+            if live_price < t.trail_low:
+                t.trail_low = live_price
+            stop = t.trail_low + atr * TRAIL_MULT
+            if live_price > stop:
+                log.info(f"[{symbol}] TRAILING STOP short @ {live_price:.6g}")
+                close_trade(ex, symbol, "TRAILING STOP", live_price)
+                return
+
+    # Signal flip
+    if symbol in state.trades:  # puede haber sido cerrado arriba
+        if t.side == "long" and short_score >= MIN_SCORE:
+            log.info(f"[{symbol}] FLIP: cerrando long por señal short fuerte")
+            close_trade(ex, symbol, "FLIP LONG→SHORT", live_price)
+        elif t.side == "short" and long_score >= MIN_SCORE:
+            log.info(f"[{symbol}] FLIP: cerrando short por señal long fuerte")
+            close_trade(ex, symbol, "FLIP SHORT→LONG", live_price)
 
 
-def check_tp1_hit(price: float) -> bool:
-    """Detect if TP1 has been hit (price crossed TP1 level)."""
-    if state.tp1_hit or not state.in_trade:
-        return False
-    if state.trade_side == "long"  and price >= state.tp1_price:
-        return True
-    if state.trade_side == "short" and price <= state.tp1_price:
-        return True
-    return False
+# ══════════════════════════════════════════════════════════
+# SCAN DE UN SIMBOLO (usado en paralelo)
+# ══════════════════════════════════════════════════════════
+def scan_symbol(ex: ccxt.Exchange, symbol: str) -> Optional[dict]:
+    """
+    Analiza un símbolo y retorna un dict con señal si la hay, o None.
+    dict: {"symbol", "side", "score", "row", "atr"}
+    """
+    try:
+        df  = fetch_df(ex, symbol, TF,   limit=350)
+        df1 = fetch_df(ex, symbol, HTF1, limit=150)
+        df2 = fetch_df(ex, symbol, HTF2, limit=300)
+
+        df  = compute(df)
+        row = df.iloc[-2]
+
+        if pd.isna(row["adx"]) or pd.isna(row["rsi"]):
+            return None
+
+        htf1_bull, htf1_bear = htf_bias(df1)
+        htf2_bull, htf2_bear = htf2_macro(df2)
+
+        long_score, short_score = confluence_score(
+            row, htf1_bull, htf1_bear, htf2_bull, htf2_bear
+        )
+
+        atr       = row["atr"]
+        live_price = float(row["close"])
+
+        return {
+            "symbol":      symbol,
+            "long_score":  long_score,
+            "short_score": short_score,
+            "row":         row,
+            "atr":         atr,
+            "live_price":  live_price,
+            "is_trending": bool(row["is_trending"]),
+        }
+    except Exception as e:
+        log.debug(f"[{symbol}] scan error: {e}")
+        return None
 
 
 # ══════════════════════════════════════════════════════════
 # MAIN LOOP
 # ══════════════════════════════════════════════════════════
 def main():
-    log.info("=" * 60)
-    log.info(" SATY ELITE v8 - CONFLUENCE ENGINE  STARTING")
-    log.info("=" * 60)
+    log.info("=" * 65)
+    log.info("  SATY ELITE v8 MULTI-SYMBOL — CONFLUENCE ENGINE STARTING")
+    log.info("=" * 65)
 
     dry_run = not (API_KEY and API_SECRET)
     if dry_run:
-        log.warning("DRY-RUN: no API keys. Set BINGX_API_KEY and BINGX_API_SECRET.")
+        log.warning("DRY-RUN: sin API keys. "
+                    "Configura BINGX_API_KEY y BINGX_API_SECRET.")
         while True:
-            log.info("DRY-RUN mode active. Waiting...")
+            log.info("DRY-RUN mode activo. Esperando...")
             time.sleep(POLL_SECS)
 
     ex = build_exchange()
-    log.info(f"Connected | {SYMBOL} | {TF} | HTF1:{HTF1} | HTF2:{HTF2}")
+    log.info(f"Conectado a BingX | TF:{TF} | HTF1:{HTF1} | HTF2:{HTF2}")
 
     balance = get_balance(ex)
     state.peak_equity = balance
     log.info(f"Balance: ${balance:.2f} USDT")
-    tg_startup(balance)
 
-    scan_count = 0
+    # Obtener universo de símbolos
+    symbols = get_tradeable_symbols(ex)
+    if not symbols:
+        log.error("No hay símbolos válidos para escanear. Abortando.")
+        return
+
+    tg_startup(balance, len(symbols))
+
+    scan_count   = 0
+    # Refrescar universo cada N ciclos (aprox. cada hora)
+    REFRESH_EVERY = max(1, int(3600 / max(POLL_SECS, 1)))
 
     while True:
         try:
-            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            log.info(f"─── [{now_str}] SCAN #{scan_count + 1} ───────────────────")
-
-            # ── Fetch data ──
-            df     = fetch_df(ex, SYMBOL, TF,   limit=350)
-            df1    = fetch_df(ex, SYMBOL, HTF1, limit=150)
-            df2    = fetch_df(ex, SYMBOL, HTF2, limit=300)
-
-            df  = compute(df)
-            row = df.iloc[-2]  # ultima vela cerrada
-
-            # ── HTF bias ──
-            htf1_bull, htf1_bear = htf_bias(df1)
-            htf2_bull, htf2_bear = htf2_macro(df2)
-
-            atr   = row["atr"]
-            price = row["close"]
-
-            log.info(
-                f"Price={price:.4f} | ADX={row['adx']:.1f} | RSI={row['rsi']:.1f} | "
-                f"ATR={atr:.6f} | Vol={row['volume']/row['vol_ma']:.2f}x | "
-                f"OSC={row['osc']:.2f} | SQZ={'Y' if row['squeeze'] else 'N'} | "
-                f"HTF1={'B' if htf1_bull else 'b'} | HTF2={'B' if htf2_bull else 'b'} | "
-                f"Trend={'Y' if row['is_trending'] else 'N'} | "
-                f"Session={'Y' if in_session() else 'N'}"
-            )
-
-            # ── Score ──
-            long_score, short_score = confluence_score(
-                row, htf1_bull, htf1_bear, htf2_bull, htf2_bear
-            )
-
-            # ── Send periodic scan to Telegram (every 15 scans) ──
+            ts_start = time.time()
+            now_str  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             scan_count += 1
-            if scan_count % 15 == 0:
-                tg_scan(row, long_score, short_score, htf1_bull, htf2_bull, in_session())
+            log.info(f"━━━ [{now_str}] SCAN #{scan_count} — {len(symbols)} pares ━━━")
 
-            # ── Circuit breaker ──
+            # Refrescar universo periódicamente
+            if scan_count % REFRESH_EVERY == 0:
+                log.info("Refrescando universo de símbolos...")
+                try:
+                    ex.load_markets()
+                    symbols = get_tradeable_symbols(ex)
+                except Exception as e:
+                    log.warning(f"Error refrescando universo: {e}")
+
+            # ── Circuit breaker global ──
             if state.cb_active():
-                log.warning(f"CIRCUIT BREAKER ACTIVE — drawdown >= {CB_DD}% — no new trades")
+                log.warning(f"CIRCUIT BREAKER ACTIVO — drawdown >= {CB_DD}% — sin nuevas entradas")
                 time.sleep(POLL_SECS)
                 continue
 
-            # ── Position management ──
-            live_price = get_last_price(ex, SYMBOL)
-            position   = get_position(ex, SYMBOL)
+            # ── Obtener todas las posiciones abiertas del exchange ──
+            live_positions = get_all_positions(ex)
 
-            if position is not None and state.in_trade:
+            # ── Gestionar trades abiertos ──
+            for sym in list(state.trades.keys()):
+                try:
+                    live_pos   = live_positions.get(sym)
+                    live_price = (float(live_pos["markPrice"])
+                                  if live_pos else get_last_price(ex, sym))
 
-                # Check TP1
-                if check_tp1_hit(live_price):
-                    state.tp1_hit = True
-                    log.info(f"[TP1 HIT] Activating trailing stop")
-                    estimated_pnl = abs(state.tp1_price - state.entry_price) * float(
-                        position.get("contracts", 0)) * 0.5
-                    tg_tp1(state.trade_side, live_price, estimated_pnl)
+                    # Re-calcular scores básicos para flip detection
+                    result = scan_symbol(ex, sym)
+                    ls = result["long_score"]  if result else 0
+                    ss = result["short_score"] if result else 0
+                    atr = result["atr"]        if result else state.trades[sym].entry_price * 0.001
 
-                # Trailing stop (post TP1)
-                if check_trailing(ex, live_price, atr):
-                    position = None
+                    manage_open_trade(ex, sym, live_price, atr, ls, ss, live_pos)
+                except Exception as e:
+                    log.warning(f"[{sym}] manage_open_trade error: {e}")
 
-                # Signal flip
-                if position is not None:
-                    if state.trade_side == "long" and short_score >= MIN_SCORE:
-                        log.info("[FLIP] Closing long - strong short signal")
-                        close_trade(ex, "FLIP LONG->SHORT", live_price)
-                        position = None
-                    elif state.trade_side == "short" and long_score >= MIN_SCORE:
-                        log.info("[FLIP] Closing short - strong long signal")
-                        close_trade(ex, "FLIP SHORT->LONG", live_price)
-                        position = None
+            # ── Escanear nuevas señales (solo si hay cupo) ──
+            new_signals: List[dict] = []
 
-            elif position is None and state.in_trade:
-                # Position was closed externally (TP or SL hit on exchange)
-                log.info("[EXTERNAL CLOSE] Position closed on exchange (TP/SL)")
-                pnl_est = 0.0
-                reason  = "TP ALCANZADO" if live_price >= state.tp2_price else "SL ALCANZADO"
-                if state.trade_side == "long":
-                    pnl_est = (live_price - state.entry_price)
-                else:
-                    pnl_est = (state.entry_price - live_price)
+            if state.open_count() < MAX_OPEN_TRADES and in_session():
+                # Escanear en paralelo para mayor velocidad
+                symbols_to_scan = [s for s in symbols if s not in state.trades]
 
-                if pnl_est > 0:
-                    state.wins         += 1
-                    state.gross_profit += abs(pnl_est)
-                    state.consec_losses = 0
-                else:
-                    state.losses        += 1
-                    state.gross_loss    += abs(pnl_est)
-                    state.consec_losses += 1
+                with ThreadPoolExecutor(max_workers=5) as pool:
+                    futures = {pool.submit(scan_symbol, ex, sym): sym
+                               for sym in symbols_to_scan}
+                    results = []
+                    for fut in as_completed(futures):
+                        res = fut.result()
+                        if res:
+                            results.append(res)
 
-                state.total_pnl += pnl_est
-                tg_close(reason, state.trade_side, state.entry_price,
-                         live_price, pnl_est, state.entry_score)
-                state.in_trade   = False
-                state.trade_side = ""
-                state.tp1_hit    = False
+                # Ordenar por score descendente
+                for res in results:
+                    best_side  = None
+                    best_score = 0
+                    if res["long_score"] >= MIN_SCORE and res["is_trending"]:
+                        if res["long_score"] > best_score:
+                            best_score = res["long_score"]
+                            best_side  = "long"
+                    if res["short_score"] >= MIN_SCORE and res["is_trending"]:
+                        if res["short_score"] > best_score:
+                            best_score = res["short_score"]
+                            best_side  = "short"
+                    if best_side:
+                        new_signals.append({
+                            "symbol": res["symbol"],
+                            "side":   best_side,
+                            "score":  best_score,
+                            "row":    res["row"],
+                        })
 
-            # ── Entry ──
-            if position is None and not state.in_trade:
+                # Ordenar por score
+                new_signals.sort(key=lambda x: x["score"], reverse=True)
 
-                if not in_session():
-                    log.info("Outside trading session — skipping")
+                # Abrir trades para las mejores señales hasta el máximo permitido
+                for sig in new_signals:
+                    if state.open_count() >= MAX_OPEN_TRADES:
+                        break
+                    sym   = sig["symbol"]
+                    side  = "buy" if sig["side"] == "long" else "sell"
+                    score = sig["score"]
+                    row   = sig["row"]
 
-                elif not row["is_trending"]:
-                    log.info(f"Market ranging (ADX={row['adx']:.1f}) — no entry")
+                    log.info(f"*** SEÑAL {sig['side'].upper()} *** {sym} score={score}/8")
+                    t = open_trade(ex, sym, side, score, row)
+                    if t:
+                        state.trades[sym] = t
 
-                elif long_score >= MIN_SCORE:
-                    log.info(f"*** LONG SIGNAL *** score={long_score}/8")
-                    open_trade(ex, "buy", long_score, row)
+            elif not in_session():
+                log.info("Fuera de sesión de trading — sin nuevas entradas")
+            elif state.open_count() >= MAX_OPEN_TRADES:
+                log.info(f"Máximo de trades abiertos ({MAX_OPEN_TRADES}) alcanzado")
 
-                elif short_score >= MIN_SCORE:
-                    log.info(f"*** SHORT SIGNAL *** score={short_score}/8")
-                    open_trade(ex, "sell", short_score, row)
+            # ── Log resumen ──
+            elapsed = time.time() - ts_start
+            log.info(
+                f"Ciclo completado en {elapsed:.1f}s | "
+                f"Trades abiertos: {state.open_count()}/{MAX_OPEN_TRADES} | "
+                f"Señales: {len(new_signals)} | "
+                f"W:{state.wins} L:{state.losses} PnL:${state.total_pnl:+.2f}"
+            )
 
-                else:
-                    log.info(
-                        f"No signal — L:{long_score}/8 S:{short_score}/8 "
-                        f"(need {MIN_SCORE})"
-                    )
+            # ── Resumen Telegram cada 15 ciclos ──
+            if scan_count % 15 == 0:
+                tg_scan_summary(new_signals, len(symbols), in_session())
 
         except ccxt.NetworkError as e:
-            log.warning(f"Network error: {e} — retrying...")
+            log.warning(f"Network error: {e} — reintentando...")
         except ccxt.ExchangeError as e:
             log.error(f"Exchange error: {e}")
-            tg(f"❌ <b>Exchange error:</b> <code>{e}</code>")
+            tg(f"❌ <b>Exchange error:</b> <code>{str(e)[:200]}</code>")
         except KeyboardInterrupt:
-            log.info("Bot stopped by user.")
+            log.info("Bot detenido por el usuario.")
             tg("🛑 <b>Bot detenido manualmente.</b>")
             break
         except Exception as e:
-            log.exception(f"Unexpected error: {e}")
+            log.exception(f"Error inesperado: {e}")
             tg_error(str(e))
 
         time.sleep(POLL_SECS)
