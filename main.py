@@ -37,7 +37,7 @@ Variables de entorno OBLIGATORIAS:
 Variables OPCIONALES:
     SYMBOL_FILTER        Bases "BTC,ETH,SOL" (vacío=todas)
     BLACKLIST            Pares excluidos "LUNA/USDT:USDT,..."
-    MAX_OPEN_TRADES      Max posiciones simultáneas      (def: 3)
+    MAX_OPEN_TRADES      Max posiciones simultáneas      (def: 10)
     MIN_SCORE            Score mínimo 1-12               (def: 5)
     BASE_RISK            % capital por operación         (def: 2.0)
     MAX_DRAWDOWN         % CB drawdown máximo            (def: 15.0)
@@ -96,7 +96,7 @@ BLACKLIST: List[str] = [s.strip() for s in _bl.split(",") if s.strip()]
 
 MIN_VOLUME_USDT  = float(os.environ.get("MIN_VOLUME_USDT",  "3000000"))
 TOP_N_SYMBOLS    = int(os.environ.get("TOP_N_SYMBOLS",      "60"))
-MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",    "3"))
+MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",    "10"))
 MIN_SCORE        = int(os.environ.get("MIN_SCORE",          "5"))
 BASE_RISK        = float(os.environ.get("BASE_RISK",        "2.0"))
 CB_DD            = float(os.environ.get("MAX_DRAWDOWN",     "15.0"))
