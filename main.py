@@ -108,17 +108,6 @@ LOG_TRADES_CSV   = os.environ.get("LOG_TRADES_CSV", "true").lower() == "true"
 USE_SESSION = os.environ.get("USE_SESSION", "false").lower() == "true"
 BTC_FILTER  = os.environ.get("BTC_FILTER",  "true").lower()  == "true"
 
-# ── Apalancamiento configurable ──
-LEVERAGE    = int(os.environ.get("LEVERAGE", "10"))
-
-# ── Hedge Mode: auto-detectado, pero puede forzarse con HEDGE_MODE=true/false ──
-_hm_env = os.environ.get("HEDGE_MODE", "").lower()
-HEDGE_MODE_FORCED: Optional[bool] = (
-    True  if _hm_env == "true"  else
-    False if _hm_env == "false" else
-    None   # None = auto-detectar en runtime
-)
-
 LONDON_OPEN = 7;  LONDON_CLOSE = 16
 NY_OPEN     = 13; NY_CLOSE     = 21
 
@@ -728,34 +717,14 @@ def build_exchange() -> ccxt.Exchange:
 
 
 def detect_hedge_mode(ex: ccxt.Exchange) -> bool:
-    """
-    Detecta Hedge Mode. Si HEDGE_MODE env var está seteada, usa ese valor.
-    Si no, intenta detectarlo consultando el endpoint de posición-modo de BingX.
-    """
-    global HEDGE_MODE_FORCED
-    if HEDGE_MODE_FORCED is not None:
-        log.info(f"HEDGE_MODE forzado por env var: {HEDGE_MODE_FORCED}")
-        return HEDGE_MODE_FORCED
-
-    # Intentar vía endpoint nativo de BingX (más fiable que fetch_positions vacío)
-    try:
-        resp = ex.privateGetOpenApiSwapV2TradePositionSide({})
-        ps = resp.get("data", {}).get("dualSidePosition", False)
-        if ps:
-            return True
-    except Exception:
-        pass
-
-    # Fallback: revisar posiciones abiertas
     try:
         positions = ex.fetch_positions()
-        for p in positions:
+        for p in positions[:5]:
             ps = p.get("info", {}).get("positionSide", "")
             if ps in ("LONG", "SHORT"):
                 return True
     except Exception:
         pass
-
     return False
 
 
@@ -818,8 +787,8 @@ def entry_params(side: str) -> dict:
 
 def exit_params(trade_side: str) -> dict:
     if HEDGE_MODE:
-        # En Hedge Mode NO se envía reduceOnly — causa error 109400 en BingX
-        return {"positionSide": "LONG" if trade_side == "long" else "SHORT"}
+        return {"positionSide": "LONG" if trade_side == "long" else "SHORT",
+                "reduceOnly": True}
     return {"reduceOnly": True}
 
 
@@ -878,22 +847,6 @@ def open_trade(ex: ccxt.Exchange, symbol: str, side: str,
         atr      = float(row["atr"])
         risk_pct = BASE_RISK   # solo para el log
 
-        # ── Configurar apalancamiento e margen ANTES de la orden ──
-        try:
-            ex.set_leverage(LEVERAGE, symbol,
-                            params={"side": "LONG"} if HEDGE_MODE else {})
-            if HEDGE_MODE:
-                ex.set_leverage(LEVERAGE, symbol, params={"side": "SHORT"})
-            log.info(f"[{symbol}] leverage={LEVERAGE}x OK")
-        except Exception as e:
-            log.warning(f"[{symbol}] set_leverage: {e}")
-
-        try:
-            ex.set_margin_mode("isolated", symbol)
-            log.info(f"[{symbol}] margin=ISOLATED OK")
-        except Exception as e:
-            log.debug(f"[{symbol}] set_margin_mode: {e}")  # puede ya estar seteado
-
         # Tamaño fijo: 8 USDT por operación
         FIXED_USDT = 8.0
         raw_amt    = FIXED_USDT / price
@@ -911,22 +864,11 @@ def open_trade(ex: ccxt.Exchange, symbol: str, side: str,
 
         log.info(f"[ENTRY] {symbol} {side.upper()} score={score}/12 "
                  f"size={amount} @ {price:.6g} notional=${amount*price:.2f} "
-                 f"spread={spread:.3f}% lev={LEVERAGE}x")
+                 f"spread={spread:.3f}%")
 
-        order = ex.create_order(symbol, "market", side, amount,
-                                params=entry_params(side))
-
-        # ── Extraer precio de entrada real ──
-        entry_price = float(
-            order.get("average") or
-            order.get("price")   or
-            order.get("info", {}).get("avgPrice") or
-            order.get("info", {}).get("price") or
-            price
-        )
-        if entry_price == 0:
-            entry_price = price
-
+        order       = ex.create_order(symbol, "market", side, amount,
+                                      params=entry_params(side))
+        entry_price = float(order.get("average") or price)
         trade_side  = "long" if side == "buy" else "short"
 
         if side == "buy":
@@ -945,38 +887,25 @@ def open_trade(ex: ccxt.Exchange, symbol: str, side: str,
         sl_p  = float(ex.price_to_precision(symbol, sl_p))
 
         close_side = "sell" if side == "buy" else "buy"
+        half_amt   = float(ex.amount_to_precision(symbol, amount * 0.5))
         ep         = exit_params(trade_side)
 
-        # ── TP1 y TP2: mitad del tamaño cada uno ──
-        # Si la mitad queda por debajo del mínimo, usar el mínimo (o el total si es muy pequeño)
-        half_raw = amount * 0.5
-        half_amt = float(ex.amount_to_precision(symbol, half_raw))
-        if half_amt < min_amt:
-            half_amt = amount   # poner todo en TP2, no colocar TP1
-
         for label, typ, qty, px in [
-            ("TP1", "limit", half_amt, tp1_p),
-            ("TP2", "limit", half_amt, tp2_p),
+            ("TP1", "limit",       half_amt, tp1_p),
+            ("TP2", "limit",       half_amt, tp2_p),
         ]:
             try:
-                ex.create_order(symbol, typ, close_side, qty, px, params=ep)
+                ex.create_order(symbol, typ, close_side, qty, px, ep)
                 log.info(f"[{symbol}] {label} @ {px:.6g}")
             except Exception as e:
                 log.warning(f"[{symbol}] {label} failed: {e}")
 
-        # ── Stop-loss: tipo STOP_MARKET (BingX requiere mayúsculas) ──
         try:
-            sl_ep = {**ep, "stopPrice": sl_p, "triggerPrice": sl_p}
-            ex.create_order(symbol, "STOP_MARKET", close_side, amount, None, params=sl_ep)
+            sl_ep = {**ep, "stopPrice": sl_p}
+            ex.create_order(symbol, "stop_market", close_side, amount, None, sl_ep)
             log.info(f"[{symbol}] SL  @ {sl_p:.6g}")
         except Exception as e:
-            # Segundo intento con tipo alternativo
-            try:
-                sl_ep2 = {**ep, "stopPrice": sl_p}
-                ex.create_order(symbol, "stop_market", close_side, amount, None, params=sl_ep2)
-                log.info(f"[{symbol}] SL (fallback) @ {sl_p:.6g}")
-            except Exception as e2:
-                log.warning(f"[{symbol}] SL failed: {e} / {e2}")
+            log.warning(f"[{symbol}] SL failed: {e}")
 
         t = TradeState(
             symbol=symbol,       side=trade_side,
@@ -990,7 +919,7 @@ def open_trade(ex: ccxt.Exchange, symbol: str, side: str,
 
         log_trade_csv("OPEN", t, entry_price)
 
-        extra = f"{'🔀HEDGE' if HEDGE_MODE else '1️⃣ONE-WAY'} | spread:{spread:.3f}% | 💵$8 fijos | {LEVERAGE}x"
+        extra = f"{'🔀HEDGE' if HEDGE_MODE else '1️⃣ONE-WAY'} | spread:{spread:.3f}% | 💵$8 fijos"
         tg_signal(t, 0.0, row, extra)
         return t
 
@@ -1016,7 +945,7 @@ def move_sl_to_breakeven(ex: ccxt.Exchange, symbol: str):
     ep         = {**exit_params(t.side), "stopPrice": be_price}
 
     try:
-        ex.create_order(symbol, "STOP_MARKET", close_side, t.contracts, None, params=ep)
+        ex.create_order(symbol, "stop_market", close_side, t.contracts, None, ep)
         t.sl_price    = be_price
         t.sl_moved_be = True
         log.info(f"[{symbol}] SL → Break-even @ {be_price:.6g}")
@@ -1394,7 +1323,7 @@ def main():
         return
 
     HEDGE_MODE = detect_hedge_mode(ex)
-    log.info(f"Modo: {'HEDGE' if HEDGE_MODE else 'ONE-WAY'} | Leverage: {LEVERAGE}x")
+    log.info(f"Modo: {'HEDGE' if HEDGE_MODE else 'ONE-WAY'}")
 
     balance = 0.0
     for attempt in range(10):
