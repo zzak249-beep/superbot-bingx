@@ -1,10 +1,8 @@
-# railway.toml — Supertrend Bot v1
-# Servicio SEPARADO de SATY v14 para comparativa de rentabilidad
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "python supertrend_bot.py"
+startCommand = "python saty_v14.py"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 10
