@@ -1,9 +1,0 @@
-# railway.toml – Force Dockerfile build (disable Railpack/Nixpacks)
-[build]
-builder = "DOCKERFILE"
-dockerfilePath = "Dockerfile"
-
-[deploy]
-startCommand = "python saty_v13.py"
-restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 10
