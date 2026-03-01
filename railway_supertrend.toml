@@ -1,8 +1,0 @@
-[build]
-builder = "DOCKERFILE"
-dockerfilePath = "Dockerfile"
-
-[deploy]
-startCommand = "python saty_v14.py"
-restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 10
