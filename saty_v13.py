@@ -1,46 +1,50 @@
 """
-SATY ELITE v13 — Motor de señales multi-estrategia
-══════════════════════════════════════════════════════════════
-ESTRATEGIAS INTEGRADAS (traducidas desde Pine Script):
+SATY ELITE v14 — Motor de señales multi-estrategia + Brain Adaptativo
+══════════════════════════════════════════════════════════════════════
+MEJORAS v14 sobre v13:
 
-  📊 MÓDULO 1 — Confirmación PRO (Squeeze + BB + Vol + EMA)
-     Fuente: "Confirmación Simple PRO v5"
-     Condición BUY:  precio < BB_lower + volumen fuerte + squeeze_momentum>0 + EMA9>EMA21
-     Condición SELL: precio > BB_upper + volumen fuerte + squeeze_momentum<0 + EMA9<EMA21
+  🧠 BRAIN ADAPTATIVO
+     - Ajuste automático de MIN_SCORE según win rate reciente
+     - Memoria de combinaciones de módulos perdedoras
+     - Score mínimo efectivo por combinación de módulos
 
-  🎯 MÓDULO 2 — Bollinger Hunter Pro v5.4
-     Fuente: "Bollinger Hunter Pro v5.4" (Arthur Merrill + Bollinger)
-     Señales: W-pattern (doble suelo), M-pattern (doble techo),
-              %B Divergencia, Breakout, Walking the Bands,
-              Mean Reversion, Middle Band Crossover, Squeeze
+  💰 FUNDING RATE FILTER
+     - Funding > 0.05% + señal LONG → bloqueado (mercado sobrecargado)
+     - Funding < -0.05% + señal SHORT → bloqueado (contratendencia)
+     - Contrarian: funding extremo confirma dirección opuesta
 
-  🏛️ MÓDULO 3 — SMC (Smart Money Concepts)
-     Fuente: "SMC Scalper M1 w/ M5 Confirm"
-     Señales: Order Blocks (bullish/bearish), Liquidity Sweeps,
-              Break of Structure (BOS), multi-timeframe EMA confirm
+  😱 FEAR & GREED INDEX
+     - Fear < 25 → solo LONGS permitidos
+     - Greed > 75 → solo SHORTS permitidos
+     - Neutral 25-75 → operación normal
 
-  🔧 ANTI-SEÑALES FALSAS:
-     - REQUIERE consenso ≥2 módulos para entrar (no solo 1)
-     - Cooldown 30min tras cada señal por símbolo
-     - Score mínimo subido a 5/15 (antes 3/13)
-     - Filtro de volumen institucional (2x media)
-     - HTF confirmation obligatorio (15m + 1h)
-     - SMC Order Block proximity filter
-     - Sin señales en squeeze (esperar confirmación)
-     - Divergencias %B como señal de salida temprana
+  ⏰ FILTRO HORARIO
+     - Asia nocturna (02-07 UTC) → MIN_SCORE +2
+     - Europa/EEUU (08-17 UTC) → score normal
+     - Resto → MIN_SCORE +1
+
+  📉 SL DINÁMICO por VOLATILIDAD
+     - ATR% > 3% → SL 1.5×ATR (mercado muy volátil)
+     - ATR% < 1% → SL 0.8×ATR (mercado tranquilo)
+
+  ⏸ PAUSA EN MERCADO LATERAL
+     - BTC ADX < 18 + sin tendencia → pausa nuevas entradas
 
 Variables de entorno Railway:
   BINGX_API_KEY, BINGX_API_SECRET
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
   FIXED_USDT          (def: 8)
   MAX_OPEN_TRADES     (def: 10)
-  MIN_SCORE           (def: 5)       ← más selectivo
-  MIN_MODULES         (def: 2)       ← requiere consenso
+  MIN_SCORE           (def: 5)
+  MIN_MODULES         (def: 2)
   MAX_DRAWDOWN        (def: 15)
   DAILY_LOSS_LIMIT    (def: 8)
   BTC_FILTER          (def: true)
-  COOLDOWN_MIN        (def: 30)      ← más largo
+  COOLDOWN_MIN        (def: 30)
   LEVERAGE            (def: 10)
+  FUNDING_FILTER      (def: true)
+  FNG_FILTER          (def: true)
+  HOUR_FILTER         (def: true)
 """
 
 import os, sys, time, logging, csv, json
@@ -65,7 +69,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-log = logging.getLogger("saty_v13")
+log = logging.getLogger("saty_v14")
 
 # ══════════════════════════════════════════════════════════
 # CONFIG
@@ -85,48 +89,222 @@ BLACKLIST: List[str] = [s.strip() for s in _bl.split(",") if s.strip()]
 
 FIXED_USDT       = float(os.environ.get("FIXED_USDT",       "8.0"))
 MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",    "10"))
-MIN_SCORE        = int(os.environ.get("MIN_SCORE",          "5"))   # ← más selectivo
-MIN_MODULES      = int(os.environ.get("MIN_MODULES",        "2"))   # ← consenso requerido
+MIN_SCORE        = int(os.environ.get("MIN_SCORE",          "5"))
+MIN_MODULES      = int(os.environ.get("MIN_MODULES",        "2"))
 CB_DD            = float(os.environ.get("MAX_DRAWDOWN",     "15.0"))
 DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", "8.0"))
-COOLDOWN_MIN     = int(os.environ.get("COOLDOWN_MIN",       "30"))  # ← más largo
-MAX_SPREAD_PCT   = float(os.environ.get("MAX_SPREAD_PCT",   "0.8")) # ← más estricto
-MIN_VOLUME_USDT  = float(os.environ.get("MIN_VOLUME_USDT",  "50000")) # ← más líquido
-TOP_N_SYMBOLS    = int(os.environ.get("TOP_N_SYMBOLS",      "200")) # ← menos pares, más calidad
-BTC_FILTER       = os.environ.get("BTC_FILTER", "true").lower() == "true"
+COOLDOWN_MIN     = int(os.environ.get("COOLDOWN_MIN",       "30"))
+MAX_SPREAD_PCT   = float(os.environ.get("MAX_SPREAD_PCT",   "0.8"))
+MIN_VOLUME_USDT  = float(os.environ.get("MIN_VOLUME_USDT",  "50000"))
+TOP_N_SYMBOLS    = int(os.environ.get("TOP_N_SYMBOLS",      "200"))
+BTC_FILTER       = os.environ.get("BTC_FILTER",      "true").lower() == "true"
 LEVERAGE         = float(os.environ.get("LEVERAGE",         "10"))
+
+# ── v14: nuevos filtros ──────────────────────────────────
+FUNDING_FILTER   = os.environ.get("FUNDING_FILTER", "true").lower() == "true"
+FNG_FILTER       = os.environ.get("FNG_FILTER",     "true").lower() == "true"
+HOUR_FILTER      = os.environ.get("HOUR_FILTER",    "true").lower() == "true"
+FUNDING_EXTREME  = float(os.environ.get("FUNDING_EXTREME", "0.05"))  # 0.05%
+FNG_FEAR_MAX     = int(os.environ.get("FNG_FEAR_MAX",    "25"))
+FNG_GREED_MIN    = int(os.environ.get("FNG_GREED_MIN",   "75"))
+ADX_LATERAL_MAX  = float(os.environ.get("ADX_LATERAL_MAX", "18"))
 
 # ── Bollinger params ─────────────────────────────────────
 BB_LEN    = 20;  BB_MULT   = 2.0
-VOL_MULT  = 1.5; VOL_INST  = 2.0   # institucional = 2x media
+VOL_MULT  = 1.5; VOL_INST  = 2.0
 SQZ_LEN   = 20
-TREND_LEN = 3    # barras sobre upper band para "walking"
-PIVOT_L   = 5;   PIVOT_R   = 2     # W/M pattern pivots
-SMC_LB    = 10   # lookback Order Blocks
+TREND_LEN = 3
+PIVOT_L   = 5;   PIVOT_R   = 2
+SMC_LB    = 10
 
 # ── Indicadores base ─────────────────────────────────────
 FAST_LEN  = 9;   SLOW_LEN_EMA = 21; BIAS_LEN = 48; MA200 = 200
 ADX_LEN   = 14;  ADX_MIN   = 15
 RSI_LEN   = 14;  ATR_LEN   = 14; MACD_FAST = 12; MACD_SLOW = 26; MACD_SIG = 9
 
-# ── TP/SL (3 niveles) ────────────────────────────────────
+# ── TP/SL ────────────────────────────────────────────────
 TP1_MULT = 1.0; TP2_MULT = 2.0; TP3_MULT = 4.0; SL_ATR = 1.0
 MAX_CONSEC_LOSS = 3
 HEDGE_MODE: bool = False
-CSV_PATH  = "saty_v13_trades.csv"
+CSV_PATH  = "saty_v14_trades.csv"
 
 equity_history: deque = deque(maxlen=48)
+
+# ══════════════════════════════════════════════════════════
+# BRAIN ADAPTATIVO v14
+# ══════════════════════════════════════════════════════════
+class AdaptiveBrain:
+    """
+    Brain adaptativo que ajusta MIN_SCORE según rendimiento real.
+    Aprende qué combinaciones de módulos fallan y las penaliza.
+    """
+    def __init__(self):
+        self.min_score_dynamic = MIN_SCORE
+        self.module_stats: Dict[str, dict] = {}   # {combo: {wins, losses}}
+        self.bad_combos:   Dict[str, float] = {}  # {combo: timestamp_penalizado}
+        self.last_adapt_trades = 0
+        self.adapt_every = 20  # recalibrar cada N trades
+        self.fng_value   = 50
+        self.fng_updated = 0.0
+        self.funding_cache: Dict[str, Tuple[float, float]] = {}  # {sym: (ts, rate)}
+
+    def record_trade(self, modules: str, pnl: float):
+        """Registra resultado de un trade por combinación de módulos."""
+        if modules not in self.module_stats:
+            self.module_stats[modules] = {"wins": 0, "losses": 0}
+        if pnl > 0:
+            self.module_stats[modules]["wins"]   += 1
+        else:
+            self.module_stats[modules]["losses"] += 1
+            # Si combo pierde 3 veces seguidas → penalizar 2h
+            stats = self.module_stats[modules]
+            total = stats["wins"] + stats["losses"]
+            if total >= 4:
+                wr = stats["wins"] / total
+                if wr < 0.35:
+                    self.bad_combos[modules] = time.time()
+                    log.info(f"Brain: combo {modules} penalizado (WR {wr*100:.0f}%)")
+
+    def combo_is_penalized(self, modules: str) -> bool:
+        """Devuelve True si este combo de módulos está penalizado."""
+        if modules not in self.bad_combos:
+            return False
+        elapsed = time.time() - self.bad_combos[modules]
+        if elapsed > 7200:  # 2 horas de penalización
+            del self.bad_combos[modules]
+            return False
+        return True
+
+    def adapt_min_score(self, wins: int, losses: int):
+        """Ajusta MIN_SCORE según win rate reciente."""
+        total = wins + losses
+        if total < self.adapt_every or total == self.last_adapt_trades:
+            return
+        self.last_adapt_trades = total
+        wr = wins / total * 100 if total > 0 else 50
+        prev = self.min_score_dynamic
+
+        if wr < 35:
+            self.min_score_dynamic = min(self.min_score_dynamic + 1, 10)
+        elif wr < 45:
+            self.min_score_dynamic = min(self.min_score_dynamic + 0, 9)  # mantener
+        elif wr > 65:
+            self.min_score_dynamic = max(self.min_score_dynamic - 1, 4)
+        elif wr > 55:
+            self.min_score_dynamic = max(self.min_score_dynamic, MIN_SCORE)  # no bajar de base
+
+        if self.min_score_dynamic != prev:
+            log.info(f"Brain: WR={wr:.1f}% → MIN_SCORE {prev}→{self.min_score_dynamic}")
+            tg(f"🧠 <b>Brain adaptativo</b>\n"
+               f"WR: {wr:.1f}% ({wins}W/{losses}L)\n"
+               f"MIN_SCORE: {prev} → <b>{self.min_score_dynamic}</b>\n⏰ {utcnow()}")
+
+    def get_fear_greed(self) -> int:
+        """Obtiene Fear & Greed Index (caché 1h)."""
+        if time.time() - self.fng_updated < 3600:
+            return self.fng_value
+        try:
+            r = requests.get("https://api.alternative.me/fng/", timeout=8)
+            if r.ok:
+                self.fng_value   = int(r.json()["data"][0]["value"])
+                self.fng_updated = time.time()
+                log.info(f"Fear&Greed: {self.fng_value}")
+        except Exception as e:
+            log.warning(f"FNG: {e}")
+        return self.fng_value
+
+    def get_funding_rate(self, ex, symbol: str) -> float:
+        """Obtiene funding rate con caché 10min."""
+        now = time.time()
+        if symbol in self.funding_cache:
+            ts, rate = self.funding_cache[symbol]
+            if now - ts < 600:
+                return rate
+        try:
+            info = ex.fetch_funding_rate(symbol)
+            rate = float(info.get("fundingRate", 0) or 0)
+            self.funding_cache[symbol] = (now, rate)
+            return rate
+        except Exception:
+            return 0.0
+
+    def funding_allows(self, ex, symbol: str, direction: str) -> Tuple[bool, str]:
+        """
+        Contrarian funding filter:
+        - Funding muy positivo (todos long) → señal SHORT favorable, LONG bloqueado
+        - Funding muy negativo (todos short) → señal LONG favorable, SHORT bloqueado
+        """
+        if not FUNDING_FILTER:
+            return True, ""
+        rate = self.get_funding_rate(ex, symbol)
+        rate_pct = rate * 100
+        if direction == "long"  and rate_pct >  FUNDING_EXTREME:
+            return False, f"Funding +{rate_pct:.3f}% (mercado sobrecargado LONG)"
+        if direction == "short" and rate_pct < -FUNDING_EXTREME:
+            return False, f"Funding {rate_pct:.3f}% (mercado sobrecargado SHORT)"
+        return True, ""
+
+    def fng_allows(self, direction: str) -> Tuple[bool, str]:
+        """
+        Fear & Greed filter:
+        - Miedo extremo (< 25) → solo LONGS
+        - Codicia extrema (> 75) → solo SHORTS
+        """
+        if not FNG_FILTER:
+            return True, ""
+        fng = self.get_fear_greed()
+        if fng < FNG_FEAR_MAX and direction == "short":
+            return False, f"FNG miedo extremo ({fng}) → solo longs"
+        if fng > FNG_GREED_MIN and direction == "long":
+            return False, f"FNG codicia extrema ({fng}) → solo shorts"
+        return True, ""
+
+    def hour_score_bonus(self) -> int:
+        """
+        Ajuste de MIN_SCORE por hora del día (UTC):
+        - 08-17 UTC: horario europeo/americano → score normal (0)
+        - 17-02 UTC: tarde/noche americana → +1
+        - 02-07 UTC: Asia nocturna = ruido → +2
+        """
+        if not HOUR_FILTER:
+            return 0
+        hora = datetime.now(timezone.utc).hour
+        if 2 <= hora < 7:
+            return 2   # Asia nocturna, muy volátil e impredecible
+        if 8 <= hora < 17:
+            return 0   # mejor horario
+        return 1       # resto del día
+
+    def effective_min_score(self) -> int:
+        return self.min_score_dynamic + self.hour_score_bonus()
+
+    def telegram_report(self) -> str:
+        lines = ["🧠 <b>Brain v14 — Reporte módulos</b>"]
+        for combo, stats in sorted(self.module_stats.items()):
+            total = stats["wins"] + stats["losses"]
+            if total < 3:
+                continue
+            wr   = stats["wins"] / total * 100
+            icon = "✅" if wr >= 55 else "⚠️" if wr >= 40 else "❌"
+            pen  = " 🚫" if self.combo_is_penalized(combo) else ""
+            lines.append(f"  {icon} {combo}: {wr:.0f}% ({stats['wins']}W/{stats['losses']}L){pen}")
+        lines.append(f"\n📊 MIN_SCORE dinámico: <b>{self.min_score_dynamic}</b>")
+        lines.append(f"⏰ Bonus horario: +{self.hour_score_bonus()}")
+        lines.append(f"😱 Fear&Greed: <b>{self.fng_value}</b>")
+        return "\n".join(lines)
+
+
+ab = AdaptiveBrain()
 
 # ══════════════════════════════════════════════════════════
 # DATACLASSES
 # ══════════════════════════════════════════════════════════
 @dataclass
 class ModuleResult:
-    """Resultado de un módulo de señal."""
     name:       str
-    direction:  str    # "long" | "short" | "none"
+    direction:  str
     score:      int
-    signals:    List[str]  # señales individuales activas
+    signals:    List[str]
     reason:     str = ""
 
 @dataclass
@@ -154,6 +332,7 @@ class TradeState:
     entry_time:     str   = ""
     contracts:      float = 0.0
     atr_entry:      float = 0.0
+    sl_mult:        float = 1.0   # v14: SL dinámico
 
 @dataclass
 class BotState:
@@ -177,6 +356,7 @@ class BotState:
     signals_found:  int   = 0
     signals_blocked: int  = 0
     last_discarded: List[dict] = field(default_factory=list)
+    market_lateral: bool  = False   # v14
 
     def open_count(self): return len(self.trades)
     def bases_open(self): return {t.base: t.side for t in self.trades.values()}
@@ -186,9 +366,6 @@ class BotState:
         return (self.wins / t * 100) if t else 0.0
     def profit_factor(self):
         return (self.gross_profit / self.gross_loss) if self.gross_loss else 0.0
-    def score_bar(self, score, mx=15):
-        filled = min(score, mx)
-        return "█" * filled + "░" * (mx - filled)
     def cb_active(self):
         if self.peak_equity <= 0: return False
         dd = (self.peak_equity - (self.peak_equity + self.total_pnl)) / self.peak_equity * 100
@@ -209,6 +386,36 @@ class BotState:
             log.info("Daily PnL reseteado")
 
 state = BotState()
+
+# ══════════════════════════════════════════════════════════
+# v14: SL DINÁMICO POR VOLATILIDAD
+# ══════════════════════════════════════════════════════════
+def dynamic_sl_mult(atr_v: float, price: float) -> float:
+    """
+    Ajusta el multiplicador del SL según la volatilidad relativa.
+    ATR% = ATR / precio * 100
+    """
+    if price <= 0:
+        return 1.0
+    atr_pct = atr_v / price * 100
+    if atr_pct > 3.0:
+        return 1.5   # mercado muy volátil → SL más amplio
+    elif atr_pct > 1.5:
+        return 1.0   # volatilidad normal
+    else:
+        return 0.8   # mercado tranquilo → SL más ajustado
+
+# ══════════════════════════════════════════════════════════
+# v14: DETECCIÓN DE MERCADO LATERAL
+# ══════════════════════════════════════════════════════════
+def is_market_lateral() -> bool:
+    """
+    True si BTC está en rango lateral (ADX bajo + sin tendencia clara).
+    En este estado pausamos nuevas entradas.
+    """
+    return (state.btc_adx < ADX_LATERAL_MAX
+            and not state.btc_bull
+            and not state.btc_bear)
 
 # ══════════════════════════════════════════════════════════
 # CACHE OHLCV
@@ -273,13 +480,8 @@ def calc_bb(s, n=BB_LEN, mult=BB_MULT):
     return mid, mid + mult * std, mid - mult * std
 
 def calc_squeeze_momentum(df, n=SQZ_LEN):
-    """
-    Squeeze Momentum (Pine: ta.linreg(close - (high+low)/2, sqzLen, 0))
-    Traducción exacta del Pine Script de "Confirmación Simple PRO"
-    """
     c, h, l = df["close"], df["high"], df["low"]
     val = c - (h + l) / 2
-    # Regresión lineal en ventana deslizante
     result = pd.Series(np.nan, index=df.index)
     for i in range(n - 1, len(df)):
         y = val.iloc[i - n + 1: i + 1].values
@@ -290,47 +492,27 @@ def calc_squeeze_momentum(df, n=SQZ_LEN):
     return result
 
 def calc_percent_b(close, upper, lower):
-    """%B = (close - lower) / (upper - lower)"""
     return (close - lower) / (upper - lower).replace(0, np.nan)
 
 def calc_pivot_highs(s_high, left=PIVOT_L, right=PIVOT_R):
-    """Detecta pivot highs (máximos locales)."""
     result = pd.Series(np.nan, index=s_high.index)
     for i in range(left, len(s_high) - right):
-        window_l = s_high.iloc[i - left: i]
-        window_r = s_high.iloc[i + 1: i + right + 1]
-        if s_high.iloc[i] >= window_l.max() and s_high.iloc[i] >= window_r.max():
+        if s_high.iloc[i] >= s_high.iloc[i-left:i].max() and s_high.iloc[i] >= s_high.iloc[i+1:i+right+1].max():
             result.iloc[i] = s_high.iloc[i]
     return result
 
 def calc_pivot_lows(s_low, left=PIVOT_L, right=PIVOT_R):
-    """Detecta pivot lows (mínimos locales)."""
     result = pd.Series(np.nan, index=s_low.index)
     for i in range(left, len(s_low) - right):
-        window_l = s_low.iloc[i - left: i]
-        window_r = s_low.iloc[i + 1: i + right + 1]
-        if s_low.iloc[i] <= window_l.min() and s_low.iloc[i] <= window_r.min():
+        if s_low.iloc[i] <= s_low.iloc[i-left:i].min() and s_low.iloc[i] <= s_low.iloc[i+1:i+right+1].min():
             result.iloc[i] = s_low.iloc[i]
     return result
 
 # ══════════════════════════════════════════════════════════
-# MÓDULO 1: CONFIRMACIÓN PRO (Squeeze + BB + Vol + EMA)
-# Traducción exacta de "Confirmación Simple PRO v5"
+# MÓDULO 1: CONFIRMACIÓN PRO
 # ══════════════════════════════════════════════════════════
 def module_confirmacion_pro(df: pd.DataFrame, htf1_bull: bool, htf1_bear: bool) -> Tuple[ModuleResult, ModuleResult]:
-    """
-    BUY:  precio < BB_lower + volumen > 1.5x + squeeze_momentum > 0 + EMA9 > EMA21
-    SELL: precio > BB_upper + volumen > 1.5x + squeeze_momentum < 0 + EMA9 < EMA21
-
-    Anti-falsas señales añadidos sobre el Pine original:
-    - HTF confirmation (15m bias)
-    - ADX > 14 (requiere tendencia real, no rango plano)
-    - Distancia mínima a BB (evita señales en medio de la banda)
-    """
     c = df["close"]
-    row = df.iloc[-2]   # última vela cerrada
-
-    # Indicadores del Pine
     mid_bb, upper_bb, lower_bb = calc_bb(c)
     vol_safe  = df["volume"].fillna(1).replace(0, 1)
     vol_avg   = sma(vol_safe, BB_LEN)
@@ -346,37 +528,33 @@ def module_confirmacion_pro(df: pd.DataFrame, htf1_bull: bool, htf1_bear: bool) 
     sqz_v     = float(sqz_mom.iloc[-2]) if not pd.isna(sqz_mom.iloc[-2]) else 0.0
     upper_v   = float(upper_bb.iloc[-2])
     lower_v   = float(lower_bb.iloc[-2])
-    mid_v     = float(mid_bb.iloc[-2])
     ef_v      = float(ema_fast.iloc[-2])
     es_v      = float(ema_slow.iloc[-2])
     adx_v     = float(adx.iloc[-2])
 
-    vol_ok    = vol_v > vol_avg_v * VOL_MULT
-    adx_ok    = adx_v > ADX_MIN
+    vol_ok = vol_v > vol_avg_v * VOL_MULT
+    adx_ok = adx_v > ADX_MIN
 
-    # ── LONG ─────────────────────────────────────────────
     long_sigs = []
-    if close_v < lower_v:      long_sigs.append("BB_lower_touch")
-    if vol_ok:                 long_sigs.append(f"vol_{vol_v/vol_avg_v:.1f}x")
-    if sqz_v > 0:              long_sigs.append(f"sqz_mom+{sqz_v:.4f}")
-    if ef_v > es_v:            long_sigs.append("EMA9>21")
-    if htf1_bull:              long_sigs.append("HTF1_bull")
-    if adx_ok:                 long_sigs.append(f"ADX{adx_v:.0f}")
+    if close_v < lower_v: long_sigs.append("BB_lower_touch")
+    if vol_ok:            long_sigs.append(f"vol_{vol_v/vol_avg_v:.1f}x")
+    if sqz_v > 0:         long_sigs.append(f"sqz_mom+{sqz_v:.4f}")
+    if ef_v > es_v:       long_sigs.append("EMA9>21")
+    if htf1_bull:         long_sigs.append("HTF1_bull")
+    if adx_ok:            long_sigs.append(f"ADX{adx_v:.0f}")
 
-    # Pine original: bbBuy AND volConfirm AND sqzBuy AND trendUp
-    pine_buy = (close_v < lower_v and vol_ok and sqz_v > 0 and ef_v > es_v)
+    pine_buy  = (close_v < lower_v and vol_ok and sqz_v > 0 and ef_v > es_v)
     long_score = len(long_sigs) if pine_buy else max(0, len(long_sigs) - 2)
 
-    # ── SHORT ────────────────────────────────────────────
     short_sigs = []
-    if close_v > upper_v:      short_sigs.append("BB_upper_touch")
-    if vol_ok:                 short_sigs.append(f"vol_{vol_v/vol_avg_v:.1f}x")
-    if sqz_v < 0:              short_sigs.append(f"sqz_mom{sqz_v:.4f}")
-    if ef_v < es_v:            short_sigs.append("EMA9<21")
-    if htf1_bear:              short_sigs.append("HTF1_bear")
-    if adx_ok:                 short_sigs.append(f"ADX{adx_v:.0f}")
+    if close_v > upper_v: short_sigs.append("BB_upper_touch")
+    if vol_ok:            short_sigs.append(f"vol_{vol_v/vol_avg_v:.1f}x")
+    if sqz_v < 0:         short_sigs.append(f"sqz_mom{sqz_v:.4f}")
+    if ef_v < es_v:       short_sigs.append("EMA9<21")
+    if htf1_bear:         short_sigs.append("HTF1_bear")
+    if adx_ok:            short_sigs.append(f"ADX{adx_v:.0f}")
 
-    pine_sell = (close_v > upper_v and vol_ok and sqz_v < 0 and ef_v < es_v)
+    pine_sell  = (close_v > upper_v and vol_ok and sqz_v < 0 and ef_v < es_v)
     short_score = len(short_sigs) if pine_sell else max(0, len(short_sigs) - 2)
 
     long_r  = ModuleResult("ConfPRO", "long"  if pine_buy  else "none", long_score,  long_sigs)
@@ -385,449 +563,234 @@ def module_confirmacion_pro(df: pd.DataFrame, htf1_bull: bool, htf1_bear: bool) 
 
 # ══════════════════════════════════════════════════════════
 # MÓDULO 2: BOLLINGER HUNTER PRO v5.4
-# Traducción de: W/M patterns, %B divergence, breakout,
-#                walking the bands, mean reversion, MA cross
 # ══════════════════════════════════════════════════════════
 def module_bollinger_hunter(df: pd.DataFrame, htf2_bull: bool, htf2_bear: bool) -> Tuple[ModuleResult, ModuleResult]:
-    """
-    7 sub-estrategias con jerarquía (igual que el Pine):
-    1. %B Divergencia (más fuerte)
-    2. Breakout
-    3. Walking the Bands
-    4. Middle Band Cross
-    5. W/M Pattern
-    6. Mean Reversion
-    7. Squeeze (solo info, no entrada)
-    """
     c, h, l, v = df["close"], df["high"], df["low"], df["volume"]
-
     mid_bb, upper_bb, lower_bb = calc_bb(c)
     bb_width = ((upper_bb - lower_bb) / mid_bb) * 100
     pct_b    = calc_percent_b(c, upper_bb, lower_bb)
-
     vol_avg  = sma(v.fillna(1).replace(0, 1), BB_LEN)
     ema_fast = ema(c, FAST_LEN)
     ema_slow = ema(c, SLOW_LEN_EMA)
-
     pivot_h  = calc_pivot_highs(h)
     pivot_l  = calc_pivot_lows(l)
 
-    # Usar barra -2 (última cerrada, anti look-ahead)
     i = len(df) - 2
     if i < 50:
         empty = ModuleResult("BollingerHunter", "none", 0, [])
         return empty, empty
 
-    close_v  = float(c.iloc[i])
-    high_v   = float(h.iloc[i])
-    low_v    = float(l.iloc[i])
+    close_v  = float(c.iloc[i]); high_v = float(h.iloc[i]); low_v = float(l.iloc[i])
     open_v   = float(df["open"].iloc[i])
-    upper_v  = float(upper_bb.iloc[i])
-    lower_v  = float(lower_bb.iloc[i])
-    mid_v    = float(mid_bb.iloc[i])
+    upper_v  = float(upper_bb.iloc[i]); lower_v = float(lower_bb.iloc[i]); mid_v = float(mid_bb.iloc[i])
     bbw_v    = float(bb_width.iloc[i])
     pbv      = float(pct_b.iloc[i]) if not pd.isna(pct_b.iloc[i]) else 0.5
-    vol_v    = float(v.iloc[i])
-    vol_av   = float(vol_avg.iloc[i])
-    ef_v     = float(ema_fast.iloc[i])
-    es_v     = float(ema_slow.iloc[i])
+    vol_v    = float(v.iloc[i]); vol_av = float(vol_avg.iloc[i])
+    ef_v     = float(ema_fast.iloc[i]); es_v = float(ema_slow.iloc[i])
 
-    # 1️⃣ SQUEEZE
-    bbw_min_100 = float(bb_width.iloc[max(0,i-100):i+1].min())
-    is_squeeze  = bbw_v <= bbw_min_100 * 1.10
+    bbw_min_100  = float(bb_width.iloc[max(0,i-100):i+1].min())
+    is_squeeze   = bbw_v <= bbw_min_100 * 1.10
 
-    # 2️⃣ BREAKOUT: precio > upper + BB se expande + volumen
     bbw_prev = float(bb_width.iloc[i-1])
-    upper_prev = float(upper_bb.iloc[i-1])
-    lower_prev = float(lower_bb.iloc[i-1])
-    is_breakout_up   = (close_v > upper_v and bbw_v > bbw_prev and
-                        upper_v > upper_prev and lower_v < lower_prev and
-                        vol_v > vol_av * 1.5)
-    is_breakout_down = (close_v < lower_v and bbw_v > bbw_prev and
-                        upper_v > upper_prev and lower_v < lower_prev and
-                        vol_v > vol_av * 1.5)
+    upper_prev = float(upper_bb.iloc[i-1]); lower_prev = float(lower_bb.iloc[i-1])
+    is_breakout_up   = (close_v > upper_v and bbw_v > bbw_prev and upper_v > upper_prev and lower_v < lower_prev and vol_v > vol_av * 1.5)
+    is_breakout_down = (close_v < lower_v and bbw_v > bbw_prev and upper_v > upper_prev and lower_v < lower_prev and vol_v > vol_av * 1.5)
 
-    # 3️⃣ WALKING THE BANDS (TREND_LEN barras sobre upper)
-    close_arr = c.iloc[i-TREND_LEN+1:i+1].values
-    upper_arr = upper_bb.iloc[i-TREND_LEN+1:i+1].values
+    close_arr  = c.iloc[i-TREND_LEN+1:i+1].values
+    upper_arr  = upper_bb.iloc[i-TREND_LEN+1:i+1].values
     above_count = sum(1 for cv, uv in zip(close_arr, upper_arr) if cv >= uv)
     is_walking_up = above_count >= TREND_LEN - 1
 
-    # 4️⃣ MEAN REVERSION
-    is_rev_long  = (not is_squeeze and not is_breakout_up and
-                    low_v  <= lower_v and close_v > open_v and pbv > 0.1)
-    is_rev_short = (not is_squeeze and not is_breakout_down and
-                    high_v >= upper_v and close_v < open_v and pbv < 0.9)
+    is_rev_long  = (not is_squeeze and not is_breakout_up   and low_v  <= lower_v and close_v > open_v and pbv > 0.1)
+    is_rev_short = (not is_squeeze and not is_breakout_down and high_v >= upper_v and close_v < open_v and pbv < 0.9)
 
-    # 5️⃣ W PATTERN (doble suelo — Arthur Merrill)
-    # Primera pata: pivot low que TOCA/ROMPE lower band
-    # Segunda pata: pivot low que queda DENTRO de la banda
-    is_w_pattern = False
-    is_m_pattern = False
+    is_w_pattern = False; is_m_pattern = False
     last_pl_val = None; last_pl_out = False
     last_ph_val = None; last_ph_out = False
-
     for j in range(max(0, i-30), i+1):
-        pl_v = pivot_l.iloc[j]
-        ph_v = pivot_h.iloc[j]
-        lb_j = float(lower_bb.iloc[j])
-        ub_j = float(upper_bb.iloc[j])
-
+        pl_v = pivot_l.iloc[j]; ph_v = pivot_h.iloc[j]
+        lb_j = float(lower_bb.iloc[j]); ub_j = float(upper_bb.iloc[j])
         if not pd.isna(pl_v):
-            current_in = pl_v > lb_j
-            if current_in and last_pl_out:
-                is_w_pattern = True
-            last_pl_val  = pl_v
-            last_pl_out  = pl_v < lb_j
-
+            if pl_v > lb_j and last_pl_out: is_w_pattern = True
+            last_pl_val = pl_v; last_pl_out = pl_v < lb_j
         if not pd.isna(ph_v):
-            current_in = ph_v < ub_j
-            if current_in and last_ph_out:
-                is_m_pattern = True
-            last_ph_val  = ph_v
-            last_ph_out  = ph_v > ub_j
+            if ph_v < ub_j and last_ph_out: is_m_pattern = True
+            last_ph_val = ph_v; last_ph_out = ph_v > ub_j
 
-    # 6️⃣ %B DIVERGENCE (más fuerte — John Bollinger)
-    # Bear div: precio sube (new high) pero %B baja (menos fuerte)
-    # Bull div: precio baja (new low) pero %B sube (menos débil)
     bear_div = False; bull_div = False
     last_price_ph = None; last_pb_ph = None
     last_price_pl = None; last_pb_pl = None
-
     ph_indices = [(j, float(pivot_h.iloc[j])) for j in range(max(0,i-50), i+1) if not pd.isna(pivot_h.iloc[j])]
     pl_indices = [(j, float(pivot_l.iloc[j])) for j in range(max(0,i-50), i+1) if not pd.isna(pivot_l.iloc[j])]
-
     for j, ph_v in ph_indices:
         pb_at_ph = float(pct_b.iloc[j]) if not pd.isna(pct_b.iloc[j]) else 0.5
-        if last_price_ph is not None and ph_v > last_price_ph and pb_at_ph < last_pb_ph:
-            bear_div = True
+        if last_price_ph is not None and ph_v > last_price_ph and pb_at_ph < last_pb_ph: bear_div = True
         last_price_ph = ph_v; last_pb_ph = pb_at_ph
-
     for j, pl_v in pl_indices:
         pb_at_pl = float(pct_b.iloc[j]) if not pd.isna(pct_b.iloc[j]) else 0.5
-        if last_price_pl is not None and pl_v < last_price_pl and pb_at_pl > last_pb_pl:
-            bull_div = True
+        if last_price_pl is not None and pl_v < last_price_pl and pb_at_pl > last_pb_pl: bull_div = True
         last_price_pl = pl_v; last_pb_pl = pb_at_pl
 
-    # 7️⃣ MIDDLE BAND CROSS
-    close_prev = float(c.iloc[i-1])
-    mid_prev   = float(mid_bb.iloc[i-1])
+    close_prev = float(c.iloc[i-1]); mid_prev = float(mid_bb.iloc[i-1])
     is_ma_cross_up   = (close_prev <= mid_prev and close_v > mid_v)
     is_ma_cross_down = (close_prev >= mid_prev and close_v < mid_v)
 
-    # ══════════════════════════════════════════════════════
-    # JERARQUÍA EXACTA DEL PINE (Bollinger Hunter v5.4)
-    # 🥇 Divergencia %B  → señal más fuerte, las demás se silencian
-    # 🥈 Breakout         → inicio de movimiento
-    # 🥉 Walking          → continuación de tendencia
-    # 🎖️ MA Cross         → devolución segura a tendencia
-    # 🏅 W/M Pattern      → señales de giro
-    # 🎖️ Mean Reversion   → rebote de banda
-    # ⏳ Squeeze          → MODO ESPERA, SIN ENTRADA
-    # ══════════════════════════════════════════════════════
-
-    # Squeeze = sin entrada (esperar dirección)
     if is_squeeze:
-        long_r  = ModuleResult("BollingerHunter", "none", 0, ["squeeze_wait"])
-        short_r = ModuleResult("BollingerHunter", "none", 0, ["squeeze_wait"])
-        return long_r, short_r
+        return ModuleResult("BollingerHunter","none",0,["squeeze_wait"]), ModuleResult("BollingerHunter","none",0,["squeeze_wait"])
 
     vol_strong = vol_v > vol_av * VOL_MULT
     vol_label  = f"vol_{vol_v/max(vol_av,1):.1f}x"
 
-    # ── Determinar ESTADO del Pine (único estado por barra) ──────────────
-    # Pine usa if/else → sólo UN estado activo
-    # Traducimos manteniendo la exclusividad de la jerarquía
-
-    # Patas largas (LONG)
-    long_state  = "none"
-    long_sigs   = []
-
-    if bear_div:
-        # Bear div = estado BAJISTA más fuerte, silencia long
-        long_state = "none"
+    long_state = "none"; long_sigs = []
+    if bear_div: long_state = "none"
     elif bull_div:
-        # 🥇 Divergencia positiva → long más fuerte
-        long_state = "bull_div"
-        long_sigs  = ["bull_div_%B", vol_label if vol_strong else ""]
+        long_state = "bull_div"; long_sigs = ["bull_div_%B", vol_label if vol_strong else ""]
         if htf2_bull: long_sigs.append("HTF2_bull")
     elif is_breakout_up:
-        # 🥈 Breakout alcista
-        long_state = "breakout"
-        long_sigs  = ["breakout_up", vol_label if vol_strong else ""]
+        long_state = "breakout"; long_sigs = ["breakout_up", vol_label if vol_strong else ""]
         if htf2_bull: long_sigs.append("HTF2_bull")
         if ef_v > es_v: long_sigs.append("EMA_up")
     elif is_walking_up:
-        # 🥉 Walking the bands → ralli en curso, NO SHORTAR
-        long_state = "walking"
-        long_sigs  = ["walking_up"]
+        long_state = "walking"; long_sigs = ["walking_up"]
         if htf2_bull: long_sigs.append("HTF2_bull")
-        if ef_v > es_v: long_sigs.append("EMA_up")
     elif is_ma_cross_up:
-        # 🎖️ Cruce de banda media → devolución
-        long_state = "ma_cross"
-        long_sigs  = ["ma_cross_up"]
+        long_state = "ma_cross"; long_sigs = ["ma_cross_up"]
         if htf2_bull: long_sigs.append("HTF2_bull")
         if vol_strong: long_sigs.append(vol_label)
     elif is_w_pattern:
-        # 🏅 Formación W
-        long_state = "w_pattern"
-        long_sigs  = ["W_pattern"]
+        long_state = "w_pattern"; long_sigs = ["W_pattern"]
         if htf2_bull: long_sigs.append("HTF2_bull")
         if vol_strong: long_sigs.append(vol_label)
     elif is_rev_long:
-        # 🎖️ Mean reversion (rebote de banda baja)
-        long_state = "mean_rev"
-        long_sigs  = ["mean_rev_long"]
+        long_state = "mean_rev"; long_sigs = ["mean_rev_long"]
         if htf2_bull: long_sigs.append("HTF2_bull")
         if vol_strong: long_sigs.append(vol_label)
+    long_sigs = [s for s in long_sigs if s]
 
-    long_sigs = [s for s in long_sigs if s]  # quitar strings vacíos
-
-    # Patas cortas (SHORT)
-    short_state = "none"
-    short_sigs  = []
-
-    if bull_div:
-        # Bull div = estado ALCISTA más fuerte, silencia short
-        short_state = "none"
+    short_state = "none"; short_sigs = []
+    if bull_div: short_state = "none"
     elif bear_div:
-        # 🥇 Divergencia negativa → short más fuerte
-        short_state = "bear_div"
-        short_sigs  = ["bear_div_%B", vol_label if vol_strong else ""]
+        short_state = "bear_div"; short_sigs = ["bear_div_%B", vol_label if vol_strong else ""]
         if htf2_bear: short_sigs.append("HTF2_bear")
     elif is_breakout_down:
-        short_state = "breakout"
-        short_sigs  = ["breakout_down", vol_label if vol_strong else ""]
+        short_state = "breakout"; short_sigs = ["breakout_down", vol_label if vol_strong else ""]
         if htf2_bear: short_sigs.append("HTF2_bear")
         if ef_v < es_v: short_sigs.append("EMA_dn")
-    elif is_walking_up:
-        # Mientras hace "walking" no hay señal short (tendencia alcista fuerte)
-        short_state = "none"
+    elif is_walking_up: short_state = "none"
     elif is_ma_cross_down:
-        short_state = "ma_cross"
-        short_sigs  = ["ma_cross_down"]
+        short_state = "ma_cross"; short_sigs = ["ma_cross_down"]
         if htf2_bear: short_sigs.append("HTF2_bear")
         if vol_strong: short_sigs.append(vol_label)
     elif is_m_pattern:
-        short_state = "m_pattern"
-        short_sigs  = ["M_pattern"]
+        short_state = "m_pattern"; short_sigs = ["M_pattern"]
         if htf2_bear: short_sigs.append("HTF2_bear")
         if vol_strong: short_sigs.append(vol_label)
     elif is_rev_short:
-        short_state = "mean_rev"
-        short_sigs  = ["mean_rev_short"]
+        short_state = "mean_rev"; short_sigs = ["mean_rev_short"]
         if htf2_bear: short_sigs.append("HTF2_bear")
         if vol_strong: short_sigs.append(vol_label)
-
     short_sigs = [s for s in short_sigs if s]
 
-    # ── Validar dirección: requiere estado activo + min señales ──────────
-    # Los estados "fuertes" (divergencia, breakout) necesitan menos confirmación
-    # Los estados "débiles" (mean_rev) necesitan HTF confirm
-    STRONG_LONG_STATES  = {"bull_div", "breakout", "walking"}
-    STRONG_SHORT_STATES = {"bear_div", "breakout"}
+    STRONG_LONG  = {"bull_div", "breakout", "walking"}
+    STRONG_SHORT = {"bear_div", "breakout"}
 
-    if long_state in STRONG_LONG_STATES:
-        long_dir = "long" if len(long_sigs) >= 1 else "none"
-    elif long_state != "none":
-        long_dir = "long" if len(long_sigs) >= 2 and htf2_bull else "none"
-    else:
-        long_dir = "none"
+    long_dir  = "long"  if (long_state  in STRONG_LONG  and len(long_sigs)  >= 1) or (long_state  != "none" and len(long_sigs)  >= 2 and htf2_bull) else "none"
+    short_dir = "short" if (short_state in STRONG_SHORT and len(short_sigs) >= 1) or (short_state != "none" and len(short_sigs) >= 2 and htf2_bear) else "none"
 
-    if short_state in STRONG_SHORT_STATES:
-        short_dir = "short" if len(short_sigs) >= 1 else "none"
-    elif short_state != "none":
-        short_dir = "short" if len(short_sigs) >= 2 and htf2_bear else "none"
-    else:
-        short_dir = "none"
-
-    long_r  = ModuleResult("BollingerHunter", long_dir,  len(long_sigs),  long_sigs)
-    short_r = ModuleResult("BollingerHunter", short_dir, len(short_sigs), short_sigs)
-    return long_r, short_r
+    return ModuleResult("BollingerHunter", long_dir, len(long_sigs), long_sigs), \
+           ModuleResult("BollingerHunter", short_dir, len(short_sigs), short_sigs)
 
 # ══════════════════════════════════════════════════════════
-# MÓDULO 3: SMC (Smart Money Concepts)
-# Traducción de: "SMC Scalper M1 w/ M5 Confirm"
-# Order Blocks + Liquidity Sweeps + BOS
+# MÓDULO 3: SMC
 # ══════════════════════════════════════════════════════════
 def module_smc(df: pd.DataFrame, df_htf: pd.DataFrame) -> Tuple[ModuleResult, ModuleResult]:
-    """
-    Traducción exacta de "SMC Scalper M1 w/ M5 Confirm"
-
-    Pine lógica:
-      Bullish OB: close[i] < open[i] AND close > high[i]
-        → vela bajista hace k barras, precio actual ROMPE POR ENCIMA = OB bullish activado
-        → señal: precio está dentro de la zona OB (tiempo) + sweepDown + HTF BOS/EMA up
-
-      Bearish OB: close[i] > open[i] AND close < low[i]
-        → vela alcista hace k barras, precio actual ROMPE POR ABAJO = OB bearish activado
-        → señal: dentro de zona OB + sweepUp + HTF BOS/EMA down
-
-    Liquidity zones: mínimos/máximos locales que actúan como imanes de liquidez
-
-    Anti-falsas señales añadidas vs Pine original:
-      - Requiere las 3 condiciones (OB + sweep + HTF) simultáneamente
-      - Cooldown implícito vía score bajo si solo 1 o 2 condiciones
-    """
     c, h, l, o = df["close"], df["high"], df["low"], df["open"]
-
     i = len(df) - 2
     if i < SMC_LB + 5 or len(df_htf) < 30:
         empty = ModuleResult("SMC", "none", 0, [])
         return empty, empty
 
-    close_v = float(c.iloc[i])
-    high_v  = float(h.iloc[i])
-    low_v   = float(l.iloc[i])
+    close_v = float(c.iloc[i]); high_v = float(h.iloc[i]); low_v = float(l.iloc[i])
     atr_v   = float(calc_atr(df).iloc[i])
 
-    # ── Order Blocks (Pine: for i = 2 to 10) ─────────────
-    # El Pine escanea velas recientes y detecta OBs cuando precio rompe
-    # NOTA: "close > high[i]" = precio actual rompe por encima de vela bajista i barras atrás
-    active_bull_obs: List[dict] = []
-    active_bear_obs: List[dict] = []
-
+    active_bull_obs = []; active_bear_obs = []
     for k in range(2, min(11, i)):
-        ob_h = float(h.iloc[i - k])
-        ob_l = float(l.iloc[i - k])
-        ob_c = float(c.iloc[i - k])
-        ob_o = float(o.iloc[i - k])
-
-        # Bullish OB (Pine: close[i]<open[i] and close>high[i])
-        # = vela bajista + precio actual ya por encima → OB confirmado
-        if ob_c < ob_o and close_v > ob_h:
-            active_bull_obs.append({"high": ob_h, "low": ob_l, "k": k})
-
-        # Bearish OB (Pine: close[i]>open[i] and close<low[i])
-        # = vela alcista + precio actual ya por debajo → OB confirmado
-        if ob_c > ob_o and close_v < ob_l:
-            active_bear_obs.append({"high": ob_h, "low": ob_l, "k": k})
+        ob_h = float(h.iloc[i-k]); ob_l = float(l.iloc[i-k])
+        ob_c = float(c.iloc[i-k]); ob_o = float(o.iloc[i-k])
+        if ob_c < ob_o and close_v > ob_h: active_bull_obs.append({"high": ob_h, "low": ob_l})
+        if ob_c > ob_o and close_v < ob_l: active_bear_obs.append({"high": ob_h, "low": ob_l})
 
     bullish_ob = len(active_bull_obs) > 0
     bearish_ob = len(active_bear_obs) > 0
 
-    # ── Proximity check: precio cerca del OB (retest) ────
-    # Para señal de entrada, el precio debe estar retestando el OB:
-    # Bullish OB retest: precio cayó de vuelta cerca del OB (within 1 ATR above ob_high)
-    bull_ob_retest = False
-    for ob in active_bull_obs:
-        if ob["high"] <= close_v <= ob["high"] + atr_v * 1.5:
-            bull_ob_retest = True; break
+    bull_ob_retest = any(ob["high"] <= close_v <= ob["high"] + atr_v * 1.5 for ob in active_bull_obs)
+    bear_ob_retest = any(ob["low"] - atr_v * 1.5 <= close_v <= ob["low"]   for ob in active_bear_obs)
 
-    # Bearish OB retest: precio subió de vuelta cerca del OB (within 1 ATR below ob_low)
-    bear_ob_retest = False
-    for ob in active_bear_obs:
-        if ob["low"] - atr_v * 1.5 <= close_v <= ob["low"]:
-            bear_ob_retest = True; break
+    lowest_prev  = float(l.iloc[i-SMC_LB:i].min())
+    highest_prev = float(h.iloc[i-SMC_LB:i].max())
+    sweep_dn = low_v  < lowest_prev
+    sweep_up = high_v > highest_prev
 
-    # ── Liquidity Sweep (Pine: sweepLen=10 bars) ─────────
-    # sweepDown = low < ta.lowest(low[1], sweepLen) → nuevo mínimo local
-    # sweepUp   = high > ta.highest(high[1], sweepLen) → nuevo máximo local
-    sweep_len_bars = SMC_LB  # = 10
-    lowest_prev  = float(l.iloc[i - sweep_len_bars:i].min())
-    highest_prev = float(h.iloc[i - sweep_len_bars:i].max())
-    sweep_dn = low_v  < lowest_prev   # barre stops bajistas (trampa → rebote alcista)
-    sweep_up = high_v > highest_prev  # barre stops alcistas (trampa → caída bajista)
-
-    # ── BOS en HTF (Pine: bosUp_m5, bosDown_m5) ──────────
-    htf_c  = df_htf["close"]
-    htf_h  = df_htf["high"]
-    htf_l  = df_htf["low"]
-    htf_i  = len(df_htf) - 2
-
-    htf_ema9  = ema(htf_c, FAST_LEN)
-    htf_ema21 = ema(htf_c, SLOW_LEN_EMA)
+    htf_c = df_htf["close"]; htf_h = df_htf["high"]; htf_l = df_htf["low"]
+    htf_i = len(df_htf) - 2
+    htf_ema9  = ema(htf_c, FAST_LEN); htf_ema21 = ema(htf_c, SLOW_LEN_EMA)
     htf_close = float(htf_c.iloc[htf_i])
-    htf_ef    = float(htf_ema9.iloc[htf_i])
-    htf_es    = float(htf_ema21.iloc[htf_i])
+    htf_ef    = float(htf_ema9.iloc[htf_i]); htf_es = float(htf_ema21.iloc[htf_i])
+    htf_highest = float(htf_h.iloc[max(0,htf_i-20):htf_i].max())
+    htf_lowest  = float(htf_l.iloc[max(0,htf_i-20):htf_i].min())
+    bos_up   = htf_close > htf_highest
+    bos_down = htf_close < htf_lowest
+    htf_bull = htf_ef > htf_es
+    htf_bear = htf_ef < htf_es
 
-    # bosUp_m5  = m5_close > ta.highest(high, bosLookback)
-    # bosDown_m5 = m5_close < ta.lowest(low, bosLookback)
-    htf_highest = float(htf_h.iloc[max(0, htf_i - 20):htf_i].max())
-    htf_lowest  = float(htf_l.iloc[max(0, htf_i - 20):htf_i].min())
-    bos_up   = htf_close > htf_highest  # BOS alcista HTF
-    bos_down = htf_close < htf_lowest   # BOS bajista HTF
-    htf_bull = htf_ef > htf_es          # m5_emaUp
-    htf_bear = htf_ef < htf_es          # m5_emaDn
-
-    # ── Señales (Pine exacto) ─────────────────────────────
-    # Pine BUY:  inside bullish OB + sweepDown + (bosUp_m5 OR m5_emaUp)
-    # Pine SELL: inside bearish OB + sweepUp   + (bosDown_m5 OR m5_emaDn)
-    # Añadimos bull_ob_retest/bear_ob_retest para evitar falsas (precio ya lejos del OB)
-
-    long_sigs = []
-    if bullish_ob:         long_sigs.append(f"bullish_OB({len(active_bull_obs)})")
-    if bull_ob_retest:     long_sigs.append("OB_retest")
-    if sweep_dn:           long_sigs.append("sweep_low")
-    if bos_up:             long_sigs.append("HTF_BOS_up")
-    elif htf_bull:         long_sigs.append("HTF_EMA_bull")
+    long_sigs  = []
+    if bullish_ob:     long_sigs.append(f"bullish_OB({len(active_bull_obs)})")
+    if bull_ob_retest: long_sigs.append("OB_retest")
+    if sweep_dn:       long_sigs.append("sweep_low")
+    if bos_up:         long_sigs.append("HTF_BOS_up")
+    elif htf_bull:     long_sigs.append("HTF_EMA_bull")
 
     short_sigs = []
-    if bearish_ob:         short_sigs.append(f"bearish_OB({len(active_bear_obs)})")
-    if bear_ob_retest:     short_sigs.append("OB_retest")
-    if sweep_up:           short_sigs.append("sweep_high")
-    if bos_down:           short_sigs.append("HTF_BOS_down")
-    elif htf_bear:         short_sigs.append("HTF_EMA_bear")
+    if bearish_ob:     short_sigs.append(f"bearish_OB({len(active_bear_obs)})")
+    if bear_ob_retest: short_sigs.append("OB_retest")
+    if sweep_up:       short_sigs.append("sweep_high")
+    if bos_down:       short_sigs.append("HTF_BOS_down")
+    elif htf_bear:     short_sigs.append("HTF_EMA_bear")
 
-    # Las 3 condiciones del Pine son obligatorias para dirección válida
     smc_long_valid  = bullish_ob and bull_ob_retest and sweep_dn and (bos_up or htf_bull)
     smc_short_valid = bearish_ob and bear_ob_retest and sweep_up and (bos_down or htf_bear)
 
-    long_dir  = "long"  if smc_long_valid  else "none"
-    short_dir = "short" if smc_short_valid else "none"
-
-    long_r  = ModuleResult("SMC", long_dir,  len(long_sigs),  long_sigs)
-    short_r = ModuleResult("SMC", short_dir, len(short_sigs), short_sigs)
-    return long_r, short_r
+    return ModuleResult("SMC", "long"  if smc_long_valid  else "none", len(long_sigs),  long_sigs), \
+           ModuleResult("SMC", "short" if smc_short_valid else "none", len(short_sigs), short_sigs)
 
 # ══════════════════════════════════════════════════════════
-# MOTOR DE CONSENSO (anti-falsas señales)
+# CONSENSO
 # ══════════════════════════════════════════════════════════
-def eval_consensus(
-    m1_long: ModuleResult, m1_short: ModuleResult,
-    m2_long: ModuleResult, m2_short: ModuleResult,
-    m3_long: ModuleResult, m3_short: ModuleResult,
-) -> Tuple[Optional[str], int, str, str]:
-    """
-    Retorna (direction, total_score, modules_used, signals_str) o (None, 0, "", "")
+def eval_consensus(m1_l, m1_s, m2_l, m2_s, m3_l, m3_s) -> Tuple[Optional[str], int, str, str]:
+    long_results  = [r for r in [m1_l, m2_l, m3_l] if r.direction == "long"]
+    short_results = [r for r in [m1_s, m2_s, m3_s] if r.direction == "short"]
+    long_total    = sum(r.score for r in long_results)
+    short_total   = sum(r.score for r in short_results)
+    long_mods     = len(long_results)
+    short_mods    = len(short_results)
 
-    Anti-falsas señales:
-    1. Requiere MIN_MODULES módulos en la misma dirección
-    2. Score total >= MIN_SCORE
-    3. No señales contradictorias fuertes (si hay short fuerte con long fuerte → skip)
-    """
-    # Acumular longs
-    long_results  = [r for r in [m1_long, m2_long, m3_long]  if r.direction == "long"]
-    short_results = [r for r in [m1_short, m2_short, m3_short] if r.direction == "short"]
-
-    long_total  = sum(r.score for r in long_results)
-    short_total = sum(r.score for r in short_results)
-    long_mods   = len(long_results)
-    short_mods  = len(short_results)
-
-    # Contradicción fuerte: ambos lados tienen ≥2 módulos → no operar
     if long_mods >= 2 and short_mods >= 2:
         return None, 0, "", "contradicting_signals"
 
-    # Usar score mínimo del Brain si está disponible
-    combo_long  = "+".join(r.name for r in long_results)
-    combo_short = "+".join(r.name for r in short_results)
-    effective_min_l = brain.get_effective_min_score(combo_long)
-    effective_min_s = brain.get_effective_min_score(combo_short)
+    # v14: usar min_score dinámico del AdaptiveBrain
+    effective_min = ab.effective_min_score()
 
     best_dir = None; best_score = 0; best_mods = ""
+    if long_mods >= MIN_MODULES and long_total >= effective_min:
+        combo = "+".join(r.name for r in long_results)
+        if not ab.combo_is_penalized(combo):
+            best_dir = "long"; best_score = long_total; best_mods = combo
 
-    if long_mods >= MIN_MODULES and long_total >= effective_min_l:
-        mod_names = combo_long
-        all_sigs  = "; ".join(f"{r.name}:[{','.join(r.signals[:3])}]" for r in long_results)
-        best_dir = "long"; best_score = long_total; best_mods = mod_names
-
-    if short_mods >= MIN_MODULES and short_total >= effective_min_s:
-        if short_total > best_score:
-            mod_names = combo_short
-            all_sigs  = "; ".join(f"{r.name}:[{','.join(r.signals[:3])}]" for r in short_results)
-            best_dir = "short"; best_score = short_total; best_mods = mod_names
+    if short_mods >= MIN_MODULES and short_total >= effective_min:
+        combo = "+".join(r.name for r in short_results)
+        if not ab.combo_is_penalized(combo):
+            if short_total > best_score:
+                best_dir = "short"; best_score = short_total; best_mods = combo
 
     if best_dir is None:
         return None, 0, "", ""
@@ -839,13 +802,12 @@ def eval_consensus(
     return best_dir, best_score, best_mods, all_sigs
 
 # ══════════════════════════════════════════════════════════
-# INDICADORES HTF (para módulos 1 y 2)
+# HTF BIAS
 # ══════════════════════════════════════════════════════════
 def htf_bias(df: pd.DataFrame) -> Tuple[bool, bool]:
     c = df["close"]
     e48 = ema(c, BIAS_LEN); e21 = ema(c, SLOW_LEN_EMA)
-    row = df.iloc[-2]
-    cl  = float(row["close"]); e48v = float(e48.iloc[-2]); e21v = float(e21.iloc[-2])
+    cl  = float(df.iloc[-2]["close"]); e48v = float(e48.iloc[-2]); e21v = float(e21.iloc[-2])
     return (cl > e48v and e21v > e48v), (cl < e48v and e21v < e48v)
 
 # ══════════════════════════════════════════════════════════
@@ -853,35 +815,27 @@ def htf_bias(df: pd.DataFrame) -> Tuple[bool, bool]:
 # ══════════════════════════════════════════════════════════
 def scan_symbol(ex, symbol) -> Optional[dict]:
     try:
-        df   = fetch_df(ex, symbol, TF,   400)
-        df1  = fetch_df(ex, symbol, HTF1, 200)
-        df2  = fetch_df(ex, symbol, HTF2, 300)
+        df  = fetch_df(ex, symbol, TF,   400)
+        df1 = fetch_df(ex, symbol, HTF1, 200)
+        df2 = fetch_df(ex, symbol, HTF2, 300)
+        if len(df) < 100 or len(df1) < 50 or len(df2) < 50: return None
 
-        if len(df) < 100 or len(df1) < 50 or len(df2) < 50:
-            return None
-
-        # Indicadores básicos para filtrado rápido
-        rsi_s = calc_rsi(df["close"])
-        atr_s = calc_atr(df)
+        rsi_s = calc_rsi(df["close"]); atr_s = calc_atr(df)
         dip, dim, adx_s = calc_adx(df)
-
-        rsi_v = float(rsi_s.iloc[-2])
-        adx_v = float(adx_s.iloc[-2])
-
-        if pd.isna(adx_v) or pd.isna(rsi_v):
-            return None
+        rsi_v = float(rsi_s.iloc[-2]); adx_v = float(adx_s.iloc[-2])
+        if pd.isna(adx_v) or pd.isna(rsi_v): return None
 
         htf1_bull, htf1_bear = htf_bias(df1)
         htf2_bull, htf2_bear = htf_bias(df2)
 
-        # ── Ejecutar los 3 módulos ───────────────────────
         m1_l, m1_s = module_confirmacion_pro(df, htf1_bull, htf1_bear)
         m2_l, m2_s = module_bollinger_hunter(df, htf2_bull, htf2_bear)
         m3_l, m3_s = module_smc(df, df1)
 
-        direction, total_score, modules, signals = eval_consensus(
-            m1_l, m1_s, m2_l, m2_s, m3_l, m3_s
-        )
+        direction, total_score, modules, signals = eval_consensus(m1_l, m1_s, m2_l, m2_s, m3_l, m3_s)
+
+        atr_v_val = float(atr_s.iloc[-2])
+        price_v   = float(df["close"].iloc[-2])
 
         return {
             "symbol":    symbol,
@@ -892,11 +846,11 @@ def scan_symbol(ex, symbol) -> Optional[dict]:
             "signals":   signals,
             "rsi":       rsi_v,
             "adx":       adx_v,
-            "atr":       float(atr_s.iloc[-2]),
-            "live_price":float(df["close"].iloc[-2]),
+            "atr":       atr_v_val,
+            "live_price": price_v,
             "vol_ma":    float(df["volume"].rolling(20).mean().iloc[-2]),
             "row":       df.iloc[-2],
-            # módulos individuales para debug
+            "sl_mult":   dynamic_sl_mult(atr_v_val, price_v),  # v14
             "m1_l": m1_l, "m1_s": m1_s,
             "m2_l": m2_l, "m2_s": m2_s,
             "m3_l": m3_l, "m3_s": m3_s,
@@ -912,34 +866,32 @@ def update_btc_bias(ex):
     prev_bull = state.btc_bull; prev_bear = state.btc_bear
     try:
         df  = fetch_df(ex, "BTC/USDT:USDT", "1h", limit=250)
-        e48 = ema(df["close"], BIAS_LEN)
-        e200= ema(df["close"], MA200)
-        adx = calc_adx(df)[2]
-        rsi = calc_rsi(df["close"])
+        e48 = ema(df["close"], BIAS_LEN); e200 = ema(df["close"], MA200)
+        adx = calc_adx(df)[2]; rsi = calc_rsi(df["close"])
         r   = df.iloc[-2]
         state.btc_bull = bool(float(r["close"]) > float(e48.iloc[-2]) and float(e48.iloc[-2]) > float(e200.iloc[-2]))
         state.btc_bear = bool(float(r["close"]) < float(e48.iloc[-2]) and float(e48.iloc[-2]) < float(e200.iloc[-2]))
         state.btc_rsi  = float(rsi.iloc[-2])
         state.btc_adx  = float(adx.iloc[-2])
-        log.info(f"BTC: {'BULL' if state.btc_bull else 'BEAR' if state.btc_bear else 'NEUTRAL'}"
-                 f" RSI:{state.btc_rsi:.1f} ADX:{state.btc_adx:.1f}")
+        state.market_lateral = is_market_lateral()
+
+        status = "BULL" if state.btc_bull else "BEAR" if state.btc_bear else "NEUTRAL"
+        lateral_tag = " [LATERAL]" if state.market_lateral else ""
+        log.info(f"BTC: {status}{lateral_tag} RSI:{state.btc_rsi:.1f} ADX:{state.btc_adx:.1f}")
         tg_btc_flip(prev_bull, prev_bear)
     except Exception as e:
         log.warning(f"BTC bias: {e}")
 
 # ══════════════════════════════════════════════════════════
-# BTC FILTER ADAPTATIVO
+# BTC FILTER
 # ══════════════════════════════════════════════════════════
 def btc_allows(direction: str, score: int) -> Tuple[bool, str]:
-    if not BTC_FILTER:
-        return True, ""
+    if not BTC_FILTER: return True, ""
     btc_strong = state.btc_adx > 22
-    if direction == "long":
-        if state.btc_bear and btc_strong and score < 9:
-            return False, f"BTC bajista fuerte (ADX:{state.btc_adx:.0f})"
-    if direction == "short":
-        if state.btc_bull and btc_strong and score < 9:
-            return False, f"BTC alcista fuerte (ADX:{state.btc_adx:.0f})"
+    if direction == "long"  and state.btc_bear and btc_strong and score < 9:
+        return False, f"BTC bajista fuerte (ADX:{state.btc_adx:.0f})"
+    if direction == "short" and state.btc_bull and btc_strong and score < 9:
+        return False, f"BTC alcista fuerte (ADX:{state.btc_adx:.0f})"
     return True, ""
 
 # ══════════════════════════════════════════════════════════
@@ -958,24 +910,29 @@ def tg(msg: str, parse_mode="HTML"):
     except Exception as e: log.warning(f"TG: {e}")
 
 def tg_startup(balance: float, n: int):
-    btc_icon = "🟢" if state.btc_bull else "🔴" if state.btc_bear else "⚪"
+    fng = ab.get_fear_greed()
+    fng_label = "😱 Miedo ext." if fng < 25 else "🤑 Codicia ext." if fng > 75 else "😐 Neutral"
+    btc_icon  = "🟢" if state.btc_bull else "🔴" if state.btc_bear else "⚪"
+    hora_bonus = ab.hour_score_bonus()
     tg(
-        f"🚀 <b>SATY ELITE v13 — ONLINE</b>\n"
+        f"🚀 <b>SATY ELITE v14 — ONLINE</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 Balance: <b>${balance:.2f} USDT</b>\n"
-        f"📊 Universo: <b>{n} pares</b> (min ${MIN_VOLUME_USDT/1000:.0f}k vol)\n"
+        f"📊 Universo: <b>{n} pares</b>\n"
         f"⏱ TF: {TF} · {HTF1} · {HTF2}\n"
-        f"🎯 Score mín: {MIN_SCORE} | Módulos mín: {MIN_MODULES}/3\n"
-        f"📈 Max trades: {MAX_OPEN_TRADES}  |  💵 ${FIXED_USDT:.0f}×{int(LEVERAGE)}×\n"
-        f"⏸ Cooldown: {COOLDOWN_MIN}min  |  Spread max: {MAX_SPREAD_PCT}%\n"
+        f"🎯 Score base: {MIN_SCORE} | Dinámico: {ab.min_score_dynamic}\n"
+        f"⏰ Bonus horario: +{hora_bonus}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Módulos activos:\n"
-        f"  1️⃣ Confirmación PRO (Squeeze+BB+Vol+EMA)\n"
-        f"  2️⃣ Bollinger Hunter (W/M+Div+Breakout)\n"
-        f"  3️⃣ SMC (OB+Sweep+BOS)\n"
+        f"🆕 Filtros v14:\n"
+        f"  💰 Funding Rate: {'✅' if FUNDING_FILTER else '❌'}\n"
+        f"  😱 Fear&Greed: {fng_label} ({fng}) {'✅' if FNG_FILTER else '❌'}\n"
+        f"  ⏰ Filtro horario: {'✅' if HOUR_FILTER else '❌'}\n"
+        f"  📉 SL dinámico: ✅\n"
+        f"  ⏸ Pausa lateral: ✅\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{btc_icon} BTC: {'ALCISTA' if state.btc_bull else 'BAJISTA' if state.btc_bear else 'NEUTRO'}"
-        f" RSI:{state.btc_rsi:.0f} ADX:{state.btc_adx:.0f}\n"
+        f" RSI:{state.btc_rsi:.0f} ADX:{state.btc_adx:.0f}"
+        f"{' [LATERAL]' if state.market_lateral else ''}\n"
         f"⏰ {utcnow()}"
     )
 
@@ -985,42 +942,40 @@ def tg_signal(t: TradeState):
     sl_d   = abs(t.sl_price - t.entry_price)
     rr3    = abs(t.tp3_price - t.entry_price) / max(sl_d, 1e-9)
     def pct(p): return abs(p - t.entry_price) / t.entry_price * 100
-    btc_icon = "🟢" if state.btc_bull else "🔴" if state.btc_bear else "⚪"
+    fng = ab.fng_value
     tg(
         f"{emoji} <b>{accion} — {t.symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🧠 Módulos: <b>{t.modules_used}</b>\n"
-        f"🎯 Score: <b>{t.entry_score}/15</b>\n"
+        f"🎯 Score: <b>{t.entry_score}</b> (mín efectivo: {ab.effective_min_score()})\n"
         f"📋 Señales: <code>{t.active_signals[:120]}</code>\n"
+        f"📏 SL mult: {t.sl_mult:.1f}×ATR\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 Entrada: <code>{t.entry_price:.6g}</code>\n"
-        f"🟡 TP1 (25%): <code>{t.tp1_price:.6g}</code>  +{pct(t.tp1_price):.2f}%\n"
-        f"🟠 TP2 (25%): <code>{t.tp2_price:.6g}</code>  +{pct(t.tp2_price):.2f}%\n"
-        f"🟢 TP3 (50%): <code>{t.tp3_price:.6g}</code>  +{pct(t.tp3_price):.2f}%  R:R 1:{rr3:.1f}\n"
+        f"🟡 TP1: <code>{t.tp1_price:.6g}</code>  +{pct(t.tp1_price):.2f}%\n"
+        f"🟠 TP2: <code>{t.tp2_price:.6g}</code>  +{pct(t.tp2_price):.2f}%\n"
+        f"🟢 TP3: <code>{t.tp3_price:.6g}</code>  +{pct(t.tp3_price):.2f}%  R:R 1:{rr3:.1f}\n"
         f"🛑 SL: <code>{t.sl_price:.6g}</code>  -{pct(t.sl_price):.2f}%\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{btc_icon} BTC RSI:{state.btc_rsi:.0f} ADX:{state.btc_adx:.0f}\n"
+        f"😱 F&G: {fng} | BTC RSI:{state.btc_rsi:.0f} ADX:{state.btc_adx:.0f}\n"
         f"📦 Posiciones: {state.open_count()}/{MAX_OPEN_TRADES}\n"
         f"⏰ {utcnow()}"
     )
 
 def tg_close(reason: str, t: TradeState, exit_p: float, pnl: float):
-    win   = pnl > 0
-    emoji = "✅" if win else "❌"
-    pct   = (pnl / (t.entry_price * t.contracts) * 100) if t.contracts > 0 else 0
+    win = pnl > 0; emoji = "✅" if win else "❌"
+    pct = (pnl / (t.entry_price * t.contracts) * 100) if t.contracts > 0 else 0
     tg(
         f"{emoji} <b>CERRADO — {t.symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📋 {t.side.upper()} | {t.modules_used} | {reason}\n"
-        f"🚪 Entrada: <code>{t.entry_price:.6g}</code>\n"
-        f"🚪 Salida:  <code>{exit_p:.6g}</code>\n"
+        f"🚪 Entrada: <code>{t.entry_price:.6g}</code> → Salida: <code>{exit_p:.6g}</code>\n"
         f"{'📈' if win else '📉'} <b>{pct:+.2f}%  ${pnl:+.2f}</b>\n"
-        f"🏔 Máx trade: +{t.max_profit_pct:.2f}%\n"
+        f"🏔 Máx: +{t.max_profit_pct:.2f}%\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 {state.wins}W/{state.losses}L"
-        f" | WR:{state.win_rate():.1f}%"
-        f" | PF:{state.profit_factor():.2f}\n"
+        f"📊 {state.wins}W/{state.losses}L | WR:{state.win_rate():.1f}% | PF:{state.profit_factor():.2f}\n"
         f"💹 Hoy: ${state.daily_pnl:+.2f} | Total: ${state.total_pnl:+.2f}\n"
+        f"🧠 MIN_SCORE dinámico: {ab.min_score_dynamic}\n"
         f"⏰ {utcnow()}"
     )
 
@@ -1031,21 +986,29 @@ def tg_heartbeat(balance: float):
         f" [{ts.modules_used}] {'🛡' if ts.sl_moved_be else ''}+{ts.max_profit_pct:.1f}%"
         for sym, ts in state.trades.items()
     ) or "  (ninguna)"
+    fng = ab.fng_value
+    fng_label = "😱 Miedo" if fng < 25 else "🤑 Codicia" if fng > 75 else "😐 Neutral"
     tg(
-        f"💓 <b>HEARTBEAT — SATY v13</b>\n"
+        f"💓 <b>HEARTBEAT — SATY v14</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 Balance: <b>${balance:.2f} USDT</b>\n"
         f"📅 Hoy: <b>${state.daily_pnl:+.2f}</b> | Total: <b>${state.total_pnl:+.2f}</b>\n"
         f"📊 {state.wins}W/{state.losses}L | WR:{state.win_rate():.1f}% | PF:{state.profit_factor():.2f}\n"
-        f"🔍 Señales: {state.signals_found} ok / {state.signals_blocked} bloqueadas\n"
+        f"🧠 MIN_SCORE: {ab.min_score_dynamic} (+{ab.hour_score_bonus()} hora) = {ab.effective_min_score()}\n"
+        f"😱 F&G: {fng} {fng_label}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📦 Posiciones ({state.open_count()}/{MAX_OPEN_TRADES}):\n{open_lines}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{brain.telegram_summary_line()}\n"
         f"{'🟢' if state.btc_bull else '🔴' if state.btc_bear else '⚪'} BTC"
-        f" RSI:{state.btc_rsi:.0f} ADX:{state.btc_adx:.0f}\n"
+        f" RSI:{state.btc_rsi:.0f} ADX:{state.btc_adx:.0f}"
+        f"{' ⏸LATERAL' if state.market_lateral else ''}\n"
         f"⏰ {utcnow()}"
     )
+
+def tg_lateral_pause():
+    tg(f"⏸ <b>MERCADO LATERAL</b>\n"
+       f"BTC ADX:{state.btc_adx:.1f} < {ADX_LATERAL_MAX} + sin tendencia\n"
+       f"Pausando nuevas entradas hasta que haya dirección clara.\n⏰ {utcnow()}")
 
 def tg_summary(new_signals: list, n_scanned: int):
     top = "\n".join(
@@ -1059,10 +1022,11 @@ def tg_summary(new_signals: list, n_scanned: int):
     ) or "  (ninguna)"
     tg(
         f"📡 <b>SCAN #{state.scan_count}</b>\n"
-        f"🔍 Escaneados: {n_scanned} | Señales válidas: {state.signals_found}\n"
+        f"🔍 Escaneados: {n_scanned} | Válidas: {state.signals_found}\n"
         f"📶 Entradas:\n{top}\n"
         f"🚫 Bloqueadas:\n{blocked}\n"
         f"📊 {state.wins}W/{state.losses}L | Total: ${state.total_pnl:+.2f}\n"
+        f"😱 F&G: {ab.fng_value} | Score efectivo: {ab.effective_min_score()}\n"
         f"⏰ {utcnow()}"
     )
 
@@ -1090,10 +1054,10 @@ def log_csv(action, t: TradeState, price, pnl=0.0):
         with open(CSV_PATH, "a", newline="") as f:
             w = csv.writer(f)
             if not exists:
-                w.writerow(["ts","action","symbol","side","modules","score","entry","exit","pnl","contracts"])
+                w.writerow(["ts","action","symbol","side","modules","score","entry","exit","pnl","contracts","sl_mult"])
             w.writerow([utcnow(), action, t.symbol, t.side,
                         t.modules_used, t.entry_score,
-                        t.entry_price, price, round(pnl,4), t.contracts])
+                        t.entry_price, price, round(pnl,4), t.contracts, t.sl_mult])
     except Exception as e:
         log.warning(f"CSV: {e}")
 
@@ -1171,31 +1135,41 @@ def get_symbols(ex):
     for sym in candidates:
         tk  = tickers.get(sym, {})
         vol = float(tk.get("quoteVolume", 0) or 0)
-        if vol >= MIN_VOLUME_USDT:
-            ranked.append((sym, vol))
+        if vol >= MIN_VOLUME_USDT: ranked.append((sym, vol))
     ranked.sort(key=lambda x: -x[1])
     result = [s for s, _ in ranked[:TOP_N_SYMBOLS]]
-    log.info(f"Universo: {len(result)} pares (>${MIN_VOLUME_USDT/1000:.0f}k vol)")
+    log.info(f"Universo: {len(result)} pares")
     return result
 
 # ══════════════════════════════════════════════════════════
 # APERTURA / CIERRE
 # ══════════════════════════════════════════════════════════
-def open_trade(ex, symbol, base, side, score, modules, signals, atr_v, swing_low, swing_high):
+def open_trade(ex, symbol, base, side, score, modules, signals, atr_v, swing_low, swing_high, sl_mult=1.0):
     try:
         spread = get_spread_pct(ex, symbol)
         if spread > MAX_SPREAD_PCT:
             log.warning(f"[{symbol}] spread {spread:.3f}% — skip")
             return None
 
-        # 🧠 Brain: verificar si este trade tiene sentido según historial
         can_enter, brain_size, brain_reason = check_entry(score, modules, FIXED_USDT * state.risk_mult())
         if not can_enter:
-            log.info(f"[{symbol}] Brain bloqueó entrada: {brain_reason}")
+            log.info(f"[{symbol}] Brain bloqueó: {brain_reason}")
+            return None
+
+        # v14: verificar funding y FNG antes de abrir
+        direction = "long" if side == "buy" else "short"
+        ok_fund, reason_fund = ab.funding_allows(ex, symbol, direction)
+        if not ok_fund:
+            log.info(f"[{symbol}] Funding bloqueado: {reason_fund}")
+            return None
+
+        ok_fng, reason_fng = ab.fng_allows(direction)
+        if not ok_fng:
+            log.info(f"[{symbol}] FNG bloqueado: {reason_fng}")
             return None
 
         price    = get_last_price(ex, symbol)
-        usdt     = brain_size  # ← tamaño ajustado por Brain (hora del día)
+        usdt     = brain_size
         mkt      = ex.markets.get(symbol, {})
         cs       = float(mkt.get("contractSize") or mkt.get("info",{}).get("contractSize") or 1.0)
         notional = usdt * LEVERAGE
@@ -1219,19 +1193,20 @@ def open_trade(ex, symbol, base, side, score, modules, signals, atr_v, swing_low
         entry_price = float(order.get("average") or price)
         trade_side  = "long" if side == "buy" else "short"
 
+        # v14: SL dinámico por volatilidad
+        sl_distance = atr_v * SL_ATR * sl_mult
+
         if side == "buy":
-            sl_p  = min(swing_low - atr_v * 0.2, entry_price - atr_v * SL_ATR)
+            sl_p  = min(swing_low - atr_v * 0.2, entry_price - sl_distance)
             tp1_p = entry_price + atr_v * TP1_MULT
             tp2_p = entry_price + atr_v * TP2_MULT
             tp3_p = entry_price + atr_v * TP3_MULT
         else:
-            sl_p  = max(swing_high + atr_v * 0.2, entry_price + atr_v * SL_ATR)
+            sl_p  = max(swing_high + atr_v * 0.2, entry_price + sl_distance)
             tp1_p = entry_price - atr_v * TP1_MULT
             tp2_p = entry_price - atr_v * TP2_MULT
             tp3_p = entry_price - atr_v * TP3_MULT
 
-        for attr, val in [("tp1",tp1_p),("tp2",tp2_p),("tp3",tp3_p),("sl",sl_p)]:
-            locals()[f"{attr}_p"] = float(ex.price_to_precision(symbol, val))
         tp1_p = float(ex.price_to_precision(symbol, tp1_p))
         tp2_p = float(ex.price_to_precision(symbol, tp2_p))
         tp3_p = float(ex.price_to_precision(symbol, tp3_p))
@@ -1255,12 +1230,12 @@ def open_trade(ex, symbol, base, side, score, modules, signals, atr_v, swing_low
             entry_price=entry_price, tp1_price=tp1_p, tp2_price=tp2_p, tp3_price=tp3_p,
             sl_price=sl_p, entry_score=score, modules_used=modules,
             active_signals=signals[:150], entry_time=utcnow(),
-            contracts=amount, atr_entry=atr_v,
+            contracts=amount, atr_entry=atr_v, sl_mult=sl_mult,
         )
         t.trail_high = t.trail_low = t.peak_price = entry_price
         log_csv("OPEN", t, entry_price)
         tg_signal(t)
-        log.info(f"[OPEN] {symbol} {trade_side.upper()} score={score} [{modules}]")
+        log.info(f"[OPEN] {symbol} {trade_side.upper()} score={score} [{modules}] SL×{sl_mult:.1f}")
         return t
     except Exception as e:
         log.error(f"[{symbol}] open_trade: {e}")
@@ -1295,6 +1270,7 @@ def close_trade(ex, symbol, reason, price):
             pnl = ((price - t.entry_price) if t.side == "long" else (t.entry_price - price)) * contracts
         except Exception as e:
             log.error(f"[{symbol}] close: {e}"); return
+
     if pnl > 0: state.wins += 1; state.gross_profit += pnl; state.consec_losses = 0
     else:        state.losses += 1; state.gross_loss += abs(pnl); state.consec_losses += 1
     state.total_pnl += pnl; state.daily_pnl += pnl
@@ -1302,7 +1278,11 @@ def close_trade(ex, symbol, reason, price):
     state.set_cooldown(symbol)
     log_csv("CLOSE", t, price, pnl)
     tg_close(reason, t, price, pnl)
-    # 🧠 Enseñar al Brain
+
+    # v14: enseñar al AdaptiveBrain
+    ab.record_trade(t.modules_used, pnl)
+    ab.adapt_min_score(state.wins, state.losses)
+
     on_trade_closed(t, pnl, reason, state.btc_bull, state.btc_bear, state.btc_adx)
     del state.trades[symbol]
 
@@ -1316,41 +1296,38 @@ def manage_trade(ex, symbol, live_price, atr_v, res, live_pos):
     if live_pos is None:
         pnl = ((live_price - t.entry_price) if t.side=="long" else (t.entry_price - live_price)) * t.contracts
         reason = ("TP3 COMPLETO" if (t.side=="long" and live_price>=t.tp3_price) or
-                                     (t.side=="short" and live_price<=t.tp3_price)
-                  else "SL ALCANZADO")
+                                     (t.side=="short" and live_price<=t.tp3_price) else "SL ALCANZADO")
         if pnl > 0: state.wins += 1; state.gross_profit += pnl; state.consec_losses = 0
         else:        state.losses += 1; state.gross_loss += abs(pnl); state.consec_losses += 1
         state.total_pnl += pnl; state.daily_pnl += pnl
         state.set_cooldown(symbol)
         log_csv("CLOSE_EXT", t, live_price, pnl)
         tg_close(reason, t, live_price, pnl)
-        # 🧠 Enseñar al Brain
+        ab.record_trade(t.modules_used, pnl)
+        ab.adapt_min_score(state.wins, state.losses)
         on_trade_closed(t, pnl, reason, state.btc_bull, state.btc_bear, state.btc_adx)
         del state.trades[symbol]; return
 
-    # TP1 → break-even
     if not t.tp1_hit:
         hit = (t.side=="long" and live_price>=t.tp1_price) or (t.side=="short" and live_price<=t.tp1_price)
         if hit:
             t.tp1_hit = True; t.sl_moved_be = True; t.peak_price = live_price
             pnl_est = abs(t.tp1_price - t.entry_price) * float(live_pos.get("contracts",0)) * 0.25
             move_sl_to(ex, symbol, t.entry_price)
-            tg(f"🟡 <b>TP1 + BE</b> — {t.symbol}\n💰 +${pnl_est:.2f} | SL→entrada\n🎯 Próximo TP2: <code>{t.tp2_price:.6g}</code>\n⏰ {utcnow()}")
+            tg(f"🟡 <b>TP1 + BE</b> — {t.symbol}\n💰 +${pnl_est:.2f} | SL→entrada\n🎯 TP2: <code>{t.tp2_price:.6g}</code>\n⏰ {utcnow()}")
 
-    # TP2 → SL sube a TP1
     if t.tp1_hit and not t.tp2_hit:
         hit2 = (t.side=="long" and live_price>=t.tp2_price) or (t.side=="short" and live_price<=t.tp2_price)
         if hit2:
             t.tp2_hit = True
             pnl_est = abs(t.tp2_price - t.entry_price) * float(live_pos.get("contracts",0)) * 0.25
             move_sl_to(ex, symbol, t.tp1_price)
-            tg(f"🟠 <b>TP2 ALCANZADO</b> — {t.symbol}\n💰 +${pnl_est:.2f} | SL→TP1\n🎯 TP3: <code>{t.tp3_price:.6g}</code>\n⏰ {utcnow()}")
+            tg(f"🟠 <b>TP2</b> — {t.symbol}\n💰 +${pnl_est:.2f} | SL→TP1\n🎯 TP3: <code>{t.tp3_price:.6g}</code>\n⏰ {utcnow()}")
 
-    # Trailing dinámico
     if t.tp1_hit and symbol in state.trades:
-        atr_t    = atr_v if atr_v > 0 else t.atr_entry
-        cur_pct  = ((live_price - t.entry_price)/t.entry_price*100 if t.side=="long"
-                    else (t.entry_price - live_price)/t.entry_price*100)
+        atr_t   = atr_v if atr_v > 0 else t.atr_entry
+        cur_pct = ((live_price - t.entry_price)/t.entry_price*100 if t.side=="long"
+                   else (t.entry_price - live_price)/t.entry_price*100)
         t.max_profit_pct = max(t.max_profit_pct, cur_pct)
 
         new_peak = (live_price > t.peak_price if t.side=="long" else live_price < t.peak_price)
@@ -1361,7 +1338,6 @@ def manage_trade(ex, symbol, live_price, atr_v, res, live_pos):
         retrace = ((t.peak_price - live_price)/max(denom,1e-9)*100 if t.side=="long"
                    else (live_price - t.peak_price)/max(denom,1e-9)*100)
 
-        prev_phase = t.trail_phase
         if cur_pct > 5.0:       t.trail_phase = "ultra"
         elif retrace > 30:       t.trail_phase = "locked"
         elif t.stall_count >= 3: t.trail_phase = "tight"
@@ -1377,19 +1353,17 @@ def manage_trade(ex, symbol, live_price, atr_v, res, live_pos):
             if live_price >= t.trail_low + atr_t * trail_m:
                 close_trade(ex, symbol, f"TRAILING {t.trail_phase.upper()}", live_price); return
 
-    # Pérdida dinámica pre-TP1
     if not t.tp1_hit and symbol in state.trades:
         atr_now   = atr_v if atr_v > 0 else t.atr_entry
         loss_dist = (t.entry_price - live_price if t.side=="long" else live_price - t.entry_price)
-        if loss_dist >= atr_now * 0.8:
-            close_trade(ex, symbol, "PÉRDIDA DINÁMICA (0.8×ATR)", live_price); return
+        if loss_dist >= atr_now * 0.8 * t.sl_mult:
+            close_trade(ex, symbol, f"PÉRDIDA DINÁMICA ({t.sl_mult:.1f}×ATR)", live_price); return
 
-    # Cierre por señal opuesta fuerte (requiere MIN_MODULES módulos opuestos)
     if res and symbol in state.trades:
         direction = res.get("direction")
-        if t.side == "long"  and direction == "short" and res.get("score",0) >= MIN_SCORE + 2:
+        if t.side == "long"  and direction == "short" and res.get("score",0) >= ab.effective_min_score() + 2:
             close_trade(ex, symbol, f"FLIP SHORT score={res['score']}", live_price)
-        elif t.side == "short" and direction == "long"  and res.get("score",0) >= MIN_SCORE + 2:
+        elif t.side == "short" and direction == "long"  and res.get("score",0) >= ab.effective_min_score() + 2:
             close_trade(ex, symbol, f"FLIP LONG score={res['score']}", live_price)
 
 # ══════════════════════════════════════════════════════════
@@ -1398,7 +1372,7 @@ def manage_trade(ex, symbol, live_price, atr_v, res, live_pos):
 def main():
     global HEDGE_MODE
     log.info("=" * 65)
-    log.info("  SATY ELITE v13 — Motor multi-módulo 3 estrategias")
+    log.info("  SATY ELITE v14 — Brain adaptativo + Funding + F&G + SL dinámico")
     log.info("=" * 65)
 
     if not (API_KEY and API_SECRET):
@@ -1427,6 +1401,9 @@ def main():
     state.peak_equity = balance; state.daily_reset_ts = time.time()
     state.last_heartbeat = time.time()
 
+    # Precalentar Fear & Greed
+    ab.get_fear_greed()
+
     symbols = []
     while not symbols:
         try: ex.load_markets(); symbols = get_symbols(ex)
@@ -1439,7 +1416,8 @@ def main():
     REFRESH_EVERY = max(1, 3600 // max(POLL_SECS, 1))
     BTC_REFRESH   = max(1, 900  // max(POLL_SECS, 1))
     SUMMARY_EVERY = 20
-    prev_cb = False; prev_dl = False
+    FNG_REFRESH   = max(1, 3600 // max(POLL_SECS, 1))
+    prev_cb = False; prev_dl = False; prev_lateral = False
 
     while True:
         ts_start = time.time()
@@ -1449,16 +1427,22 @@ def main():
 
             log.info(f"SCAN #{scan_count} | {datetime.now(timezone.utc):%H:%M:%S} "
                      f"| {state.open_count()}/{MAX_OPEN_TRADES} | "
-                     f"señales ok:{state.signals_found} bloq:{state.signals_blocked}")
+                     f"score_eff:{ab.effective_min_score()} | F&G:{ab.fng_value}")
 
             if scan_count % REFRESH_EVERY == 0:
                 try: ex.load_markets(); symbols = get_symbols(ex)
                 except Exception as e: log.warning(f"Refresh: {e}")
             if scan_count % BTC_REFRESH == 0:
                 update_btc_bias(ex)
+            if scan_count % FNG_REFRESH == 0:
+                ab.get_fear_greed()
             if time.time() - state.last_heartbeat > 3600:
                 try: tg_heartbeat(get_balance(ex)); state.last_heartbeat = time.time()
                 except Exception: pass
+
+            # Brain report cada 50 scans
+            if scan_count % 50 == 0 and (state.wins + state.losses) >= 5:
+                tg(ab.telegram_report())
 
             cb_now = state.cb_active()
             if cb_now and not prev_cb:
@@ -1471,6 +1455,25 @@ def main():
             if dl_now and not prev_dl: tg_daily_limit()
             prev_dl = dl_now
             if dl_now: time.sleep(POLL_SECS); continue
+
+            # v14: pausa mercado lateral
+            if state.market_lateral:
+                if not prev_lateral:
+                    tg_lateral_pause()
+                prev_lateral = True
+                # Gestionar posiciones abiertas pero no abrir nuevas
+                live_positions = get_all_positions(ex)
+                for sym in list(state.trades.keys()):
+                    try:
+                        lp   = live_positions.get(sym)
+                        lp_  = float(lp["markPrice"]) if lp else get_last_price(ex, sym)
+                        res  = scan_symbol(ex, sym)
+                        atr_v = res["atr"] if res else state.trades[sym].atr_entry
+                        manage_trade(ex, sym, lp_, atr_v, res, lp)
+                    except Exception as e: log.warning(f"[{sym}] manage: {e}")
+                time.sleep(POLL_SECS)
+                continue
+            prev_lateral = False
 
             # Gestionar posiciones abiertas
             live_positions = get_all_positions(ex)
@@ -1494,7 +1497,7 @@ def main():
                     and not state.in_cooldown(s)
                     and s.split("/")[0] not in bases_open
                 ]
-                log.info(f"Escaneando {len(to_scan)} pares con 3 módulos...")
+                log.info(f"Escaneando {len(to_scan)} pares...")
 
                 with ThreadPoolExecutor(max_workers=8) as pool:
                     futures = {pool.submit(scan_symbol, ex, s): s for s in to_scan}
@@ -1505,12 +1508,22 @@ def main():
                     score     = res.get("score", 0)
                     if direction is None: continue
 
+                    # v14: múltiples filtros en cadena
                     allowed, block_reason = btc_allows(direction, score)
                     if not allowed:
                         state.signals_blocked += 1
-                        state.last_discarded.append({
-                            "symbol": res["symbol"], "score": score, "reason": block_reason
-                        })
+                        state.last_discarded.append({"symbol": res["symbol"], "score": score, "reason": block_reason})
+                        continue
+
+                    ok_fng, reason_fng = ab.fng_allows(direction)
+                    if not ok_fng:
+                        state.signals_blocked += 1
+                        state.last_discarded.append({"symbol": res["symbol"], "score": score, "reason": reason_fng})
+                        continue
+
+                    if ab.combo_is_penalized(res.get("modules", "")):
+                        state.signals_blocked += 1
+                        state.last_discarded.append({"symbol": res["symbol"], "score": score, "reason": f"combo penalizado: {res['modules']}"})
                         continue
 
                     state.signals_found += 1
@@ -1524,24 +1537,22 @@ def main():
                     if sym in state.trades or state.base_has_trade(base): continue
                     if state.in_cooldown(sym): continue
 
-                    row  = res["row"]
+                    row   = res["row"]
                     atr_v = res["atr"]
-                    sl_l = float(df["low"].rolling(10).min().iloc[-2]) if False else \
-                           float(row.get("swing_low", row["low"]) if hasattr(row, 'get') else row["low"])
-                    sl_h = float(row.get("swing_high", row["high"]) if hasattr(row, 'get') else row["high"])
+                    sl_l  = float(row["low"]); sl_h = float(row["high"])
 
-                    # Calcular swing_low/high directamente
                     try:
                         df_tmp = fetch_df(ex, sym, TF, 50)
-                        sl_l = float(df_tmp["low"].rolling(10).min().iloc[-2])
-                        sl_h = float(df_tmp["high"].rolling(10).max().iloc[-2])
+                        sl_l   = float(df_tmp["low"].rolling(10).min().iloc[-2])
+                        sl_h   = float(df_tmp["high"].rolling(10).max().iloc[-2])
                     except Exception: pass
 
                     t = open_trade(
                         ex, sym, base,
                         "buy"  if res["direction"] == "long" else "sell",
                         res["score"], res["modules"], res["signals"],
-                        atr_v, sl_l, sl_h
+                        atr_v, sl_l, sl_h,
+                        sl_mult=res.get("sl_mult", 1.0)  # v14: SL dinámico
                     )
                     if t: state.trades[sym] = t
 
@@ -1551,16 +1562,10 @@ def main():
             if scan_count % SUMMARY_EVERY == 0:
                 tg_summary(new_signals, len(to_scan))
 
-            # 🧠 Brain report cada 50 scans
-            if scan_count % 50 == 0 and brain.data.total_trades >= 5:
-                tg(brain.telegram_report())
-                # También enviar distribución de WR por score
-                dist = brain.score_distribution_bar()
-                if dist: tg(f"<code>{dist}</code>")
-
             elapsed = time.time() - ts_start
             log.info(f"Ciclo {elapsed:.1f}s | {state.wins}W/{state.losses}L | "
-                     f"hoy:${state.daily_pnl:+.2f} | total:${state.total_pnl:+.2f}")
+                     f"hoy:${state.daily_pnl:+.2f} | total:${state.total_pnl:+.2f} | "
+                     f"score_eff:{ab.effective_min_score()}")
 
         except ccxt.NetworkError as e:
             log.warning(f"Network: {e} — 15s"); time.sleep(15)
