@@ -13,7 +13,7 @@ VARIABLES OPCIONALES (con defaults):
   MIN_FUNDING       = 0.03     # Funding rate minimo para abrir (0.03%)
   SCAN_INTERVAL     = 300      # Segundos entre escaneos
   DRY_RUN           = false    # Si true, solo simula sin operar
-  CLOSE_THRESHOLD   = 0.005    # Funding rate para cerrar posicion
+  CLOSE_THRESHOLD   = 0.01     # Funding rate para cerrar posicion
 """
 
 import os, time, hmac, hashlib, logging, requests
@@ -27,26 +27,30 @@ logging.basicConfig(
 log = logging.getLogger("funding_bot")
 
 # ── Config desde variables de entorno ────────────────────────────────────────
-API_KEY        = os.environ["BINGX_API_KEY"]
-API_SECRET     = os.environ["BINGX_API_SECRET"]
-TG_TOKEN       = os.environ["TELEGRAM_BOT_TOKEN"]
-TG_CHAT        = os.environ["TELEGRAM_CHAT_ID"]
+API_KEY         = os.environ["BINGX_API_KEY"]
+API_SECRET      = os.environ["BINGX_API_SECRET"]
+TG_TOKEN        = os.environ["TELEGRAM_BOT_TOKEN"]
+TG_CHAT         = os.environ["TELEGRAM_CHAT_ID"]
 
 CAPITAL_USDT    = float(os.getenv("CAPITAL_USDT",    "40"))
 MAX_POSITIONS   = int(os.getenv("MAX_POSITIONS",      "3"))
 MIN_FUNDING     = float(os.getenv("MIN_FUNDING",     "0.03"))
 SCAN_INTERVAL   = int(os.getenv("SCAN_INTERVAL",     "300"))
 DRY_RUN         = os.getenv("DRY_RUN", "false").lower() == "true"
-CLOSE_THRESHOLD = float(os.getenv("CLOSE_THRESHOLD", "0.005"))
+CLOSE_THRESHOLD = float(os.getenv("CLOSE_THRESHOLD", "0.01"))
 
 BASE_URL = "https://open-api.bingx.com"
 
 # Estado en memoria
-open_positions: dict = {}  # symbol -> {spot_qty, futures_qty, entry_funding, entry_time, entry_price}
+open_positions: dict = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # UTILIDADES HTTP / FIRMA
+#
+# BingX tiene comportamiento DISTINTO segun endpoint:
+#   Spot    → firma debe ir en BODY como form data  (data=)
+#   Futuros → firma debe ir en QUERY STRING         (params=)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def ts_ms() -> str:
@@ -57,22 +61,44 @@ def sign(params: dict) -> str:
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
 def bx_get(path: str, params: dict = None) -> dict:
+    """GET generico — firma en query string."""
     params = params or {}
     params["timestamp"] = ts_ms()
     params["signature"] = sign(params)
-    r = requests.get(f"{BASE_URL}{path}",
-                     headers={"X-BX-APIKEY": API_KEY},
-                     params=params, timeout=10)
+    r = requests.get(
+        f"{BASE_URL}{path}",
+        headers={"X-BX-APIKEY": API_KEY},
+        params=params,
+        timeout=10
+    )
     r.raise_for_status()
     return r.json()
 
-def bx_post(path: str, params: dict = None) -> dict:
+def bx_post_futures(path: str, params: dict = None) -> dict:
+    """POST para Futuros — firma en QUERY STRING (params=)."""
     params = params or {}
     params["timestamp"] = ts_ms()
     params["signature"] = sign(params)
-    r = requests.post(f"{BASE_URL}{path}",
-                      headers={"X-BX-APIKEY": API_KEY},
-                      params=params, timeout=10)
+    r = requests.post(
+        f"{BASE_URL}{path}",
+        headers={"X-BX-APIKEY": API_KEY},
+        params=params,
+        timeout=10
+    )
+    r.raise_for_status()
+    return r.json()
+
+def bx_post_spot(path: str, params: dict = None) -> dict:
+    """POST para Spot — firma en BODY como form data (data=). CRITICO."""
+    params = params or {}
+    params["timestamp"] = ts_ms()
+    params["signature"] = sign(params)
+    r = requests.post(
+        f"{BASE_URL}{path}",
+        headers={"X-BX-APIKEY": API_KEY},
+        data=params,            # <-- data= no params=
+        timeout=10
+    )
     r.raise_for_status()
     return r.json()
 
@@ -94,29 +120,28 @@ def tg(msg: str):
 def tg_alert_manual(symbol: str, action: str, spot_qty: float,
                     futures_qty: float, price: float, funding: float, reason: str):
     emoji = "🟢" if action == "OPEN" else "🔴"
+    base  = symbol.split("-")[0]
     msg = (
         f"{emoji} <b>ACCION MANUAL REQUERIDA</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 Bot fallo — ejecutar manualmente:\n\n"
         f"<b>Par:</b> {symbol}\n"
         f"<b>Accion:</b> {action}\n"
-        f"<b>Motivo fallo:</b> {reason}\n\n"
+        f"<b>Motivo:</b> {reason}\n\n"
         f"📋 <b>PASOS EN BINGX:</b>\n"
     )
     if action == "OPEN":
-        base = symbol.split("-")[0]
         msg += (
             f"1️⃣ <b>SPOT</b> → Comprar {base}\n"
             f"   Cantidad: <code>{spot_qty}</code> {base}\n"
-            f"   Precio ref: ${price:.4f}\n\n"
+            f"   Precio ref: ${price:.6f}\n\n"
             f"2️⃣ <b>FUTUROS</b> → Short {symbol}\n"
             f"   Cantidad: <code>{futures_qty}</code> contratos\n"
             f"   Tipo: Market, Sell/Short\n\n"
-            f"📊 Funding rate: <b>{funding:.4f}%</b>\n"
-            f"💰 Capital aprox: ${spot_qty * price:.2f} USDT"
+            f"📊 Funding: <b>{funding:.4f}%</b>\n"
+            f"💰 Aprox: ${spot_qty * price:.2f} USDT"
         )
     else:
-        base = symbol.split("-")[0]
         msg += (
             f"1️⃣ <b>SPOT</b> → Vender {base}\n"
             f"   Cantidad: <code>{spot_qty}</code> {base}\n\n"
@@ -151,14 +176,14 @@ def get_futures_balance() -> float:
     return 0.0
 
 def transfer_futures_to_spot(amount: float) -> bool:
-    """Transfiere USDT de Futuros Perpetuos → Spot. BingX type=3."""
+    """Transfiere USDT de Futuros Perpetuos a Spot. type=3."""
     try:
         params = {
             "asset":  "USDT",
             "amount": str(round(amount, 2)),
-            "type":   "3",   # 3 = Futuros Perpetuos → Spot
+            "type":   "3",
         }
-        result = bx_post("/openApi/api/v3/asset/transfer", params)
+        result = bx_post_futures("/openApi/api/v3/asset/transfer", params)
         if result.get("code") == 0:
             log.info(f"✅ Transferido ${amount:.2f} Futuros→Spot")
             return True
@@ -175,17 +200,17 @@ def ensure_spot_balance(needed_usdt: float) -> bool:
     if spot >= needed_usdt:
         return True
 
-    gap = needed_usdt - spot + 0.50   # 0.50 USDT colchon
+    gap = needed_usdt - spot + 0.50
     fut = get_futures_balance()
     log.info(f"Futuros: ${fut:.2f} | A transferir: ${gap:.2f}")
 
     if fut < gap:
-        log.warning(f"Fondos insuficientes. Futuros: ${fut:.2f}, necesito ${gap:.2f}")
+        log.warning(f"Fondos insuficientes. Futuros=${fut:.2f}, necesito=${gap:.2f}")
         return False
 
     ok = transfer_futures_to_spot(gap)
     if ok:
-        time.sleep(2)   # dar tiempo a BingX para procesar
+        time.sleep(2)
     return ok
 
 
@@ -238,8 +263,9 @@ def round_qty(qty: float, step_size: float) -> float:
     return int(qty * factor) / factor
 
 def place_spot_buy(symbol: str, qty: float) -> dict | None:
+    """Compra spot a mercado — usa bx_post_spot (body form data)."""
     try:
-        result = bx_post("/openApi/spot/v1/trade/order", {
+        result = bx_post_spot("/openApi/spot/v1/trade/order", {
             "symbol":   symbol,
             "side":     "BUY",
             "type":     "MARKET",
@@ -247,7 +273,7 @@ def place_spot_buy(symbol: str, qty: float) -> dict | None:
         })
         if result.get("code") == 0:
             log.info(f"✅ Spot BUY {qty} {symbol}")
-            return result["data"]
+            return result.get("data", {})
         log.error(f"Spot BUY error: {result}")
         return None
     except Exception as e:
@@ -255,8 +281,9 @@ def place_spot_buy(symbol: str, qty: float) -> dict | None:
         return None
 
 def place_futures_short(symbol: str, qty: float) -> dict | None:
+    """Abre short futuros — usa bx_post_futures (query string)."""
     try:
-        result = bx_post("/openApi/swap/v2/trade/order", {
+        result = bx_post_futures("/openApi/swap/v2/trade/order", {
             "symbol":       symbol,
             "side":         "SELL",
             "positionSide": "SHORT",
@@ -265,7 +292,7 @@ def place_futures_short(symbol: str, qty: float) -> dict | None:
         })
         if result.get("code") == 0:
             log.info(f"✅ Futures SHORT {qty} {symbol}")
-            return result["data"]
+            return result.get("data", {})
         log.error(f"Futures SHORT error: {result}")
         return None
     except Exception as e:
@@ -273,8 +300,9 @@ def place_futures_short(symbol: str, qty: float) -> dict | None:
         return None
 
 def close_spot_sell(symbol: str, qty: float) -> dict | None:
+    """Vende spot a mercado — usa bx_post_spot (body form data)."""
     try:
-        result = bx_post("/openApi/spot/v1/trade/order", {
+        result = bx_post_spot("/openApi/spot/v1/trade/order", {
             "symbol":   symbol,
             "side":     "SELL",
             "type":     "MARKET",
@@ -282,7 +310,7 @@ def close_spot_sell(symbol: str, qty: float) -> dict | None:
         })
         if result.get("code") == 0:
             log.info(f"✅ Spot SELL {qty} {symbol}")
-            return result["data"]
+            return result.get("data", {})
         log.error(f"Spot SELL error: {result}")
         return None
     except Exception as e:
@@ -290,8 +318,9 @@ def close_spot_sell(symbol: str, qty: float) -> dict | None:
         return None
 
 def close_futures_short(symbol: str, qty: float) -> dict | None:
+    """Cierra short futuros — usa bx_post_futures (query string)."""
     try:
-        result = bx_post("/openApi/swap/v2/trade/order", {
+        result = bx_post_futures("/openApi/swap/v2/trade/order", {
             "symbol":       symbol,
             "side":         "BUY",
             "positionSide": "SHORT",
@@ -301,7 +330,7 @@ def close_futures_short(symbol: str, qty: float) -> dict | None:
         })
         if result.get("code") == 0:
             log.info(f"✅ Futures CLOSE SHORT {qty} {symbol}")
-            return result["data"]
+            return result.get("data", {})
         log.error(f"Futures CLOSE error: {result}")
         return None
     except Exception as e:
@@ -315,13 +344,11 @@ def close_futures_short(symbol: str, qty: float) -> dict | None:
 
 def open_arb_position(symbol: str, funding_rate: float, price: float):
     usdt_per_pos = CAPITAL_USDT / MAX_POSITIONS
-    info = get_symbol_info(symbol)
+    info         = get_symbol_info(symbol)
+    qty          = round_qty(usdt_per_pos / price, info["step_size"])
+    notional     = qty * price
 
-    qty      = round_qty(usdt_per_pos / price, info["step_size"])
-    notional = qty * price
-
-    log.info(f"[OPEN] {symbol} | Funding: {funding_rate:.4f}% | "
-             f"Qty: {qty} | ~${notional:.2f}")
+    log.info(f"[OPEN] {symbol} | Funding: {funding_rate:.4f}% | Qty: {qty} | ~${notional:.2f}")
 
     if qty < info["min_qty"] or notional < info["min_notional"]:
         log.warning(f"[SKIP] {symbol}: bajo minimo. qty={qty} notional=${notional:.2f}")
@@ -333,13 +360,14 @@ def open_arb_position(symbol: str, funding_rate: float, price: float):
             "entry_funding": funding_rate, "entry_time": time.time(),
             "entry_price": price, "dry_run": True
         }
-        tg(f"🧪 [DRY RUN] OPEN {symbol}\nFunding: {funding_rate:.4f}% | Qty: {qty} | ~${notional:.2f}")
+        tg(f"🧪 [DRY RUN] OPEN {symbol}\n"
+           f"Funding: {funding_rate:.4f}% | Qty: {qty} | ~${notional:.2f}")
         return
 
-    # ── FIX CRITICO: garantizar fondos en Spot antes de operar ───────────────
-    needed = notional * 1.02   # +2% para cubrir fees
+    # Garantizar fondos en Spot antes de operar
+    needed = notional * 1.02
     if not ensure_spot_balance(needed):
-        reason = f"Sin fondos suficientes en Spot (necesita ${needed:.2f})"
+        reason = f"Sin fondos en Spot (necesita ${needed:.2f})"
         log.error(f"[OPEN FAIL] {symbol}: {reason}")
         tg_alert_manual(symbol, "OPEN", qty, qty, price, funding_rate, reason)
         return
@@ -348,16 +376,16 @@ def open_arb_position(symbol: str, funding_rate: float, price: float):
     spot_result = place_spot_buy(symbol, qty)
     if not spot_result:
         tg_alert_manual(symbol, "OPEN", qty, qty, price, funding_rate,
-                        "Error al colocar orden Spot BUY")
+                        "Fallo orden Spot BUY")
         return
 
     # PASO 2 — Short Futuros
     fut_result = place_futures_short(symbol, qty)
     if not fut_result:
-        log.warning(f"[REVERT] Spot OK pero Futuros fallo. Revirtiendo spot...")
+        log.warning(f"[REVERT] Futuros fallo — revirtiendo spot...")
         close_spot_sell(symbol, qty)
         tg_alert_manual(symbol, "OPEN", qty, qty, price, funding_rate,
-                        "Spot OK pero fallo SHORT en Futuros (spot revertido)")
+                        "Spot OK pero fallo SHORT Futuros (spot revertido)")
         return
 
     open_positions[symbol] = {
@@ -365,7 +393,8 @@ def open_arb_position(symbol: str, funding_rate: float, price: float):
         "entry_funding": funding_rate, "entry_time": time.time(),
         "entry_price": price, "dry_run": False
     }
-    tg(f"✅ POSICION ABIERTA\nPar: {symbol}\n"
+    tg(f"✅ POSICION ABIERTA\n"
+       f"Par: {symbol}\n"
        f"Funding: {funding_rate:.4f}% | Qty: {qty} | ~${notional:.2f}\n"
        f"LONG Spot ✅ | SHORT Futuros ✅")
 
@@ -387,12 +416,13 @@ def close_arb_position(symbol: str, current_funding: float):
     fut_result  = close_futures_short(symbol, qty)
 
     if not spot_result or not fut_result:
-        reason = (f"Spot close: {'OK' if spot_result else 'FAIL'} | "
-                  f"Futures close: {'OK' if fut_result else 'FAIL'}")
+        reason = (f"Spot: {'OK' if spot_result else 'FAIL'} | "
+                  f"Futuros: {'OK' if fut_result else 'FAIL'}")
         tg_alert_manual(symbol, "CLOSE", qty, qty, price, current_funding, reason)
     else:
         held_h = (time.time() - pos["entry_time"]) / 3600
-        tg(f"🔴 POSICION CERRADA\nPar: {symbol}\n"
+        tg(f"🔴 POSICION CERRADA\n"
+           f"Par: {symbol}\n"
            f"Funding entrada: {pos['entry_funding']:.4f}%\n"
            f"Funding salida:  {current_funding:.4f}%\n"
            f"Tiempo: {held_h:.1f}h\n"
@@ -432,6 +462,7 @@ def scan_and_trade():
     # Abrir nuevas posiciones
     slots = MAX_POSITIONS - len(open_positions)
     if slots <= 0:
+        log.info(f"[SCAN] Posiciones llenas {MAX_POSITIONS}/{MAX_POSITIONS}")
         return
 
     candidates = get_top_funding_symbols(top_n=20)
