@@ -45,6 +45,11 @@ open_positions: dict = {}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # UTILIDADES HTTP / FIRMA
+#
+# BingX comportamiento por tipo:
+#   Transferencia  → GET  con firma en query string
+#   Futuros POST   → POST con firma en query string (params=)
+#   Spot POST      → POST con firma en BODY form data (data=)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def ts_ms() -> str:
@@ -55,6 +60,7 @@ def sign(params: dict) -> str:
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
 def bx_get(path: str, params: dict = None) -> dict:
+    """GET generico — firma en query string."""
     params = params or {}
     params["timestamp"] = ts_ms()
     params["signature"] = sign(params)
@@ -68,7 +74,7 @@ def bx_get(path: str, params: dict = None) -> dict:
     return r.json()
 
 def bx_post_futures(path: str, params: dict = None) -> dict:
-    """POST Futuros — firma en QUERY STRING."""
+    """POST Futuros — firma en QUERY STRING (params=)."""
     params = params or {}
     params["timestamp"] = ts_ms()
     params["signature"] = sign(params)
@@ -82,7 +88,7 @@ def bx_post_futures(path: str, params: dict = None) -> dict:
     return r.json()
 
 def bx_post_spot(path: str, params: dict = None) -> dict:
-    """POST Spot — firma en BODY como form data. CRITICO."""
+    """POST Spot — firma en BODY como form data (data=). CRITICO."""
     params = params or {}
     params["timestamp"] = ts_ms()
     params["signature"] = sign(params)
@@ -171,20 +177,18 @@ def get_futures_balance() -> float:
 def transfer_futures_to_spot(amount: float) -> bool:
     """
     Transfiere USDT de Futuros Perpetuos → Spot.
+    IMPORTANTE: Este endpoint requiere GET, no POST.
     BingX transfer types:
-      1 = Spot      → USD-M Futures
-      2 = USD-M Futures → Spot          ← ESTE
-      3 = Spot      → Coin-M Futures
-      4 = Coin-M Futures → Spot
-    Para Perpetual Futures (USDT-M) usar type=2
+      1 = Spot → Futuros USDT-M
+      2 = Futuros USDT-M → Spot  ← ESTE
     """
     try:
         params = {
             "asset":  "USDT",
             "amount": str(round(amount, 2)),
-            "type":   "2",   # ← CORREGIDO: Futuros USDT-M → Spot
+            "type":   "2",   # 2 = Futuros USDT-M → Spot
         }
-        result = bx_post_futures("/openApi/api/v3/asset/transfer", params)
+        result = bx_get("/openApi/api/v3/asset/transfer", params)  # ← GET obligatorio
         log.info(f"Transfer result: {result}")
         if result.get("code") == 0:
             log.info(f"✅ Transferido ${amount:.2f} Futuros→Spot")
@@ -255,10 +259,8 @@ def get_top_funding_symbols(top_n: int = 20) -> list:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_symbol_info(symbol: str) -> dict:
-    """Obtiene step_size y min_qty del par en Spot."""
     try:
-        spot_sym = symbol.replace("-USDT", "-USDT")  # ya esta en formato correcto
-        data = bx_get("/openApi/spot/v1/common/symbols", {"symbol": spot_sym})
+        data = bx_get("/openApi/spot/v1/common/symbols", {"symbol": symbol})
         info = data.get("data", {}).get("symbols", [{}])[0]
         return {
             "step_size":    float(info.get("stepSize",    0.0001)),
@@ -283,7 +285,7 @@ def set_leverage(symbol: str, leverage: int = 1):
             "side":     "SHORT",
             "leverage": str(leverage),
         })
-        log.info(f"Leverage {leverage}x set: {result.get('code')}")
+        log.info(f"Leverage {leverage}x: code={result.get('code')}")
     except Exception as e:
         log.warning(f"Set leverage error: {e}")
 
@@ -309,7 +311,6 @@ def place_spot_buy(symbol: str, qty: float) -> dict | None:
 def place_futures_short(symbol: str, qty: float) -> dict | None:
     """Abre short futuros — query string."""
     try:
-        # Poner leverage 1x primero
         set_leverage(symbol, 1)
         time.sleep(0.5)
 
@@ -395,7 +396,7 @@ def open_arb_position(symbol: str, funding_rate: float, price: float):
         return
 
     # ── Garantizar fondos en Spot ─────────────────────────────────────────────
-    needed = notional * 1.03  # 3% extra para fees
+    needed = notional * 1.03
     if not ensure_spot_balance(needed):
         reason = f"Sin fondos en Spot (necesita ${needed:.2f})"
         log.error(f"[OPEN FAIL] {symbol}: {reason}")
@@ -442,7 +443,7 @@ def close_arb_position(symbol: str, current_funding: float):
         tg(f"🧪 [DRY RUN] CLOSE {symbol}\nFunding actual: {current_funding:.4f}%")
         return
 
-    # Cerrar futuros primero (reduce riesgo)
+    # Cerrar futuros primero
     fut_result  = close_futures_short(symbol, qty)
     spot_result = close_spot_sell(symbol, qty)
 
@@ -469,9 +470,7 @@ def heartbeat():
     for sym, pos in open_positions.items():
         pos_info += f"\n  {sym}: funding={pos['entry_funding']:.4f}%"
     log.info(f"[♥] Spot: ${spot_bal:.2f} | Futuros: ${fut_bal:.2f} | "
-             f"Total: ${spot_bal + fut_bal:.2f} | "
-             f"Posiciones: {len(open_positions)}/{MAX_POSITIONS} | "
-             f"DRY_RUN: {DRY_RUN}")
+             f"Posiciones: {len(open_positions)}/{MAX_POSITIONS}")
     tg(f"💗 <b>HEARTBEAT</b>\n"
        f"💵 Spot: ${spot_bal:.2f} | Futuros: ${fut_bal:.2f}\n"
        f"📊 Posiciones: {len(open_positions)}/{MAX_POSITIONS}"
