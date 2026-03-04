@@ -22,7 +22,7 @@ def _sign(params: dict) -> str:
     BingX firma: NO ordenar los parámetros.
     El query string debe respetar el orden de inserción del dict.
     """
-    query = "&".join(f"{k}={v}" for k, v in params.items())
+    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
     return hmac.new(
         config.BINGX_SECRET_KEY.encode("utf-8"),
         query.encode("utf-8"),
