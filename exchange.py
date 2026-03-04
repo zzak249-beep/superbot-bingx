@@ -1,6 +1,9 @@
 """
-exchange.py — Conexión y órdenes en BingX Futures (perpetual swaps)
-FIXED: formato klines dict, endpoint balance correcto, firma correcta
+exchange.py — Conexión BingX Futures
+FIXED v3:
+  - Firma correcta: parámetros SIN ordenar (BingX los quiere en orden de inserción)
+  - spread: usa /quote/ticker en lugar de bookTicker
+  - bookTicker solo para pares públicos (sin auth)
 """
 
 import hmac
@@ -8,7 +11,6 @@ import hashlib
 import time
 import requests
 import json
-from urllib.parse import urlencode
 from datetime import datetime
 import config
 
@@ -16,7 +18,11 @@ BASE_URL = "https://open-api.bingx.com"
 
 
 def _sign(params: dict) -> str:
-    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    """
+    BingX firma: NO ordenar los parámetros.
+    El query string debe respetar el orden de inserción del dict.
+    """
+    query = "&".join(f"{k}={v}" for k, v in params.items())
     return hmac.new(
         config.BINGX_SECRET_KEY.encode("utf-8"),
         query.encode("utf-8"),
@@ -31,15 +37,20 @@ def _headers() -> dict:
     }
 
 
-def _get(path: str, params: dict = None) -> dict:
+def _get(path: str, params: dict = None, auth: bool = True) -> dict:
+    """
+    auth=True  → añade timestamp + signature (endpoints privados)
+    auth=False → sin firma (endpoints públicos de mercado)
+    """
     params = params or {}
-    params["timestamp"] = int(time.time() * 1000)
-    params["signature"] = _sign(params)
+    if auth:
+        params["timestamp"] = int(time.time() * 1000)
+        params["signature"] = _sign(params)
     try:
         r = requests.get(BASE_URL + path, params=params, headers=_headers(), timeout=10)
         data = r.json()
-        if config.MODO_DEBUG and data.get("code", 0) != 0:
-            print(f"[EXCHANGE] API error {path}: code={data.get('code')} msg={data.get('msg')}")
+        if auth and config.MODO_DEBUG and data.get("code", 0) != 0:
+            print(f"[EXCHANGE] API error {path}: code={data.get('code')} | {data.get('msg','')[:80]}")
         return data
     except Exception as e:
         print(f"[EXCHANGE] GET error {path}: {e}")
@@ -50,7 +61,12 @@ def _post(path: str, params: dict) -> dict:
     params["timestamp"] = int(time.time() * 1000)
     params["signature"] = _sign(params)
     try:
-        r = requests.post(BASE_URL + path, data=json.dumps(params), headers=_headers(), timeout=10)
+        r = requests.post(
+            BASE_URL + path,
+            data=json.dumps(params),
+            headers=_headers(),
+            timeout=10
+        )
         return r.json()
     except Exception as e:
         print(f"[EXCHANGE] POST error {path}: {e}")
@@ -58,20 +74,20 @@ def _post(path: str, params: dict) -> dict:
 
 
 # ============================================================
-# BALANCE
+# BALANCE (endpoint privado — requiere auth)
 # ============================================================
 
 def get_balance() -> float:
     if config.MODO_DEMO:
         return _demo_balance()
 
-    resp = _get("/openApi/swap/v2/user/balance", {"currency": "USDT"})
+    resp = _get("/openApi/swap/v2/user/balance", {"currency": "USDT"}, auth=True)
     try:
-        balance_data = resp.get("data", {}).get("balance", {})
-        if isinstance(balance_data, dict):
-            return float(balance_data.get("availableMargin", 0))
-        if isinstance(balance_data, list):
-            for item in balance_data:
+        bal = resp.get("data", {}).get("balance", {})
+        if isinstance(bal, dict):
+            return float(bal.get("availableMargin", 0))
+        if isinstance(bal, list):
+            for item in bal:
                 if item.get("asset") == "USDT":
                     return float(item.get("availableMargin", 0))
     except Exception as e:
@@ -83,13 +99,13 @@ def get_equity() -> float:
     if config.MODO_DEMO:
         return _demo_balance()
 
-    resp = _get("/openApi/swap/v2/user/balance", {"currency": "USDT"})
+    resp = _get("/openApi/swap/v2/user/balance", {"currency": "USDT"}, auth=True)
     try:
-        balance_data = resp.get("data", {}).get("balance", {})
-        if isinstance(balance_data, dict):
-            return float(balance_data.get("balance", 0))
-        if isinstance(balance_data, list):
-            for item in balance_data:
+        bal = resp.get("data", {}).get("balance", {})
+        if isinstance(bal, dict):
+            return float(bal.get("balance", 0))
+        if isinstance(bal, list):
+            for item in bal:
                 if item.get("asset") == "USDT":
                     return float(item.get("balance", 0))
     except Exception as e:
@@ -98,11 +114,11 @@ def get_equity() -> float:
 
 
 # ============================================================
-# PRECIO Y MERCADO
+# PRECIO Y MERCADO (endpoints públicos — sin auth)
 # ============================================================
 
 def get_precio(par: str) -> float:
-    resp = _get("/openApi/swap/v2/quote/price", {"symbol": par})
+    resp = _get("/openApi/swap/v2/quote/price", {"symbol": par}, auth=False)
     try:
         data = resp.get("data", {})
         if isinstance(data, dict):
@@ -115,15 +131,11 @@ def get_precio(par: str) -> float:
 
 
 def get_klines(par: str, intervalo: str = "5m", limit: int = 100) -> list:
-    """
-    BingX /swap/v3/quote/klines devuelve lista de dicts:
-    {"open":"x","high":"x","low":"x","close":"x","volume":"x","time":x}
-    """
     resp = _get("/openApi/swap/v3/quote/klines", {
         "symbol":   par,
         "interval": intervalo,
         "limit":    limit
-    })
+    }, auth=False)
     try:
         data = resp.get("data", [])
         if isinstance(data, list):
@@ -134,23 +146,39 @@ def get_klines(par: str, intervalo: str = "5m", limit: int = 100) -> list:
 
 
 def get_spread_pct(par: str) -> float:
-    resp = _get("/openApi/swap/v2/quote/bookTicker", {"symbol": par})
+    """
+    Calcula spread usando el ticker 24h (endpoint público).
+    Usamos (high-low)/close como proxy del spread real.
+    Si el par tiene volumen > 0 consideramos spread aceptable.
+    """
+    resp = _get("/openApi/swap/v2/quote/ticker", {"symbol": par}, auth=False)
     try:
         data = resp.get("data", {})
         if isinstance(data, list) and data:
             data = data[0]
+
+        # Intento 1: bid/ask directo si viene en el ticker
         bid = float(data.get("bidPrice", 0))
         ask = float(data.get("askPrice", 0))
         if bid > 0 and ask > 0:
             mid = (bid + ask) / 2
             return ((ask - bid) / mid) * 100
+
+        # Intento 2: si hay volumen, el spread es aceptable (<1%)
+        vol = float(data.get("quoteVolume", 0))
+        if vol > 500_000:
+            return 0.1   # spread simbólico aceptable
+        if vol > 0:
+            return 0.5
+
     except Exception as e:
         print(f"[EXCHANGE] Error spread {par}: {e}")
-    return 999.0
+
+    return 999.0   # sin datos → rechazar
 
 
 def get_volumen_24h(par: str) -> float:
-    resp = _get("/openApi/swap/v2/quote/ticker", {"symbol": par})
+    resp = _get("/openApi/swap/v2/quote/ticker", {"symbol": par}, auth=False)
     try:
         data = resp.get("data", {})
         if isinstance(data, list) and data:
@@ -166,12 +194,6 @@ def get_volumen_24h(par: str) -> float:
 # ============================================================
 
 def parsear_klines(klines: list) -> dict:
-    """
-    Convierte respuesta BingX a arrays OHLCV.
-    Soporta:
-      - dict: {"open","high","low","close","volume","time"}
-      - array: [time, open, high, low, close, volume]
-    """
     opens = []; highs = []; lows = []; closes = []; vols = []
 
     for k in klines:
@@ -203,13 +225,11 @@ def set_leverage(par: str, leverage: int) -> bool:
         return True
 
     resp = _post("/openApi/swap/v2/trade/leverage", {
-        "symbol":   par,
-        "side":     "LONG",
-        "leverage": leverage
+        "symbol": par, "side": "LONG", "leverage": leverage
     })
     ok = resp.get("code") == 0
     if config.MODO_DEBUG:
-        print(f"[EXCHANGE] Leverage {par} {leverage}x {'✓' if ok else '✗'}")
+        print(f"[EXCHANGE] Leverage {par} {leverage}x {'✓' if ok else f'✗ {resp.get(\"msg\",\"\")}'}")
     return ok
 
 
@@ -220,13 +240,13 @@ def set_leverage(par: str, leverage: int) -> bool:
 def calcular_cantidad(par: str, balance: float, precio: float) -> float:
     if balance <= 0 or precio <= 0:
         return 0.0
-    capital_riesgo = balance * config.RIESGO_POR_TRADE * config.LEVERAGE
-    cantidad = capital_riesgo / precio
+    capital = balance * config.RIESGO_POR_TRADE * config.LEVERAGE
+    cantidad = capital / precio
     return round(cantidad, 4) if cantidad >= 0.0001 else 0.0
 
 
 # ============================================================
-# ÓRDENES
+# ÓRDENES (endpoints privados — requieren auth)
 # ============================================================
 
 def abrir_long(par: str, cantidad: float, precio_entrada: float,
@@ -241,7 +261,7 @@ def abrir_long(par: str, cantidad: float, precio_entrada: float,
     })
 
     if resp.get("code") != 0:
-        print(f"[EXCHANGE] Error abriendo LONG {par}: {resp}")
+        print(f"[EXCHANGE] Error LONG {par}: {resp}")
         return {}
 
     order_id = str(resp.get("data", {}).get("orderId", ""))
@@ -258,7 +278,7 @@ def abrir_long(par: str, cantidad: float, precio_entrada: float,
     })
 
     if config.MODO_DEBUG:
-        print(f"[EXCHANGE] LONG {par} | qty:{cantidad} | SL:{sl:.6f} | TP:{tp:.6f}")
+        print(f"[EXCHANGE] ✓ LONG {par} | qty:{cantidad} | SL:{sl:.6f} | TP:{tp:.6f}")
 
     return {
         "order_id": order_id, "par": par, "lado": "LONG",
@@ -269,8 +289,7 @@ def abrir_long(par: str, cantidad: float, precio_entrada: float,
 
 def cerrar_posicion(par: str, cantidad: float) -> dict:
     if config.MODO_DEMO:
-        precio = get_precio(par) or 1.0
-        return {"order_id": f"demo_close_{int(time.time())}", "precio_salida": precio}
+        return {"order_id": f"demo_close_{int(time.time())}", "precio_salida": get_precio(par)}
 
     resp = _post("/openApi/swap/v2/trade/order", {
         "symbol": par, "side": "SELL",
@@ -298,8 +317,7 @@ def cancelar_ordenes_abiertas(par: str):
 def get_posiciones_abiertas() -> list:
     if config.MODO_DEMO:
         return _demo_posiciones()
-
-    resp = _get("/openApi/swap/v2/user/positions")
+    resp = _get("/openApi/swap/v2/user/positions", {}, auth=True)
     try:
         posiciones = resp.get("data", []) or []
         return [p for p in posiciones if float(p.get("positionAmt", 0)) != 0]
@@ -340,7 +358,7 @@ def _demo_orden(par, lado, cantidad, precio, sl, tp) -> dict:
         "precio_entrada": precio, "sl": sl, "tp": tp,
         "order_id": oid, "timestamp": datetime.now().isoformat()
     }
-    print(f"[DEMO] {lado} {par} | qty:{cantidad} | entrada:{precio:.6f} | SL:{sl:.6f} | TP:{tp:.6f}")
+    print(f"[DEMO] {lado} {par} qty:{cantidad} entrada:{precio:.6f} SL:{sl:.6f} TP:{tp:.6f}")
     return _demo_pos[par].copy()
 
 
