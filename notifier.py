@@ -137,3 +137,80 @@ def send_symbols_update(symbols: list):
         f"Total: `{len(symbols)}`\n"
         f"Top 5: `{', '.join(symbols[:5])}`"
     )
+
+
+# ============================================================
+# FUNCIONES REQUERIDAS POR main.py
+# ============================================================
+
+def bot_iniciado(pares: list, balance: float):
+    modo = "DEMO 🧪" if cfg.MODO_DEMO else "REAL 💰"
+    _send(
+        f"🤖 *Bot iniciado — {modo}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Balance: `${balance:.2f}`\n"
+        f"📋 Pares activos: `{len(pares)}`\n"
+        f"⚙️ RSI<`{cfg.RSI_OVERSOLD}` | "
+        f"SL:`{cfg.SL_ATR_MULT}x` | "
+        f"TP:`{cfg.TP_ATR_MULT}x` | "
+        f"Lev:`{cfg.LEVERAGE}x`\n"
+        f"🔁 Ciclo: cada `{cfg.CICLO_SEGUNDOS}s`"
+    )
+
+
+def trade_abierto(trade: dict):
+    par     = trade.get("par", "?")
+    entrada = trade.get("precio_entrada", 0)
+    sl      = trade.get("sl", 0)
+    tp      = trade.get("tp", 0)
+    qty     = trade.get("cantidad", 0)
+    rr      = trade.get("rr", 0)
+    modo    = "DEMO" if cfg.MODO_DEMO else "REAL"
+    _send(
+        f"📈 *LONG ABIERTO [{modo}]* — `{par}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 Entrada : `{entrada:.6f}`\n"
+        f"🔴 SL      : `{sl:.6f}`\n"
+        f"🟢 TP      : `{tp:.6f}`\n"
+        f"📐 R:R     : `{rr:.2f}`\n"
+        f"🔢 Cantidad: `{qty}`"
+    )
+
+
+def trade_cerrado(trade: dict, pnl_usd: float, motivo: str, balance: float):
+    par     = trade.get("par", "?")
+    entrada = trade.get("precio_entrada", 0)
+    salida  = trade.get("precio_salida", 0)
+    emoji   = "✅" if pnl_usd >= 0 else "❌"
+    _send(
+        f"{emoji} *CIERRE* — `{par}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Entrada : `{entrada:.6f}`\n"
+        f"Salida  : `{salida:.6f}`\n"
+        f"PnL     : `${pnl_usd:+.4f}`\n"
+        f"Motivo  : `{motivo}`\n"
+        f"Balance : `${balance:.2f}`"
+    )
+
+
+def circuit_breaker(motivo: str, balance: float):
+    _send(
+        f"🛑 *CIRCUIT BREAKER ACTIVADO*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Motivo  : `{motivo}`\n"
+        f"Balance : `${balance:.2f}`\n"
+        f"⏸️ Bot pausado 1 hora"
+    )
+
+
+def error_critico(mensaje: str):
+    _send(f"🚨 *ERROR CRÍTICO*\n`{mensaje[:300]}`")
+
+
+def learner_ajuste(par: str, accion: str, motivo: str):
+    emoji = "⛔" if accion == "PENALIZAR" else "✅"
+    _send(
+        f"{emoji} *Learner — {accion}*\n"
+        f"Par    : `{par}`\n"
+        f"Motivo : _{motivo}_"
+    )
