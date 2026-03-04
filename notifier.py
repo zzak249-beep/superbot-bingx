@@ -1,120 +1,149 @@
 """
-notifier.py — Notificaciones por Telegram
+notifier.py — Notificaciones Telegram Elite v4
+Incluye: señales manuales, score, estado del bot, errores.
 """
-
+import logging
 import requests
-import config
-from datetime import datetime
+import config as cfg
 
+log = logging.getLogger("notifier")
 
-def _enviar(mensaje: str) -> bool:
-    if not config.TELEGRAM_TOKEN or not config.TELEGRAM_CHAT_ID:
-        print(f"[TELEGRAM] (sin configurar) {mensaje}")
-        return False
-
+def _send(text: str, parse_mode="Markdown"):
+    """Funcion base para enviar mensajes."""
+    if not cfg.TELEGRAM_TOKEN or not cfg.TELEGRAM_CHAT_ID:
+        log.warning("Telegram no configurado (TG_TOKEN / TG_CHAT_ID)")
+        return
     try:
-        url = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}/sendMessage"
-        r = requests.post(url, json={
-            "chat_id": config.TELEGRAM_CHAT_ID,
-            "text": mensaje,
-            "parse_mode": "HTML"
+        url = f"https://api.telegram.org/bot{cfg.TELEGRAM_TOKEN}/sendMessage"
+        resp = requests.post(url, json={
+            "chat_id":    cfg.TELEGRAM_CHAT_ID,
+            "text":       text,
+            "parse_mode": parse_mode,
         }, timeout=10)
-        return r.status_code == 200
+        if not resp.ok:
+            log.warning(f"Telegram error {resp.status_code}: {resp.text[:100]}")
     except Exception as e:
-        print(f"[TELEGRAM] Error: {e}")
-        return False
+        log.error(f"Error enviando Telegram: {e}")
 
 
-def bot_iniciado(pares: list, balance: float):
-    modo = "🔴 DEMO" if config.MODO_DEMO else "🟢 REAL"
-    msg = (
-        f"🤖 <b>BOT22 Arrancado</b> {modo}\n"
+def send_raw(message: str):
+    """Mensaje libre en Markdown."""
+    _send(message)
+
+
+def send_startup(symbol_stats: str):
+    # getattr con fallback para compatibilidad entre versiones de config.py
+    rsi_l    = getattr(cfg, "RSI_LONG",               getattr(cfg, "RSI_OB", "N/A"))
+    rsi_s    = getattr(cfg, "RSI_SHORT",              getattr(cfg, "RSI_OB", "N/A"))
+    cb_loss  = getattr(cfg, "CB_MAX_DAILY_LOSS_PCT",  getattr(cfg, "MAX_DAILY_LOSS_PCT", 0.05))
+    cb_cons  = getattr(cfg, "CB_MAX_CONSECUTIVE_LOSS",getattr(cfg, "MAX_CONSECUTIVE_LOSS", 5))
+    loop_s   = getattr(cfg, "LOOP_SECONDS", "N/A")
+    max_pos  = getattr(cfg, "MAX_POSITIONS", "N/A")
+    sl_atr   = getattr(cfg, "SL_ATR", "N/A")
+    bb_sigma = getattr(cfg, "BB_SIGMA", "N/A")
+    leverage = getattr(cfg, "LEVERAGE", "N/A")
+    _send(
+        f"🤖 *BB+RSI Bot Elite v4 arrancado*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>{len(pares)} pares activos</b>\n"
-        f"💰 Balance: <b>${balance:.2f}</b>\n"
-        f"⚙️ RSI<{config.RSI_OVERSOLD} | BB σ{config.BB_STD} | "
-        f"SL:{config.SL_ATR_MULT}×ATR | Lev:{config.LEVERAGE}x\n"
-        f"🔄 Ciclo: cada {config.CICLO_SEGUNDOS}s | Max pos: {config.MAX_POSICIONES}\n"
-        f"🛡️ Circuit Breaker: {config.MAX_PNL_NEGATIVO_DIA*100:.0f}% día | "
-        f"{config.MAX_PERDIDAS_SEGUIDAS} pérdidas seguidas\n"
-        f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        f"📊 {symbol_stats}\n"
+        f"⚙️ RSI_L: `{rsi_l}` | RSI_S: `{rsi_s}` | BB_σ: `{bb_sigma}` | "
+        f"SL: `{sl_atr}x ATR` | Lev: `{leverage}x`\n"
+        f"🔁 Ciclo: cada `{loop_s}s` | "
+        f"Max pos: `{max_pos}`\n"
+        f"🛡️ Circuit Breaker: `-{cb_loss*100:.0f}%` dia | "
+        f"`{cb_cons}` perdidas"
     )
-    _enviar(msg)
 
 
-def trade_abierto(trade: dict):
-    rr = trade.get("rr", 0)
-    msg = (
-        f"📈 <b>LONG ABIERTO</b>\n"
+def send_buy_signal(symbol: str, sig: dict, balance: float, executed: bool):
+    side = "🟢 LONG" if sig["action"] == "buy" else "🔴 SHORT"
+    ex   = "✅ Ejecutado" if executed else "⚠️ No ejecutado"
+    score_line = f"Score   : `{sig.get('score','N/A')}/100`\n" if sig.get("score") else ""
+    _send(
+        f"{side} — `{symbol}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 Par: <b>{trade['par']}</b>\n"
-        f"💵 Entrada: ${trade['precio_entrada']:.4f}\n"
-        f"🔴 SL: ${trade['sl']:.4f}\n"
-        f"🟢 TP: ${trade['tp']:.4f}\n"
-        f"📐 R:R: {rr:.2f}\n"
-        f"📊 RSI: {trade.get('rsi', 0):.1f}\n"
-        f"📦 Qty: {trade['cantidad']}\n"
-        f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+        f"Entrada : `{sig['entry']}`\n"
+        f"🛑 SL   : `{sig['sl']}`\n"
+        f"🎯 TP   : `{sig['tp']}`\n"
+        f"TP 50%  : `{sig.get('tp_partial','N/A')}`\n"
+        f"RSI     : `{sig.get('rsi','N/A')}`\n"
+        f"{score_line}"
+        f"4h      : `{sig.get('trend_4h','N/A')}`\n"
+        f"Balance : `${balance:.2f}`\n"
+        f"Razon   : _{sig.get('reason','')}_\n"
+        f"{ex}"
     )
-    _enviar(msg)
 
 
-def trade_cerrado(trade: dict, pnl: float, motivo: str, balance: float):
-    emoji_resultado = "✅" if pnl > 0 else "❌"
-    resultado = "WIN" if pnl > 0 else "LOSS"
-    msg = (
-        f"{emoji_resultado} <b>TRADE CERRADO — {resultado}</b>\n"
+def send_close_signal(symbol: str, entry: float, exit_price: float,
+                      pnl: float, reason: str, executed: bool):
+    emoji  = "✅" if pnl >= 0 else "❌"
+    ex_txt = "Ejecutado" if executed else "Simulado"
+    _send(
+        f"{emoji} *CIERRE* — `{symbol}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 Par: <b>{trade['par']}</b>\n"
-        f"💵 Entrada: ${trade.get('precio_entrada', 0):.4f}\n"
-        f"💵 Salida:  ${trade.get('precio_salida', 0):.4f}\n"
-        f"💰 PnL: <b>${pnl:+.4f}</b>\n"
-        f"📌 Motivo: {motivo}\n"
-        f"🏦 Balance: ${balance:.2f}\n"
-        f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+        f"Entrada : `{entry}`\n"
+        f"Salida  : `{exit_price}`\n"
+        f"PnL est : `${pnl:+.2f}`\n"
+        f"Razon   : `{reason}`\n"
+        f"Estado  : {ex_txt}"
     )
-    _enviar(msg)
 
 
-def circuit_breaker(motivo: str, balance: float):
-    msg = (
-        f"⛔ <b>CIRCUIT BREAKER ACTIVADO</b>\n"
+def send_status(positions: list, balance: float, stats: dict, perf: str):
+    pos_lines = ""
+    for p in positions:
+        side_e = "🟢" if p.get("side") == "long" else "🔴"
+        diff   = p.get("current", p["entry"]) - p["entry"]
+        pos_lines += f"  {side_e} `{p['symbol']}` e:{p['entry']} c:{p.get('current',p['entry'])} ({diff:+.4f})\n"
+    if not pos_lines:
+        pos_lines = "  _(sin posiciones abiertas)_\n"
+
+    wins   = stats.get("wins", 0)
+    losses = stats.get("losses", 0)
+    total  = wins + losses
+    wr     = f"{wins/total*100:.1f}%" if total > 0 else "N/A"
+
+    pnl_total = stats.get("pnl_total", None)
+    roi_total = stats.get("roi_total", None)
+    ttrades   = stats.get("total_trades", "")
+    total_line = (
+        f"📊 Total: `{ttrades}tr` | PnL: `${pnl_total:+.2f}` | ROI: `{roi_total:+.1f}%`\n"
+        if pnl_total is not None else ""
+    )
+    _send(
+        f"📊 *Reporte horario*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔎 Motivo: {motivo}\n"
-        f"🏦 Balance actual: ${balance:.2f}\n"
-        f"💤 Bot pausado hasta mañana o 1 hora\n"
-        f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+        f"💰 Balance: `${balance:.2f} USDT`\n"
+        f"📈 Hoy: `{wins}W / {losses}L` | WR: `{wr}` | PnL hoy: `${stats.get('pnl_today',0):+.2f}`\n"
+        f"{total_line}"
+        f"📋 Posiciones abiertas:\n{pos_lines}"
+        f"🤖 Learner: _{perf}_"
     )
-    _enviar(msg)
 
 
-def learner_ajuste(par: str, accion: str, motivo: str):
-    emoji = "⚠️" if accion == "PENALIZAR" else "♻️"
-    msg = (
-        f"{emoji} <b>LEARNER — {accion}</b>\n"
+def send_no_funds(symbol: str, sig: dict, balance: float):
+    """Deprecado — ahora se usa send_raw con señal completa desde main.py"""
+    pass
+
+
+def send_error(msg: str):
+    _send(f"🚨 *ERROR BOT*\n`{msg}`")
+
+
+def send_param_update(updates: dict, perf: str):
+    lines = "\n".join([f"  `{k}`: {v}" for k, v in updates.items()])
+    _send(
+        f"🔧 *Learner — Ajuste de parametros*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 Par: {par}\n"
-        f"📝 Motivo: {motivo}\n"
-        f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+        f"{lines}\n"
+        f"📊 {perf}"
     )
-    _enviar(msg)
 
 
-def resumen_diario(stats: dict):
-    msg = (
-        f"📊 <b>RESUMEN DIARIO</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔢 Trades: {stats.get('total', 0)} "
-        f"(✅{stats.get('wins', 0)} / ❌{stats.get('losses', 0)})\n"
-        f"💰 PnL: <b>${stats.get('pnl', 0):+.4f}</b>\n"
-        f"📈 WR: {stats.get('wr', 0):.1f}%\n"
-        f"⚖️ PF: {stats.get('pf', 0):.2f}\n"
-        f"🏦 Balance: ${stats.get('balance', 0):.2f}\n"
-        f"📅 {datetime.now().strftime('%Y-%m-%d')}"
+def send_symbols_update(symbols: list):
+    _send(
+        f"🔄 *Pares actualizados*\n"
+        f"Total: `{len(symbols)}`\n"
+        f"Top 5: `{', '.join(symbols[:5])}`"
     )
-    _enviar(msg)
-
-
-def error_critico(mensaje: str):
-    msg = f"🚨 <b>ERROR CRÍTICO</b>\n{mensaje}\n🕐 {datetime.now().strftime('%H:%M:%S')}"
-    _enviar(msg)
