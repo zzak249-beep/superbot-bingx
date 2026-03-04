@@ -1,13 +1,12 @@
 """
 exchange.py — Conexión BingX Futures v4
-FIXED: firma correcta — sign(params sin signature) + signature al final
+FIX: firma sin sorted() — BingX requiere orden de inserción, no alfabético
 """
 
 import hmac
 import hashlib
 import time
 import requests
-import json
 from datetime import datetime
 import config
 
@@ -15,7 +14,7 @@ BASE_URL = "https://open-api.bingx.com"
 
 
 def _sign(query_string: str) -> str:
-    """Firma HMAC-SHA256 del query string (sin incluir signature)"""
+    """Firma HMAC-SHA256 del query string (sin incluir &signature=...)"""
     return hmac.new(
         config.BINGX_SECRET_KEY.encode("utf-8"),
         query_string.encode("utf-8"),
@@ -30,12 +29,16 @@ def _headers() -> dict:
     }
 
 
+def _build_query(params: dict) -> str:
+    """Construye query string en orden de inserción (sin sorted)"""
+    return "&".join(f"{k}={v}" for k, v in params.items())
+
+
 def _get(path: str, params: dict = None, auth: bool = True) -> dict:
     params = params or {}
     if auth:
         params["timestamp"] = int(time.time() * 1000)
-        # Construir query string SIN signature, luego añadir signature al final
-        query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        query_string = _build_query(params)
         signature = _sign(query_string)
         url = f"{BASE_URL}{path}?{query_string}&signature={signature}"
         try:
@@ -48,7 +51,6 @@ def _get(path: str, params: dict = None, auth: bool = True) -> dict:
             print(f"[EXCHANGE] GET(auth) error {path}: {e}")
             return {"code": -1, "data": None}
     else:
-        # Endpoints públicos — sin firma
         try:
             r = requests.get(BASE_URL + path, params=params, headers=_headers(), timeout=10)
             return r.json()
@@ -59,7 +61,7 @@ def _get(path: str, params: dict = None, auth: bool = True) -> dict:
 
 def _post(path: str, params: dict) -> dict:
     params["timestamp"] = int(time.time() * 1000)
-    query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    query_string = _build_query(params)
     signature = _sign(query_string)
     url = f"{BASE_URL}{path}?{query_string}&signature={signature}"
     try:
@@ -177,7 +179,7 @@ def get_volumen_24h(par: str) -> float:
 
 
 # ============================================================
-# PARSEAR KLINES
+# PARSEAR KLINES — soporta dict Y array
 # ============================================================
 
 def parsear_klines(klines: list) -> dict:
@@ -211,8 +213,7 @@ def set_leverage(par: str, leverage: int) -> bool:
     })
     ok = resp.get("code") == 0
     if config.MODO_DEBUG:
-        msg = resp.get("msg", "")
-        estado = "ok" if ok else msg
+        estado = "ok" if ok else resp.get("msg", "")
         print(f"[EXCHANGE] Leverage {par} {leverage}x {estado}")
     return ok
 
