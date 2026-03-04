@@ -229,7 +229,9 @@ def set_leverage(par: str, leverage: int) -> bool:
     })
     ok = resp.get("code") == 0
     if config.MODO_DEBUG:
-        print(f"[EXCHANGE] Leverage {par} {leverage}x {'✓' if ok else f'✗ {resp.get(\"msg\",\"\")}'}")
+        msg = resp.get("msg", "")
+        estado = "✓" if ok else f"✗ {msg}"
+        print(f"[EXCHANGE] Leverage {par} {leverage}x {estado}")
     return ok
 
 
