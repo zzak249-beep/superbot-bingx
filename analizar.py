@@ -1,6 +1,6 @@
 """
-analizar.py — Cálculo de señales RSI + Bollinger Bands + ATR
-Entrada LONG cuando: RSI < umbral Y precio toca/cruza BB inferior
+analizar.py — Señales RSI + Bollinger Bands + ATR
+FIXED: usa exchange.parsear_klines que maneja dicts Y arrays de BingX
 """
 
 import numpy as np
@@ -8,11 +8,16 @@ import config
 import exchange
 
 
+# ============================================================
+# INDICADORES
+# ============================================================
+
 def calcular_rsi(closes: list, periodo: int = 14) -> float:
     if len(closes) < periodo + 1:
         return 50.0
 
-    deltas = np.diff(closes)
+    arr     = np.array(closes, dtype=float)
+    deltas  = np.diff(arr)
     ganancias = np.where(deltas > 0, deltas, 0.0)
     perdidas  = np.where(deltas < 0, -deltas, 0.0)
 
@@ -31,96 +36,60 @@ def calcular_rsi(closes: list, periodo: int = 14) -> float:
 
 
 def calcular_bb(closes: list, periodo: int = 20, std_mult: float = 2.0) -> dict:
+    vacio = {"media": 0, "superior": 0, "inferior": 0, "posicion": 0.5, "ancho": 0}
+
     if len(closes) < periodo:
-        return {"media": 0, "superior": 0, "inferior": 0, "posicion": 0.5}
+        return vacio
 
-    serie = np.array(closes[-periodo:])
-    media = np.mean(serie)
-    std   = np.std(serie)
-
+    serie    = np.array(closes[-periodo:], dtype=float)
+    media    = float(np.mean(serie))
+    std      = float(np.std(serie))
     superior = media + std_mult * std
     inferior = media - std_mult * std
     ancho    = superior - inferior
-
-    precio_actual = closes[-1]
-    posicion = (precio_actual - inferior) / ancho if ancho > 0 else 0.5
+    precio   = closes[-1]
+    posicion = float((precio - inferior) / ancho) if ancho > 0 else 0.5
 
     return {
         "media":    media,
         "superior": superior,
         "inferior": inferior,
-        "posicion": posicion,   # 0 = en banda inferior, 1 = en banda superior
+        "posicion": posicion,
         "ancho":    ancho
     }
 
 
 def calcular_atr(highs: list, lows: list, closes: list, periodo: int = 14) -> float:
-    if len(closes) < periodo + 1:
+    if len(closes) < 2:
         return closes[-1] * 0.02 if closes else 0.01
 
     trs = []
     for i in range(1, len(closes)):
         tr = max(
             highs[i] - lows[i],
-            abs(highs[i] - closes[i-1]),
-            abs(lows[i]  - closes[i-1])
+            abs(highs[i]  - closes[i-1]),
+            abs(lows[i]   - closes[i-1])
         )
         trs.append(tr)
 
-    if len(trs) < periodo:
-        return np.mean(trs)
+    if not trs:
+        return closes[-1] * 0.02
 
-    atr = np.mean(trs[:periodo])
+    if len(trs) < periodo:
+        return float(np.mean(trs))
+
+    atr = float(np.mean(trs[:periodo]))
     for i in range(periodo, len(trs)):
         atr = (atr * (periodo - 1) + trs[i]) / periodo
 
     return atr
 
 
-def _parsear_klines(klines: list) -> dict:
-    """Extrae arrays de OHLCV desde los klines de BingX"""
-    opens  = []
-    highs  = []
-    lows   = []
-    closes = []
-    vols   = []
-
-    for k in klines:
-        try:
-            # BingX devuelve: [time, open, high, low, close, volume, ...]
-            opens.append(float(k[1]))
-            highs.append(float(k[2]))
-            lows.append(float(k[3]))
-            closes.append(float(k[4]))
-            vols.append(float(k[5]))
-        except (IndexError, ValueError, TypeError):
-            continue
-
-    return {
-        "opens":  opens,
-        "highs":  highs,
-        "lows":   lows,
-        "closes": closes,
-        "vols":   vols
-    }
-
+# ============================================================
+# ANÁLISIS DE UN PAR
+# ============================================================
 
 def analizar_par(par: str) -> dict:
-    """
-    Analiza un par y retorna señal de entrada o None.
-
-    Retorna dict con:
-        señal: True/False
-        rsi: float
-        bb: dict
-        atr: float
-        precio: float
-        sl: float
-        tp: float
-        rr: float
-        score: int (0-100)
-        motivo: str
-    """
     resultado = {
         "par":    par,
         "señal":  False,
@@ -138,67 +107,69 @@ def analizar_par(par: str) -> dict:
     # Obtener klines
     klines = exchange.get_klines(par, intervalo="5m", limit=100)
     if len(klines) < 30:
-        resultado["motivo"] = "insuficientes klines"
+        resultado["motivo"] = f"klines insuficientes ({len(klines)})"
         return resultado
 
-    data = _parsear_klines(klines)
-    if not data["closes"]:
-        resultado["motivo"] = "error parseando klines"
+    # Parsear — ahora soporta dict Y array
+    data = exchange.parsear_klines(klines)
+
+    if len(data["closes"]) < 30:
+        resultado["motivo"] = f"closes insuficientes ({len(data['closes'])})"
         return resultado
 
-    precio = data["closes"][-1]
+    closes = data["closes"]
+    highs  = data["highs"]
+    lows   = data["lows"]
+    precio = closes[-1]
+
+    if precio <= 0:
+        resultado["motivo"] = "precio = 0"
+        return resultado
+
     resultado["precio"] = precio
 
-    # RSI
-    rsi = calcular_rsi(data["closes"], config.RSI_PERIODO)
+    # Indicadores
+    rsi = calcular_rsi(closes, config.RSI_PERIODO)
+    bb  = calcular_bb(closes, config.BB_PERIODO, config.BB_STD)
+    atr = calcular_atr(highs, lows, closes, config.ATR_PERIODO)
+
     resultado["rsi"] = rsi
-
-    # Bollinger Bands
-    bb = calcular_bb(data["closes"], config.BB_PERIODO, config.BB_STD)
-    resultado["bb"] = bb
-
-    # ATR
-    atr = calcular_atr(data["highs"], data["lows"], data["closes"], config.ATR_PERIODO)
+    resultado["bb"]  = bb
     resultado["atr"] = atr
 
-    # Volumen
+    # Filtros de calidad
     volumen = exchange.get_volumen_24h(par)
-
-    # Spread
-    spread = exchange.get_spread_pct(par)
-
-    # ============================================================
-    # FILTROS DE CALIDAD
-    # ============================================================
     if volumen < config.VOLUMEN_MIN_USD:
-        resultado["motivo"] = f"volumen insuficiente ${volumen:,.0f}"
+        resultado["motivo"] = f"vol bajo ${volumen:,.0f}"
         return resultado
 
+    spread = exchange.get_spread_pct(par)
     if spread > config.SPREAD_MAX_PCT:
-        resultado["motivo"] = f"spread alto {spread:.2f}%"
+        resultado["motivo"] = f"spread {spread:.2f}%"
         return resultado
 
-    # ============================================================
-    # CONDICIONES DE ENTRADA LONG
-    # ============================================================
+    # Condiciones de entrada LONG
     condicion_rsi = rsi < config.RSI_OVERSOLD
-    condicion_bb  = precio <= bb["inferior"] * 1.002  # precio en/cerca banda inferior
+    condicion_bb  = bb["inferior"] > 0 and precio <= bb["inferior"] * 1.002
 
-    if not (condicion_rsi and condicion_bb):
-        motivos = []
-        if not condicion_rsi: motivos.append(f"RSI={rsi:.1f} (necesita <{config.RSI_OVERSOLD})")
-        if not condicion_bb:  motivos.append(f"precio lejos de BB inferior ({bb['posicion']:.2f})")
-        resultado["motivo"] = " | ".join(motivos)
+    if not condicion_rsi:
+        resultado["motivo"] = f"RSI={rsi:.1f} (necesita <{config.RSI_OVERSOLD})"
         return resultado
 
-    # ============================================================
-    # CALCULAR SL / TP
-    # ============================================================
+    if not condicion_bb:
+        resultado["motivo"] = f"precio lejos BB inferior (pos={bb['posicion']:.2f})"
+        return resultado
+
+    # SL / TP
+    if atr <= 0:
+        resultado["motivo"] = "ATR = 0"
+        return resultado
+
     sl = precio - (atr * config.SL_ATR_MULT)
     tp = precio + (atr * config.TP_ATR_MULT)
 
-    riesgo   = precio - sl
-    beneficio= tp - precio
+    riesgo    = precio - sl
+    beneficio = tp - precio
     rr = beneficio / riesgo if riesgo > 0 else 0
 
     resultado["sl"] = sl
@@ -206,43 +177,40 @@ def analizar_par(par: str) -> dict:
     resultado["rr"] = rr
 
     if rr < config.RR_MINIMO:
-        resultado["motivo"] = f"R:R insuficiente {rr:.2f} (mínimo {config.RR_MINIMO})"
+        resultado["motivo"] = f"R:R={rr:.2f} < {config.RR_MINIMO}"
         return resultado
 
-    # ============================================================
-    # SCORE 0-100
-    # ============================================================
+    # Score
     score = 50
-    score += max(0, (config.RSI_OVERSOLD - rsi))   # Más puntos cuanto más bajo el RSI
-    score += min(20, int(rr * 5))                  # Hasta 20 pts por R:R
-    if bb["posicion"] < 0.1:                       # Precio muy cerca del fondo BB
+    score += int(max(0, config.RSI_OVERSOLD - rsi))
+    score += min(20, int(rr * 5))
+    if bb["posicion"] < 0.1:
         score += 10
     score = min(100, score)
 
     resultado["score"]  = score
     resultado["señal"]  = True
-    resultado["motivo"] = f"RSI={rsi:.1f} | BB_pos={bb['posicion']:.2f} | R:R={rr:.2f} | Score={score}"
+    resultado["motivo"] = f"RSI={rsi:.1f} | BB_pos={bb['posicion']:.2f} | R:R={rr:.2f} | score={score}"
 
     return resultado
 
 
 def analizar_todos(pares: list) -> list:
-    """
-    Analiza una lista de pares y retorna los que tienen señal,
-    ordenados por score descendente.
-    """
     señales = []
     for par in pares:
         try:
-            resultado = analizar_par(par)
-            if resultado["señal"]:
-                señales.append(resultado)
+            r = analizar_par(par)
+            if r["señal"]:
+                señales.append(r)
                 if config.MODO_DEBUG:
-                    print(f"  ✓ SEÑAL {par}: {resultado['motivo']}")
+                    print(f"  ✓ SEÑAL {par}: {r['motivo']}")
             elif config.MODO_DEBUG:
-                print(f"  ✗ {par}: {resultado['motivo']}")
+                print(f"  ✗ {par}: {r['motivo']}")
         except Exception as e:
             print(f"  [ERROR] {par}: {e}")
+            if config.MODO_DEBUG:
+                import traceback
+                traceback.print_exc()
 
     señales.sort(key=lambda x: x["score"], reverse=True)
     return señales
