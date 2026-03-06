@@ -30,6 +30,7 @@ try:
     import config
     import exchange
     import analizar
+    from notifier import send_telegram, send_startup, send_signal_telegram, send_close_telegram
 except Exception as e:
     log.error(f"ERROR importando módulos: {e}")
     log.error(traceback.format_exc())
@@ -231,8 +232,16 @@ def ejecutar_senal(r: dict, balance: float) -> bool:
     else:
         res = exchange.abrir_short(par, qty, precio, sl, tp)
 
-    if not res:
-        log.error(f"Orden fallida para {par} {lado}")
+    if not res or "error" in res:
+        err = res.get("error", "respuesta vacía") if res else "respuesta vacía"
+        log.error(f"Orden fallida {lado} {par}: {err}")
+        _notif(
+            f"🚨 *Orden fallida — {lado} `{par}`*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"❌ `{err}`\n"
+            f"qty:`{qty}` precio:`{precio:.6f}`\n"
+            f"💡 _Verifica permisos API (Trade) y modo posición en BingX_"
+        )
         return False
 
     estado.posiciones[par] = {

@@ -339,8 +339,9 @@ def abrir_long(par: str, cantidad: float, precio_entrada: float,
     })
 
     if resp.get("code") != 0:
-        print(f"[EXCHANGE] ✗ Error LONG {par}: code={resp.get('code')} | {str(resp.get('msg',''))[:100]}")
-        return {}
+        err_msg = f"code={resp.get('code')} | {str(resp.get('msg', resp.get('message', 'sin mensaje')))[:120]}"
+        print(f"[EXCHANGE] ✗ Error LONG {par}: {err_msg}")
+        return {"error": err_msg}
 
     order_id = str(resp.get("data", {}).get("orderId", ""))
     print(f"[EXCHANGE] ✓ LONG {par} qty:{qty_str} entrada:{precio_entrada:.6f}")
@@ -391,8 +392,9 @@ def abrir_short(par: str, cantidad: float, precio_entrada: float,
     })
 
     if resp.get("code") != 0:
-        print(f"[EXCHANGE] ✗ Error SHORT {par}: code={resp.get('code')} | {str(resp.get('msg',''))[:100]}")
-        return {}
+        err_msg = f"code={resp.get('code')} | {str(resp.get('msg', resp.get('message', 'sin mensaje')))[:120]}"
+        print(f"[EXCHANGE] ✗ Error SHORT {par}: {err_msg}")
+        return {"error": err_msg}
 
     order_id = str(resp.get("data", {}).get("orderId", ""))
     print(f"[EXCHANGE] ✓ SHORT {par} qty:{qty_str} entrada:{precio_entrada:.6f}")
