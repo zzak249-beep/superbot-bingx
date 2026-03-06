@@ -53,11 +53,11 @@ PARES = [
 # SEÑALES DE ENTRADA
 # ============================================================
 RSI_PERIODO      = 14
-RSI_OVERSOLD     = 35          # FIX: era 30, subido a 35 para más señales
+RSI_OVERSOLD     = 45          # FIX: era 30, subido a 35 para más señales
 BB_PERIODO       = 20
 BB_STD           = 1.8         # FIX: era 2.0, bajado a 1.8 para bandas más estrechas
 ATR_PERIODO      = 14
-VOLUMEN_MIN_USD  = 500_000     # FIX: era 1_000_000, bajado a 500k
+VOLUMEN_MIN_USD  = 200_000     # FIX: era 1_000_000, bajado a 500k
 SPREAD_MAX_PCT   = 1.5
 
 # ============================================================
