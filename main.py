@@ -30,7 +30,6 @@ try:
     import config
     import exchange
     import analizar
-    from notifier import send_telegram, send_startup, send_signal_telegram, send_close_telegram
 except Exception as e:
     log.error(f"ERROR importando módulos: {e}")
     log.error(traceback.format_exc())
