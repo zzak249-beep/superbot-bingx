@@ -41,7 +41,7 @@ PARES = [
     "DOGE-USDT",
     "XRP-USDT",
     "ADA-USDT",
-    "MATIC-USDT",
+    
     "DOT-USDT",
     "AVAX-USDT",
     "LTC-USDT",
