@@ -1,10 +1,6 @@
 """
 analizar.py — Señales RSI + Bollinger Bands + ATR
-FIXES:
-  - Usa exchange.parsear_klines() que soporta dicts Y arrays de BingX
-  - Condición BB ampliada a 1.005 (0.5% de margen)
-  - RSI_OVERSOLD sube a 35 para más señales (configurable)
-  - Logs de debug mejorados para diagnosticar filtros
+FIXED: usa exchange.parsear_klines que maneja dicts Y arrays de BingX
 """
 
 import numpy as np
@@ -20,8 +16,8 @@ def calcular_rsi(closes: list, periodo: int = 14) -> float:
     if len(closes) < periodo + 1:
         return 50.0
 
-    arr       = np.array(closes, dtype=float)
-    deltas    = np.diff(arr)
+    arr     = np.array(closes, dtype=float)
+    deltas  = np.diff(arr)
     ganancias = np.where(deltas > 0, deltas, 0.0)
     perdidas  = np.where(deltas < 0, -deltas, 0.0)
 
@@ -58,7 +54,7 @@ def calcular_bb(closes: list, periodo: int = 20, std_mult: float = 2.0) -> dict:
         "media":    media,
         "superior": superior,
         "inferior": inferior,
-        "posicion": posicion,   # 0 = banda inferior, 1 = banda superior
+        "posicion": posicion,
         "ancho":    ancho
     }
 
@@ -70,7 +66,7 @@ def calcular_atr(highs: list, lows: list, closes: list, periodo: int = 14) -> fl
     trs = []
     for i in range(1, len(closes)):
         tr = max(
-            highs[i]  - lows[i],
+            highs[i] - lows[i],
             abs(highs[i]  - closes[i-1]),
             abs(lows[i]   - closes[i-1])
         )
@@ -108,13 +104,13 @@ def analizar_par(par: str) -> dict:
         "motivo": ""
     }
 
-    # ── Klines ──────────────────────────────────────────────
+    # Obtener klines
     klines = exchange.get_klines(par, intervalo="5m", limit=100)
     if len(klines) < 30:
         resultado["motivo"] = f"klines insuficientes ({len(klines)})"
         return resultado
 
-    # FIX: usar parsear_klines de exchange (soporta dicts Y arrays)
+    # Parsear — ahora soporta dict Y array
     data = exchange.parsear_klines(klines)
 
     if len(data["closes"]) < 30:
@@ -127,12 +123,12 @@ def analizar_par(par: str) -> dict:
     precio = closes[-1]
 
     if precio <= 0:
-        resultado["motivo"] = "precio = 0 (error parseando klines)"
+        resultado["motivo"] = "precio = 0"
         return resultado
 
     resultado["precio"] = precio
 
-    # ── Indicadores ─────────────────────────────────────────
+    # Indicadores
     rsi = calcular_rsi(closes, config.RSI_PERIODO)
     bb  = calcular_bb(closes, config.BB_PERIODO, config.BB_STD)
     atr = calcular_atr(highs, lows, closes, config.ATR_PERIODO)
@@ -141,34 +137,30 @@ def analizar_par(par: str) -> dict:
     resultado["bb"]  = bb
     resultado["atr"] = atr
 
-    # ── Filtros de calidad ───────────────────────────────────
+    # Filtros de calidad
     volumen = exchange.get_volumen_24h(par)
     if volumen < config.VOLUMEN_MIN_USD:
-        resultado["motivo"] = f"vol bajo ${volumen:,.0f} (min ${config.VOLUMEN_MIN_USD:,.0f})"
+        resultado["motivo"] = f"vol bajo ${volumen:,.0f}"
         return resultado
 
     spread = exchange.get_spread_pct(par)
     if spread > config.SPREAD_MAX_PCT:
-        resultado["motivo"] = f"spread {spread:.2f}% (max {config.SPREAD_MAX_PCT}%)"
+        resultado["motivo"] = f"spread {spread:.2f}%"
         return resultado
 
-    # ── Condiciones de entrada LONG ──────────────────────────
-    # FIX: margen BB ampliado a 0.5% (era 0.2%) para más señales
+    # Condiciones de entrada LONG
     condicion_rsi = rsi < config.RSI_OVERSOLD
-    condicion_bb  = bb["inferior"] > 0 and precio <= bb["inferior"] * 1.005
+    condicion_bb  = bb["inferior"] > 0 and precio <= bb["inferior"] * 1.002
 
     if not condicion_rsi:
         resultado["motivo"] = f"RSI={rsi:.1f} (necesita <{config.RSI_OVERSOLD})"
         return resultado
 
     if not condicion_bb:
-        resultado["motivo"] = (
-            f"precio lejos BB inferior "
-            f"(pos={bb['posicion']:.2f}, precio={precio:.6f}, inf={bb['inferior']:.6f})"
-        )
+        resultado["motivo"] = f"precio lejos BB inferior (pos={bb['posicion']:.2f})"
         return resultado
 
-    # ── SL / TP ──────────────────────────────────────────────
+    # SL / TP
     if atr <= 0:
         resultado["motivo"] = "ATR = 0"
         return resultado
@@ -178,39 +170,32 @@ def analizar_par(par: str) -> dict:
 
     riesgo    = precio - sl
     beneficio = tp - precio
-    rr        = beneficio / riesgo if riesgo > 0 else 0
+    rr = beneficio / riesgo if riesgo > 0 else 0
 
     resultado["sl"] = sl
     resultado["tp"] = tp
     resultado["rr"] = rr
 
     if rr < config.RR_MINIMO:
-        resultado["motivo"] = f"R:R={rr:.2f} < mínimo {config.RR_MINIMO}"
+        resultado["motivo"] = f"R:R={rr:.2f} < {config.RR_MINIMO}"
         return resultado
 
-    # ── Score 0-100 ──────────────────────────────────────────
+    # Score
     score = 50
-    score += int(max(0, config.RSI_OVERSOLD - rsi))   # más bajo RSI = más puntos
-    score += min(20, int(rr * 5))                      # hasta 20 pts por R:R
-    if bb["posicion"] < 0.1:                           # precio muy pegado a BB inf
+    score += int(max(0, config.RSI_OVERSOLD - rsi))
+    score += min(20, int(rr * 5))
+    if bb["posicion"] < 0.1:
         score += 10
     score = min(100, score)
 
     resultado["score"]  = score
     resultado["señal"]  = True
-    resultado["motivo"] = (
-        f"RSI={rsi:.1f} | BB_pos={bb['posicion']:.2f} | "
-        f"R:R={rr:.2f} | score={score}"
-    )
+    resultado["motivo"] = f"RSI={rsi:.1f} | BB_pos={bb['posicion']:.2f} | R:R={rr:.2f} | score={score}"
 
     return resultado
 
 
 def analizar_todos(pares: list) -> list:
-    """
-    Analiza lista de pares y retorna los que tienen señal,
-    ordenados por score descendente.
-    """
     señales = []
     for par in pares:
         try:

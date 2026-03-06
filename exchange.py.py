@@ -1,15 +1,13 @@
 """
-exchange.py — Conexión BingX Futures
-FIXES:
-  - parsear_klines soporta dicts (BingX v3) Y arrays (BingX legacy)
-  - _get/_post usan sorted() para firma consistente
-  - hmac.new → hmac.new corregido
+exchange.py — Conexión BingX Futures v4
+FIXED: firma correcta — sign(params sin signature) + signature al final
 """
 
 import hmac
 import hashlib
 import time
 import requests
+import json
 from datetime import datetime
 import config
 
@@ -17,6 +15,7 @@ BASE_URL = "https://open-api.bingx.com"
 
 
 def _sign(query_string: str) -> str:
+    """Firma HMAC-SHA256 del query string (sin incluir signature)"""
     return hmac.new(
         config.BINGX_SECRET_KEY.encode("utf-8"),
         query_string.encode("utf-8"),
@@ -35,6 +34,7 @@ def _get(path: str, params: dict = None, auth: bool = True) -> dict:
     params = params or {}
     if auth:
         params["timestamp"] = int(time.time() * 1000)
+        # Construir query string SIN signature, luego añadir signature al final
         query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
         signature = _sign(query_string)
         url = f"{BASE_URL}{path}?{query_string}&signature={signature}"
@@ -48,6 +48,7 @@ def _get(path: str, params: dict = None, auth: bool = True) -> dict:
             print(f"[EXCHANGE] GET(auth) error {path}: {e}")
             return {"code": -1, "data": None}
     else:
+        # Endpoints públicos — sin firma
         try:
             r = requests.get(BASE_URL + path, params=params, headers=_headers(), timeout=10)
             return r.json()
@@ -113,7 +114,7 @@ def get_equity() -> float:
 
 
 # ============================================================
-# PRECIO Y MERCADO (públicos)
+# PRECIO Y MERCADO (públicos — sin auth)
 # ============================================================
 
 def get_precio(par: str) -> float:
@@ -176,54 +177,26 @@ def get_volumen_24h(par: str) -> float:
 
 
 # ============================================================
-# PARSEAR KLINES — soporta dict Y array (BingX v2/v3)
+# PARSEAR KLINES
 # ============================================================
 
 def parsear_klines(klines: list) -> dict:
-    """
-    BingX v3 devuelve dicts: {"open":..., "high":..., "low":..., "close":..., "volume":...}
-    BingX v2/legacy devuelve arrays: [time, open, high, low, close, volume, ...]
-    Esta función maneja ambos formatos.
-    """
-    opens  = []
-    highs  = []
-    lows   = []
-    closes = []
-    vols   = []
-
+    opens = []; highs = []; lows = []; closes = []; vols = []
     for k in klines:
         try:
             if isinstance(k, dict):
-                # BingX v3: claves en inglés o abreviadas
-                o = k.get("open",   k.get("o", None))
-                h = k.get("high",   k.get("h", None))
-                l = k.get("low",    k.get("l", None))
-                c = k.get("close",  k.get("c", None))
-                v = k.get("volume", k.get("v", 0))
-                if None in (o, h, l, c):
-                    continue
-                opens.append(float(o))
-                highs.append(float(h))
-                lows.append(float(l))
-                closes.append(float(c))
-                vols.append(float(v))
+                opens.append( float(k.get("open",   k.get("o", 0))))
+                highs.append( float(k.get("high",   k.get("h", 0))))
+                lows.append(  float(k.get("low",    k.get("l", 0))))
+                closes.append(float(k.get("close",  k.get("c", 0))))
+                vols.append(  float(k.get("volume", k.get("v", 0))))
             elif isinstance(k, (list, tuple)) and len(k) >= 6:
-                # Legacy array: [time, open, high, low, close, volume]
-                opens.append(float(k[1]))
-                highs.append(float(k[2]))
-                lows.append(float(k[3]))
-                closes.append(float(k[4]))
+                opens.append(float(k[1])); highs.append(float(k[2]))
+                lows.append(float(k[3]));  closes.append(float(k[4]))
                 vols.append(float(k[5]))
         except (ValueError, TypeError, KeyError):
             continue
-
-    return {
-        "opens":  opens,
-        "highs":  highs,
-        "lows":   lows,
-        "closes": closes,
-        "vols":   vols
-    }
+    return {"opens": opens, "highs": highs, "lows": lows, "closes": closes, "vols": vols}
 
 
 # ============================================================
@@ -238,8 +211,9 @@ def set_leverage(par: str, leverage: int) -> bool:
     })
     ok = resp.get("code") == 0
     if config.MODO_DEBUG:
-        estado = "ok" if ok else resp.get("msg", "error")
-        print(f"[EXCHANGE] Leverage {par} {leverage}x → {estado}")
+        msg = resp.get("msg", "")
+        estado = "ok" if ok else msg
+        print(f"[EXCHANGE] Leverage {par} {leverage}x {estado}")
     return ok
 
 
@@ -250,13 +224,13 @@ def set_leverage(par: str, leverage: int) -> bool:
 def calcular_cantidad(par: str, balance: float, precio: float) -> float:
     if balance <= 0 or precio <= 0:
         return 0.0
-    capital  = balance * config.RIESGO_POR_TRADE * config.LEVERAGE
+    capital = balance * config.RIESGO_POR_TRADE * config.LEVERAGE
     cantidad = capital / precio
     return round(cantidad, 4) if cantidad >= 0.0001 else 0.0
 
 
 # ============================================================
-# ÓRDENES
+# ORDENES
 # ============================================================
 
 def abrir_long(par: str, cantidad: float, precio_entrada: float,
@@ -299,10 +273,7 @@ def abrir_long(par: str, cantidad: float, precio_entrada: float,
 
 def cerrar_posicion(par: str, cantidad: float) -> dict:
     if config.MODO_DEMO:
-        return {
-            "order_id": f"demo_close_{int(time.time())}",
-            "precio_salida": get_precio(par)
-        }
+        return {"order_id": f"demo_close_{int(time.time())}", "precio_salida": get_precio(par)}
 
     resp = _post("/openApi/swap/v2/trade/order", {
         "symbol": par, "side": "SELL",
