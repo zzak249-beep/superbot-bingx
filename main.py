@@ -30,24 +30,33 @@ def inicializar():
 
     database.init_db()
 
-    # ── DEBUG: muestra JSON crudo que devuelve BingX para balance ──
-    import requests as _req, hmac as _hmac, hashlib as _hash, time as _time
-    def _raw_balance_debug():
-        if not config.BINGX_API_KEY:
-            print("[BALANCE_DEBUG] API_KEY vacia - verifica variables Railway")
-            return
+    # ── DEBUG: verifica variables de entorno ──────────────────
+    api_key    = config.BINGX_API_KEY.strip()
+    secret_key = config.BINGX_SECRET_KEY.strip()
+
+    print(f"[CONFIG] BINGX_API_KEY    : {'✓ SET (' + api_key[:6] + '...)' if api_key else '✗ VACÍA — añadir en Railway Variables'}")
+    print(f"[CONFIG] BINGX_SECRET_KEY : {'✓ SET (' + secret_key[:4] + '...)' if secret_key else '✗ VACÍA — añadir en Railway Variables'}")
+    print(f"[CONFIG] TELEGRAM_TOKEN   : {'✓ SET' if config.TELEGRAM_TOKEN.strip() else '✗ VACÍA'}")
+    print(f"[CONFIG] TELEGRAM_CHAT_ID : {'✓ SET' if config.TELEGRAM_CHAT_ID.strip() else '✗ VACÍA'}")
+
+    if api_key and secret_key:
+        # Test rápido de firma
+        import requests as _req, hmac as _hmac, hashlib as _hash, time as _time
         ts  = int(_time.time() * 1000)
-        qs  = f"currency=USDT&timestamp={ts}"
-        sig = _hmac.new(config.BINGX_SECRET_KEY.encode(), qs.encode(), _hash.sha256).hexdigest()
+        qs  = f"currency=USDT&recvWindow=10000&timestamp={ts}"
+        sig = _hmac.new(secret_key.encode(), qs.encode(), _hash.sha256).hexdigest()
         url = f"https://open-api.bingx.com/openApi/swap/v2/user/balance?{qs}&signature={sig}"
         try:
-            r = _req.get(url, headers={"X-BX-APIKEY": config.BINGX_API_KEY}, timeout=10)
-            print(f"[BALANCE_DEBUG] HTTP={r.status_code}")
-            print(f"[BALANCE_DEBUG] JSON={r.text[:800]}")
+            r = _req.get(url, headers={"X-BX-APIKEY": api_key}, timeout=10)
+            j = r.json()
+            print(f"[BALANCE_DEBUG] HTTP={r.status_code} | code={j.get('code')} | {str(j.get('data',''))[:150]}")
+            if j.get("code") == 100001:
+                print("[BALANCE_DEBUG] ✗ Signature mismatch — comprueba que BINGX_SECRET_KEY sea la Secret Key (NO la API Key)")
+            elif j.get("code") == 0:
+                print("[BALANCE_DEBUG] ✓ Autenticación correcta")
         except Exception as e:
             print(f"[BALANCE_DEBUG] ERROR={e}")
-    _raw_balance_debug()
-    # ── FIN DEBUG ──────────────────────────────────────────────────
+    # ── FIN DEBUG ──────────────────────────────────────────────
 
     balance_inicio_dia = exchange.get_balance()
     fecha_actual = date.today()

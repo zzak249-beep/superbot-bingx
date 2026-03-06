@@ -1,6 +1,7 @@
 """
 exchange.py — Conexión BingX Futures
 FIRMA: timestamp AL FINAL del query string (requerido por BingX)
+FIX v2: .strip() en keys, recvWindow, mejor detección de balance
 """
 
 import hmac
@@ -13,9 +14,18 @@ import config
 BASE_URL = "https://open-api.bingx.com"
 
 
+def _secret() -> bytes:
+    """Retorna SECRET_KEY limpia (sin espacios/newlines)"""
+    return config.BINGX_SECRET_KEY.strip().encode("utf-8")
+
+
+def _api_key() -> str:
+    return config.BINGX_API_KEY.strip()
+
+
 def _sign(query_string: str) -> str:
     return hmac.new(
-        config.BINGX_SECRET_KEY.encode("utf-8"),
+        _secret(),
         query_string.encode("utf-8"),
         hashlib.sha256
     ).hexdigest()
@@ -23,7 +33,7 @@ def _sign(query_string: str) -> str:
 
 def _headers() -> dict:
     return {
-        "X-BX-APIKEY": config.BINGX_API_KEY,
+        "X-BX-APIKEY": _api_key(),
         "Content-Type": "application/json"
     }
 
@@ -45,6 +55,7 @@ def _get(path: str, params: dict = None, auth: bool = True) -> dict:
     params = params or {}
     if auth:
         params["timestamp"] = int(time.time() * 1000)
+        params["recvWindow"] = 10000          # ← FIX: BingX requiere recvWindow
         query_string = _build_qs(params)
         signature    = _sign(query_string)
         url = f"{BASE_URL}{path}?{query_string}&signature={signature}"
@@ -52,7 +63,7 @@ def _get(path: str, params: dict = None, auth: bool = True) -> dict:
             r    = requests.get(url, headers=_headers(), timeout=10)
             data = r.json()
             if config.MODO_DEBUG and data.get("code", 0) != 0:
-                print(f"[EXCHANGE] API error {path}: code={data.get('code')} | {data.get('msg','')[:100]}")
+                print(f"[EXCHANGE] API error {path}: code={data.get('code')} | {data.get('msg','')[:120]}")
             return data
         except Exception as e:
             print(f"[EXCHANGE] GET(auth) error {path}: {e}")
@@ -69,6 +80,7 @@ def _get(path: str, params: dict = None, auth: bool = True) -> dict:
 
 def _post(path: str, params: dict) -> dict:
     params["timestamp"] = int(time.time() * 1000)
+    params["recvWindow"] = 10000
     query_string = _build_qs(params)
     signature    = _sign(query_string)
     url = f"{BASE_URL}{path}?{query_string}&signature={signature}"
@@ -76,7 +88,7 @@ def _post(path: str, params: dict) -> dict:
         r    = requests.post(url, headers=_headers(), timeout=10)
         data = r.json()
         if config.MODO_DEBUG and data.get("code", 0) != 0:
-            print(f"[EXCHANGE] POST error {path}: code={data.get('code')} | {data.get('msg','')[:100]}")
+            print(f"[EXCHANGE] POST error {path}: code={data.get('code')} | {data.get('msg','')[:120]}")
         return data
     except Exception as e:
         print(f"[EXCHANGE] POST error {path}: {e}")
@@ -114,26 +126,45 @@ def get_balance() -> float:
     if config.MODO_DEMO:
         return _demo_balance()
 
-    if not config.BINGX_API_KEY or not config.BINGX_SECRET_KEY:
-        print("[BALANCE] ⚠ API_KEY o SECRET_KEY vacías — verifica Variables en Railway")
+    api_key    = _api_key()
+    secret_key = config.BINGX_SECRET_KEY.strip()
+
+    if not api_key:
+        print("[BALANCE] ✗ BINGX_API_KEY vacía — añádela en Railway Variables")
+        return 0.0
+    if not secret_key:
+        print("[BALANCE] ✗ BINGX_SECRET_KEY vacía — añádela en Railway Variables")
         return 0.0
 
+    # Intento 1: con currency=USDT
     resp = _get("/openApi/swap/v2/user/balance", {"currency": "USDT"}, auth=True)
-    print(f"[BALANCE] code={resp.get('code')} | {str(resp.get('data',''))[:200]}")
+    code = resp.get("code", -1)
+    print(f"[BALANCE] code={code} | {str(resp.get('data',''))[:200]}")
 
-    val = _buscar_float(resp, ["availableMargin", "available", "free"])
+    if code == 100001:
+        print("[BALANCE] ✗ Signature error — verifica que BINGX_SECRET_KEY sea la clave SECRETA, no la API KEY")
+        return 0.0
+
+    val = _buscar_float(resp, ["availableMargin", "available", "free", "balance"])
     if val > 0:
         print(f"[BALANCE] ✓ ${val:.2f}")
         return val
 
-    # fallback sin currency
+    # Intento 2: sin parámetros
     resp2 = _get("/openApi/swap/v2/user/balance", {}, auth=True)
     val2  = _buscar_float(resp2, ["availableMargin", "available", "free", "balance"])
     if val2 > 0:
         print(f"[BALANCE] ✓ fallback ${val2:.2f}")
         return val2
 
-    print(f"[BALANCE] ✗ balance=0. Respuesta: {resp}")
+    # Intento 3: endpoint v3
+    resp3 = _get("/openApi/swap/v3/user/balance", {"currency": "USDT"}, auth=True)
+    val3  = _buscar_float(resp3, ["availableMargin", "available", "free", "balance", "equity"])
+    if val3 > 0:
+        print(f"[BALANCE] ✓ v3 ${val3:.2f}")
+        return val3
+
+    print(f"[BALANCE] ✗ balance=0. Última respuesta: {resp}")
     return 0.0
 
 
