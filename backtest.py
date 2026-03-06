@@ -10,7 +10,7 @@ import numpy as np
 
 import exchange
 import config
-from analizar import calcular_rsi, calcular_bb, calcular_atr, _parsear_klines
+from analizar import calcular_rsi, calcular_bb, calcular_atr
 
 # ============================================================
 # PARÁMETROS DEL BACKTEST
@@ -36,7 +36,7 @@ def backtest_par(par: str) -> dict:
     if len(klines) < 50:
         return {"par": par, "status": "insuficiente", "trades": 0}
 
-    data = _parsear_klines(klines)
+    data = exchange.parsear_klines(klines)
     closes = data["closes"]
     highs  = data["highs"]
     lows   = data["lows"]
