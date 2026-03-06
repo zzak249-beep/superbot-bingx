@@ -4,29 +4,29 @@
 
 PARES = [
     "BTC-USDT",
-    "NCCOGOLD2USD-USDT",
+    
     "ETH-USDT",
     "SOL-USDT",
-    "NCCOOILWTI2USD-USDT",
+    
     "BOME-USDT",
-    "NCCOXAG2USD-USDT",
+    
     "IMX-USDT",
     "AVAX-USDT",
     "XRP-USDT",
     "DOGE-USDT",
     "SUI-USDT",
     "SAGA-USDT",
-    "NCCOOILBRENT2USD-USDT",
+    
     "COMP-USDT",
     "ETHFI-USDT",
     "ARPA-USDT",
     "DOT-USDT",
-    "NCSINASDAQ1002USD-USDT",
+    
     "JASMY-USDT",
     "LINK-USDT",
     "AAVE-USDT",
     "XAUT-USDT",
-    "NCSISP5002USD-USDT",
+    
     "HYPE-USDT",
     "BLUR-USDT",
     "ARB-USDT",
@@ -35,7 +35,6 @@ PARES = [
     "RARE-USDT",
     "OKB-USDT",
     "BARD-USDT",
-    "NCSINIKKEI2252USD-USDT",
     "SHIB-USDT",
     "ATOM-USDT",
     "BNB-USDT",
