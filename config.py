@@ -42,13 +42,13 @@ TP_ATR_MULT   = 3.0    # TP = precio ± 3.0 × ATR  → R:R ≈ 2.0
 RR_MINIMO     = 1.5    # descartar si R:R < 1.5
 
 # ── RIESGO ────────────────────────────────────────────
-RIESGO_POR_TRADE = 0.02   # 2% del balance por trade
-LEVERAGE         = 2       # apalancamiento
-MAX_POSICIONES   = 3       # máx posiciones simultáneas
+RIESGO_POR_TRADE = 0.7   # 2% del balance por trade
+LEVERAGE         = 13       # apalancamiento
+MAX_POSICIONES   = 7      # máx posiciones simultáneas
 
 # ── CIRCUIT BREAKER ───────────────────────────────────
-CB_MAX_DAILY_LOSS_PCT   = 0.05   # parar si pierde 5% del balance en el día
-CB_MAX_CONSECUTIVE_LOSS = 4      # parar tras 4 pérdidas seguidas
+CB_MAX_DAILY_LOSS_PCT   = 20   # parar si pierde 5% del balance en el día
+CB_MAX_CONSECUTIVE_LOSS = 8      # parar tras 4 pérdidas seguidas
 
 # ── OPERACIÓN ─────────────────────────────────────────
 LOOP_SECONDS  = 600   # escanear cada 10 minutos
