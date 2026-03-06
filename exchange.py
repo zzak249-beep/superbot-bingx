@@ -76,40 +76,93 @@ def _post(path: str, params: dict) -> dict:
 # BALANCE
 # ============================================================
 
+def _extraer_balance_usdt(resp: dict, campo: str) -> float:
+    """
+    Extrae el campo pedido del balance USDT.
+    Maneja todos los formatos que devuelve BingX:
+      - data.balance como dict         → cuenta aislada clásica
+      - data.balance como lista        → multi-asset
+      - data como dict directo         → margen cruzado USDT
+      - data como lista de dicts       → margen cruzado multi
+    """
+    data = resp.get("data", {})
+
+    # Formato 1: data es dict con subclave "balance" (dict)
+    if isinstance(data, dict):
+        bal = data.get("balance", None)
+
+        if isinstance(bal, dict):
+            # Intentar campo directo
+            val = bal.get(campo, None)
+            if val is not None:
+                return float(val)
+            # Fallback: availableMargin → equity, balance → equity
+            for fallback in ["availableMargin", "balance", "equity", "available"]:
+                v = bal.get(fallback, None)
+                if v is not None:
+                    return float(v)
+
+        elif isinstance(bal, list):
+            for item in bal:
+                if isinstance(item, dict) and item.get("asset", "") in ("USDT", ""):
+                    val = item.get(campo, item.get("availableMargin", item.get("balance", 0)))
+                    return float(val)
+
+        # Formato margen cruzado: data tiene los campos directamente
+        for key in [campo, "availableMargin", "balance", "equity", "available"]:
+            val = data.get(key, None)
+            if val is not None:
+                try:
+                    return float(val)
+                except:
+                    continue
+
+    # Formato 2: data es lista de cuentas
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            asset = item.get("asset", item.get("currency", ""))
+            if asset in ("USDT", ""):
+                val = item.get(campo, item.get("availableMargin", item.get("balance", 0)))
+                return float(val)
+
+    return 0.0
+
+
 def get_balance() -> float:
+    """Margen disponible para abrir posiciones nuevas"""
     if config.MODO_DEMO:
         return _demo_balance()
 
     resp = _get("/openApi/swap/v2/user/balance", {"currency": "USDT"}, auth=True)
-    try:
-        bal = resp.get("data", {}).get("balance", {})
-        if isinstance(bal, dict):
-            return float(bal.get("availableMargin", 0))
-        if isinstance(bal, list):
-            for item in bal:
-                if item.get("asset") == "USDT":
-                    return float(item.get("availableMargin", 0))
-    except Exception as e:
-        print(f"[EXCHANGE] Error balance: {e} | resp: {resp}")
+    if config.MODO_DEBUG:
+        print(f"[EXCHANGE] balance raw: {str(resp)[:200]}")
+
+    val = _extraer_balance_usdt(resp, "availableMargin")
+    if val > 0:
+        return val
+
+    # Segunda llamada: endpoint alternativo para margen cruzado
+    resp2 = _get("/openApi/swap/v2/user/balance", {}, auth=True)
+    val2 = _extraer_balance_usdt(resp2, "availableMargin")
+    if val2 > 0:
+        return val2
+
+    print(f"[EXCHANGE] ⚠ balance=0 — respuesta completa: {resp}")
     return 0.0
 
 
 def get_equity() -> float:
+    """Balance total de la cuenta (incluyendo PnL no realizado)"""
     if config.MODO_DEMO:
         return _demo_balance()
 
     resp = _get("/openApi/swap/v2/user/balance", {"currency": "USDT"}, auth=True)
-    try:
-        bal = resp.get("data", {}).get("balance", {})
-        if isinstance(bal, dict):
-            return float(bal.get("balance", 0))
-        if isinstance(bal, list):
-            for item in bal:
-                if item.get("asset") == "USDT":
-                    return float(item.get("balance", 0))
-    except Exception as e:
-        print(f"[EXCHANGE] Error equity: {e}")
-    return 0.0
+    val = _extraer_balance_usdt(resp, "balance")
+    if val > 0:
+        return val
+    return _extraer_balance_usdt(resp, "equity")
 
 
 # ============================================================
