@@ -1,6 +1,7 @@
 # ══════════════════════════════════════════════════════
-# config.py — BingX RSI+BB Bot v5.1 (Opción A — estable)
-# Basado en backtest real 30 pares × 15 días
+# config.py — BingX RSI+BB Bot v5.2
+# Optimizado para balance pequeño ($30-$100)
+# Margen dinámico — escala con el balance automáticamente
 # ══════════════════════════════════════════════════════
 import os
 
@@ -22,44 +23,52 @@ BB_PERIODO     = 20
 BB_STD         = 2.0
 ATR_PERIODO    = 14
 
-# ── SL / TP ──────────────────────────────────────────
-# Backtest real: SL=1.5, TP=3.0 → PF:2.0 rentable
-# No cambiar sin nuevo backtest
+# ── SL / TP — confirmados por backtest PF:2.0 ────────
 SL_ATR_MULT = 1.5
 TP_ATR_MULT = 3.0
 RR_MINIMO   = 1.5
 
-# ── PARTIAL TP ───────────────────────────────────────
+# ── PARTIAL TP ────────────────────────────────────────
 # TP1 = 1.5×ATR → cerrar 50% + SL a breakeven
 # TP2 = 3.0×ATR → cerrar el 50% restante
 PARTIAL_TP_ACTIVO = True
-PARTIAL_TP1_MULT  = 1.5   # × ATR
+PARTIAL_TP1_MULT  = 1.5
 
 # ── TRAILING STOP ────────────────────────────────────
 TRAILING_ACTIVO    = True
-TRAILING_ACTIVAR   = 1.5   # activar cuando gana 1.5×ATR
+TRAILING_ACTIVAR   = 1.5   # activar al ganar 1.5×ATR
 TRAILING_DISTANCIA = 1.0   # trailing a 1.0×ATR del precio
 
-# ── TIME-BASED EXIT ───────────────────────────────────
-# Si posición lleva > 8h sin resolver → cerrar
-# Libera capital para nuevas señales
+# ── TIME-BASED EXIT ──────────────────────────────────
 TIME_EXIT_HORAS = 8
 
-# ── SCORE ─────────────────────────────────────────────
-# Backtest: WR sube con score más alto
-SCORE_MIN = 80
+# ── SCORE ────────────────────────────────────────────
+# 80 era demasiado alto → 0 señales en mercado bajista
+# 70 permite más entradas manteniendo calidad
+SCORE_MIN = int(os.environ.get("SCORE_MIN", 70))
 
 # ── FILTROS DE CALIDAD ────────────────────────────────
-VOLUMEN_MIN_USD = 500_000
+VOLUMEN_MIN_USD = 300_000   # bajado de 500k — más pares pasan
 SPREAD_MAX_PCT  = 1.5
 
 # ── RIESGO ────────────────────────────────────────────
-LEVERAGE       = 7
-MAX_POSICIONES = 3    # 3 × $8 margen = $24 máximo comprometido
+LEVERAGE       = int(os.environ.get("LEVERAGE", 7))
+# Con $34 y MAX_POSICIONES=3, ponía $24 en riesgo (70% del balance)
+# Reducido a 2 → máximo $12-14 en riesgo (~36%)
+MAX_POSICIONES = int(os.environ.get("MAX_POSICIONES", 2))
 
-# ── CIRCUIT BREAKER ───────────────────────────────────
-CB_MAX_DAILY_LOSS_PCT   = 0.06   # 6% pérdida diaria → pausar
-CB_MAX_CONSECUTIVE_LOSS = 3      # 3 pérdidas seguidas → pausar
+# ── MARGEN DINÁMICO ───────────────────────────────────
+# En lugar de $8 fijo, usa un % del balance disponible
+# Escala automáticamente:
+#   $34 → $6.10/trade   $50 → $9/trade   $80+ → $12/trade (cap)
+# Esto protege el capital pequeño y crece con la cuenta
+MARGEN_PCT  = 0.18   # 18% del balance por trade
+MARGEN_MIN  = 5.0    # mínimo absoluto ($5 = mínimo BingX)
+MARGEN_MAX  = 12.0   # máximo absoluto (no arriesgar más de $12)
+
+# ── CIRCUIT BREAKER ──────────────────────────────────
+CB_MAX_DAILY_LOSS_PCT   = 0.08   # 8% diario → pausar (más permisivo)
+CB_MAX_CONSECUTIVE_LOSS = 3
 
 # ── PARES BLOQUEADOS — backtest WR < 32% ─────────────
 PARES_BLOQUEADOS = [
@@ -98,7 +107,7 @@ PARES_PRIORITARIOS = [
     "INJ-USDT",    # WR 37.0% PnL  +$0.46
 ]
 
-# ── OPERACIÓN ─────────────────────────────────────────
+# ── OPERACIÓN ────────────────────────────────────────
 LOOP_SECONDS = 600
 
-VERSION = "BingX-RSI+BB-v5.1"
+VERSION = "BingX-RSI+BB-v5.2"

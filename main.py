@@ -377,8 +377,9 @@ def ejecutar_senal(r, balance):
         log.info(f"[MEMORIA] {par} bloqueado"); return False
     if len(estado.posiciones) >= config.MAX_POSICIONES:
         return False
-    if balance < 8.0 and not config.MODO_DEMO:
-        log.warning(f"Balance insuficiente: ${balance:.2f}"); return False
+    margen_min = getattr(config, "MARGEN_MIN", 5.0)
+    if balance < margen_min and not config.MODO_DEMO:
+        log.warning(f"Balance insuficiente: ${balance:.2f} < ${margen_min:.2f}"); return False
 
     qty = exchange.calcular_cantidad(par, balance, precio)
     if qty <= 0:

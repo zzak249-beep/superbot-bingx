@@ -356,23 +356,24 @@ def calcular_cantidad(par: str, balance: float, precio: float) -> float:
         return 0.0
 
     import math
-    leverage = getattr(config, "LEVERAGE", 3)
+    leverage = getattr(config, "LEVERAGE", 7)
 
-    # ── Margen dinámico: RIESGO_MARGEN_PCT del balance ──
-    # Para $50:  8% → $4 margen, $12 notional (3x)
-    # Para $100: 8% → $8 margen, $24 notional (3x)
-    # Para $200: 8% → $16 margen, $48 notional (3x)
-    RIESGO_MARGEN_PCT = getattr(config, "RIESGO_MARGEN_PCT", 0.08)
-    margen = round(balance * RIESGO_MARGEN_PCT, 2)
-    margen = max(3.0, min(margen, 20.0))  # entre $3 y $20
+    # ── Margen dinámico — escala con el balance ───────
+    # 18% del balance, mínimo $5, máximo $12
+    # $34 → $6.10  |  $50 → $9  |  $80+ → $12
+    margen_pct = getattr(config, "MARGEN_PCT",  0.18)
+    margen_min = getattr(config, "MARGEN_MIN",  5.0)
+    margen_max = getattr(config, "MARGEN_MAX",  12.0)
+    margen     = max(margen_min, min(margen_max, balance * margen_pct))
 
-    if balance < margen:
-        print(f"[EXCHANGE] Balance insuficiente: ${balance:.2f} < ${margen:.2f} margen requerido")
+    if balance < margen_min:
+        print(f"[EXCHANGE] Balance insuficiente: ${balance:.2f} < ${margen_min:.2f} minimo")
         return 0.0
 
     notional_objetivo = margen * leverage
     cantidad_raw      = notional_objetivo / precio
 
+    # Redondear HACIA ARRIBA según precio para garantizar margen >= $8
     if precio > 10000: decimales = 3
     elif precio > 100: decimales = 2
     elif precio > 1:   decimales = 1
@@ -384,13 +385,12 @@ def calcular_cantidad(par: str, balance: float, precio: float) -> float:
     if cantidad == 0:
         cantidad = 1.0
 
+    # Verificar mínimo BingX ($5 notional)
     if cantidad * precio < 5.0:
         return 0.0
 
     margen_real = (cantidad * precio) / leverage
-    pct_balance = (margen_real / balance) * 100
-    print(f"[EXCHANGE] Margen: ${margen_real:.2f} ({pct_balance:.1f}% balance) | "
-          f"Notional: ${cantidad * precio:.2f} | Lev:{leverage}x")
+    print(f"[EXCHANGE] Margen: ${margen_real:.2f} USDT (${margen:.2f} objetivo) | Notional: ${cantidad * precio:.2f} | Lev:{leverage}x | Bal:{balance:.2f}")
     return cantidad
 
 
@@ -450,26 +450,6 @@ def _orden_tp_short(par: str, tp_price: str, qty_str: str) -> dict:
             "stopPrice": tp_price, "closePosition": "true", "workingType": "MARK_PRICE"}
 
 
-def _get_fill_price(order_id: str, par: str) -> float:
-    """
-    Consulta el precio real de ejecución (avgPrice) de una orden MARKET ejecutada.
-    BingX endpoint: GET /openApi/swap/v2/trade/order
-    Retorna 0.0 si no se puede obtener.
-    """
-    if not order_id:
-        return 0.0
-    try:
-        resp = _get("/openApi/swap/v2/trade/order", {"symbol": par, "orderId": order_id})
-        data = resp.get("data", {}) or {}
-        for campo in ("avgPrice", "avgFillPrice", "price"):
-            val = float(data.get(campo, 0) or 0)
-            if val > 0:
-                return val
-    except Exception as e:
-        print(f"[EXCHANGE] _get_fill_price {par}: {e}")
-    return 0.0
-
-
 def abrir_long(par: str, cantidad: float, precio_entrada: float,
                sl: float, tp: float) -> dict:
     if getattr(config, "MODO_DEMO", False):
@@ -489,35 +469,16 @@ def abrir_long(par: str, cantidad: float, precio_entrada: float,
         return {"error": err_msg}
 
     order_id = str(resp.get("data", {}).get("orderId", ""))
-
-    # FIX CRÍTICO: obtener precio real de ejecución del fill
-    fill_price = float((resp.get("data") or {}).get("avgPrice", 0) or 0)
-    if fill_price <= 0:
-        time.sleep(0.35)  # esperar confirmación BingX
-        fill_price = _get_fill_price(order_id, par)
-    if fill_price <= 0:
-        fill_price = get_precio(par)  # fallback: precio actual (mejor que precio análisis)
-    if fill_price <= 0:
-        fill_price = precio_entrada   # último recurso
-
-    slip = abs(fill_price - precio_entrada) / precio_entrada * 100
-    print(f"[EXCHANGE] ✓ LONG {par} qty:{qty_str} modo:{_POSITION_MODE} "
-          f"fill:{fill_price:.6f} señal:{precio_entrada:.6f} slip:{slip:.2f}%")
+    print(f"[EXCHANGE] ✓ LONG {par} qty:{qty_str} modo:{_POSITION_MODE}")
 
     # SL y TP según modo detectado
     _post("/openApi/swap/v2/trade/order", _orden_sl_long(par, _format_price(sl), qty_str))
     _post("/openApi/swap/v2/trade/order", _orden_tp_long(par, _format_price(tp), qty_str))
 
     return {
-        "order_id":      order_id,
-        "par":           par,
-        "lado":          "LONG",
-        "cantidad":      cantidad,
-        "fill_price":    fill_price,        # ← PRECIO REAL DE EJECUCIÓN
-        "precio_entrada": precio_entrada,   # precio análisis (solo referencia)
-        "sl":            sl,
-        "tp":            tp,
-        "timestamp":     datetime.now().isoformat()
+        "order_id": order_id, "par": par, "lado": "LONG",
+        "cantidad": cantidad, "precio_entrada": precio_entrada,
+        "sl": sl, "tp": tp, "timestamp": datetime.now().isoformat()
     }
 
 
@@ -541,20 +502,7 @@ def abrir_short(par: str, cantidad: float, precio_entrada: float,
         return {"error": err_msg}
 
     order_id = str(resp.get("data", {}).get("orderId", ""))
-
-    # FIX CRÍTICO: precio real de ejecución
-    fill_price = float((resp.get("data") or {}).get("avgPrice", 0) or 0)
-    if fill_price <= 0:
-        time.sleep(0.35)
-        fill_price = _get_fill_price(order_id, par)
-    if fill_price <= 0:
-        fill_price = get_precio(par)
-    if fill_price <= 0:
-        fill_price = precio_entrada
-
-    slip = abs(fill_price - precio_entrada) / precio_entrada * 100
-    print(f"[EXCHANGE] ✓ SHORT {par} qty:{qty_str} modo:{_POSITION_MODE} "
-          f"fill:{fill_price:.6f} señal:{precio_entrada:.6f} slip:{slip:.2f}%")
+    print(f"[EXCHANGE] ✓ SHORT {par} qty:{qty_str} modo:{_POSITION_MODE}")
 
     _post("/openApi/swap/v2/trade/order",
           _orden_sl_short(par, _format_price(sl), qty_str))
@@ -562,15 +510,9 @@ def abrir_short(par: str, cantidad: float, precio_entrada: float,
           _orden_tp_short(par, _format_price(tp), qty_str))
 
     return {
-        "order_id":      order_id,
-        "par":           par,
-        "lado":          "SHORT",
-        "cantidad":      cantidad,
-        "fill_price":    fill_price,        # ← PRECIO REAL DE EJECUCIÓN
-        "precio_entrada": precio_entrada,
-        "sl":            sl,
-        "tp":            tp,
-        "timestamp":     datetime.now().isoformat()
+        "order_id": order_id, "par": par, "lado": "SHORT",
+        "cantidad": cantidad, "precio_entrada": precio_entrada,
+        "sl": sl, "tp": tp, "timestamp": datetime.now().isoformat()
     }
 
 
@@ -604,19 +546,9 @@ def cerrar_posicion(par: str, cantidad: float, lado: str = "LONG") -> dict:
         return {}
 
     cancelar_ordenes_abiertas(par)
-
-    # FIX: obtener precio real de cierre del fill
-    order_id = str(resp.get("data", {}).get("orderId", ""))
-    fill_price = float((resp.get("data") or {}).get("avgPrice", 0) or 0)
-    if fill_price <= 0:
-        time.sleep(0.35)
-        fill_price = _get_fill_price(order_id, par)
-    if fill_price <= 0:
-        fill_price = get_precio(par)
-
     return {
-        "order_id":      order_id,
-        "precio_salida": fill_price    # ← PRECIO REAL DE CIERRE
+        "order_id":      str(resp.get("data", {}).get("orderId", "")),
+        "precio_salida": get_precio(par)
     }
 
 
