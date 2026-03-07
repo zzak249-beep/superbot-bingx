@@ -589,7 +589,7 @@ def main():
         f"🗜 BB Squeeze detector\n"
         f"🔶 Partial TP (50%@TP1 + SL→BE)\n"
         f"⏱ Time exit: `{getattr(config,'TIME_EXIT_HORAS',8)}h`\n"
-        f"📐 Lev:`{config.LEVERAGE}x` | Margen:`{config.RIESGO_MARGEN_PCT*100:.0f}%`\n"
+        f"📐 Lev:`{config.LEVERAGE}x` | Margen:`{getattr(config, 'RIESGO_MARGEN_PCT', 0.08)*100:.0f}%`\n"
         f"{'🔇 *DEMO*' if config.MODO_DEMO else '🟢 *LIVE — DINERO REAL*'}"
     )
 
