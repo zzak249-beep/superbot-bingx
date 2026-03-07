@@ -22,7 +22,7 @@ logging.basicConfig(
     force=True,
 )
 log = logging.getLogger("main")
-log.info("=== ARRANQUE BOT BINGX RSI+BB v5.0 ===")
+log.info("=== ARRANQUE BOT BINGX RSI+BB v6.0 AGRESIVO ===")
 
 try:
     import config
@@ -50,14 +50,18 @@ log.info(f"SCORE_MIN={config.SCORE_MIN} | LEVERAGE={config.LEVERAGE}x | MODO_DEM
 
 class Estado:
     def __init__(self):
-        self.posiciones      = {}
-        self.operaciones_hoy = []
-        self.pnl_hoy         = 0.0
-        self.perdidas_cons   = 0
-        self.cb_activo       = False
-        self.dia_actual      = str(date.today())
-        self.wins            = 0
-        self.losses          = 0
+        self.posiciones          = {}
+        self.operaciones_hoy     = []
+        self.pnl_hoy             = 0.0
+        self.perdidas_cons       = 0
+        self.cb_activo           = False
+        self.dia_actual          = str(date.today())
+        self.wins                = 0
+        self.losses              = 0
+        # Trailing stop: precio máximo/mínimo alcanzado por posición
+        self.trailing_max        = {}   # par -> mejor precio registrado
+        # Cierre parcial: flag para no cerrar parcial dos veces
+        self.cierre_parcial_hecho = {}  # par -> bool
 
     def reset_diario(self):
         hoy = str(date.today())
@@ -150,6 +154,42 @@ def _notif_cierre(par, lado, entrada, salida, pnl, razon=""):
 # Detecta posiciones cerradas por SL/TP automático de BingX
 # ═══════════════════════════════════════════════════════
 
+def _get_precio_cierre_real(par: str, ts_apertura: str) -> float:
+    """
+    Consulta el historial de órdenes de BingX para obtener el precio
+    real de cierre de una posición cerrada por SL/TP automático.
+    Retorna 0.0 si no puede determinarlo.
+    """
+    try:
+        par_bingx = par.replace("-", "")
+        resp = exchange._get("/openApi/swap/v2/trade/allOrders", {
+            "symbol": par_bingx,
+            "limit":  10,
+        })
+        ordenes = resp.get("data", {})
+        if isinstance(ordenes, dict):
+            ordenes = ordenes.get("orders", [])
+        if not isinstance(ordenes, list):
+            return 0.0
+
+        # Buscar la última orden FILLED de cierre (STOP_MARKET o TAKE_PROFIT_MARKET)
+        for o in ordenes:
+            tipo     = o.get("type", "")
+            estado_o = o.get("status", "")
+            precio   = o.get("avgPrice", o.get("price", 0))
+            if estado_o == "FILLED" and tipo in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+                try:
+                    p = float(precio)
+                    if p > 0:
+                        log.info(f"[SYNC] {par} precio real cierre: {p} ({tipo})")
+                        return p
+                except Exception:
+                    pass
+    except Exception as e:
+        log.debug(f"[SYNC] No se pudo obtener precio real de cierre para {par}: {e}")
+    return 0.0
+
+
 def sincronizar_posiciones():
     if not estado.posiciones or config.MODO_DEMO:
         return
@@ -177,23 +217,35 @@ def sincronizar_posiciones():
             qty     = pos["qty"]
             sl      = pos["sl"]
             tp      = pos["tp"]
+
+            # Intentar obtener precio real de cierre desde BingX
+            salida_real   = _get_precio_cierre_real(par, pos.get("ts", ""))
             precio_actual = exchange.get_precio(par)
 
-            # Estimar si fue SL o TP según precio actual
-            if lado == "LONG":
-                if precio_actual >= tp * 0.98:
-                    salida, razon = tp, "TP"
-                    pnl = qty * (tp - entrada)
+            if salida_real > 0:
+                salida = salida_real
+                if lado == "LONG":
+                    pnl   = qty * (salida - entrada)
+                    razon = "TP" if salida >= tp * 0.98 else "SL"
                 else:
-                    salida, razon = sl, "SL"
-                    pnl = qty * (sl - entrada)
+                    pnl   = qty * (entrada - salida)
+                    razon = "TP" if salida <= tp * 1.02 else "SL"
             else:
-                if precio_actual <= tp * 1.02:
-                    salida, razon = tp, "TP"
-                    pnl = qty * (entrada - tp)
+                # Fallback: estimar por precio actual (menos preciso)
+                if lado == "LONG":
+                    if precio_actual >= tp * 0.98:
+                        salida, razon = tp, "TP"
+                        pnl = qty * (tp - entrada)
+                    else:
+                        salida, razon = sl, "SL"
+                        pnl = qty * (sl - entrada)
                 else:
-                    salida, razon = sl, "SL"
-                    pnl = qty * (entrada - sl)
+                    if precio_actual <= tp * 1.02:
+                        salida, razon = tp, "TP"
+                        pnl = qty * (entrada - tp)
+                    else:
+                        salida, razon = sl, "SL"
+                        pnl = qty * (entrada - sl)
 
             estado.registrar_cierre(pnl)
             memoria.registrar_resultado(par, pnl, lado)
@@ -278,7 +330,70 @@ def gestionar_posiciones(balance):
             sl      = pos["sl"]
             tp      = pos["tp"]
             qty     = pos["qty"]
+            atr     = pos.get("atr", 0)
 
+            # ── CIERRE PARCIAL ──────────────────────────────────────
+            if (getattr(config, "CIERRE_PARCIAL_ACTIVO", False)
+                    and not estado.cierre_parcial_hecho.get(par, False)
+                    and atr > 0):
+                umbral_pct = getattr(config, "CIERRE_PARCIAL_PCT_TP", 0.70)
+                if lado == "LONG":
+                    umbral = entrada + (tp - entrada) * umbral_pct
+                    en_umbral = precio >= umbral
+                else:
+                    umbral = entrada - (entrada - tp) * umbral_pct
+                    en_umbral = precio <= umbral
+
+                if en_umbral:
+                    qty_parcial = qty * getattr(config, "CIERRE_PARCIAL_QTY_PCT", 0.50)
+                    res_p = exchange.cerrar_posicion(par, qty_parcial, lado)
+                    if res_p:
+                        salida_p = res_p.get("precio_salida", precio) or precio
+                        pnl_p    = qty_parcial * (salida_p - entrada if lado == "LONG" else entrada - salida_p)
+                        estado.cierre_parcial_hecho[par] = True
+                        # Reducir qty restante en la posición
+                        estado.posiciones[par]["qty"] = qty - qty_parcial
+                        log.info(f"[PARCIAL] {lado} {par} 50% cerrado @ {salida_p:.6f} PnL={pnl_p:+.4f}")
+                        _notif(
+                            f"📊 *CIERRE PARCIAL 50%* — `{par}`\n"
+                            f"Precio: `{salida_p:.6f}` (70% del TP)\n"
+                            f"PnL parcial: `${pnl_p:+.2f}`\n"
+                            f"_Resto sigue con trailing stop_"
+                        )
+                        qty = estado.posiciones[par]["qty"]
+
+            # ── TRAILING STOP ────────────────────────────────────────
+            trailing_activo = getattr(config, "TRAILING_STOP_ACTIVO", False)
+            if trailing_activo and atr > 0:
+                activar_pct = getattr(config, "TRAILING_STOP_ACTIVAR_PCT", 0.60)
+                dist_atr    = getattr(config, "TRAILING_STOP_DISTANCIA_ATR", 0.8)
+
+                if lado == "LONG":
+                    umbral_activar = entrada + (tp - entrada) * activar_pct
+                    if precio >= umbral_activar:
+                        mejor = estado.trailing_max.get(par, precio)
+                        if precio > mejor:
+                            estado.trailing_max[par] = precio
+                            mejor = precio
+                        nuevo_sl = mejor - atr * dist_atr
+                        if nuevo_sl > sl:
+                            estado.posiciones[par]["sl"] = nuevo_sl
+                            sl = nuevo_sl
+                            log.debug(f"[TRAIL] {par} LONG nuevo SL={sl:.6f}")
+                else:
+                    umbral_activar = entrada - (entrada - tp) * activar_pct
+                    if precio <= umbral_activar:
+                        mejor = estado.trailing_max.get(par, precio)
+                        if precio < mejor:
+                            estado.trailing_max[par] = precio
+                            mejor = precio
+                        nuevo_sl = mejor + atr * dist_atr
+                        if nuevo_sl < sl:
+                            estado.posiciones[par]["sl"] = nuevo_sl
+                            sl = nuevo_sl
+                            log.debug(f"[TRAIL] {par} SHORT nuevo SL={sl:.6f}")
+
+            # ── SL / TP ───────────────────────────────────────────────
             if lado == "LONG":
                 sl_hit = precio <= sl
                 tp_hit = precio >= tp
@@ -300,6 +415,8 @@ def gestionar_posiciones(balance):
 
                 estado.registrar_cierre(pnl)
                 memoria.registrar_resultado(par, pnl, lado)
+                estado.trailing_max.pop(par, None)
+                estado.cierre_parcial_hecho.pop(par, None)
                 del estado.posiciones[par]
 
                 log.info(f"CIERRE {lado} {par} @ {salida_real:.6f} PnL={pnl:+.4f} ({razon})")
@@ -365,7 +482,8 @@ def ejecutar_senal(r, balance):
 
     estado.posiciones[par] = {
         "lado": lado, "entrada": precio, "qty": qty,
-        "sl": sl, "tp": tp, "ts": datetime.now(timezone.utc).isoformat(),
+        "sl": sl, "tp": tp, "atr": r.get("atr", 0),
+        "ts": datetime.now(timezone.utc).isoformat(),
     }
     log.info(f"✅ {lado} {par} qty:{qty} e:{precio:.6f} SL:{sl:.6f} TP:{tp:.6f} score:{r['score']}")
     return True
@@ -382,7 +500,7 @@ def enviar_reporte(balance):
         pnl_est  = pos["qty"] * (
             (p_actual - pos["entrada"]) if pos["lado"] == "LONG"
             else (pos["entrada"] - p_actual)
-        )
+        ) * config.LEVERAGE
         ico = "🟢" if pos["lado"] == "LONG" else "🔴"
         pos_txt += f"  {ico} `{par}` e:`{pos['entrada']:.4f}` → `{p_actual:.4f}` est:${pnl_est:+.2f}\n"
 
