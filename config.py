@@ -1,6 +1,6 @@
 # ══════════════════════════════════════════════════════
-# config.py — BingX RSI+BB Bot v6.0
-# Perfil: $50-150 | Más pares | Menos pérdidas | CB 20%
+# config.py — BingX RSI+BB Bot v7.0
+# AJUSTADO: backtest real + investigación 2025
 # ══════════════════════════════════════════════════════
 import os
 
@@ -11,79 +11,126 @@ TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # ── MODO ─────────────────────────────────────────────
-MODO_DEMO       = False
-MODO_DEBUG      = False
-BALANCE_INICIAL = 100.0
+MODO_DEMO    = False
+MODO_DEBUG   = False
 
-# ── INDICADORES ──────────────────────────────────────
+# ── INDICADORES BASE ─────────────────────────────────
 RSI_PERIODO    = 14
-RSI_OVERSOLD   = 36    # LONG cuando RSI < 36 (era 35, +1 para más señales)
-RSI_OVERBOUGHT = 64    # SHORT cuando RSI > 64 (era 65, -1 para más señales)
+RSI_OVERSOLD   = 35
+RSI_OVERBOUGHT = 65
+BB_PERIODO     = 20
+BB_STD         = 2.0
+ATR_PERIODO    = 14
 
-BB_PERIODO = 20
-BB_STD     = 2.0
+# ── STOCHRSI (NUEVO v7) ───────────────────────────────
+# Confirma que el momentum RSI está en su punto más extremo
+# K < 20 = oversold extremo → confirma LONG (+12 score)
+# K > 80 = overbought extremo → confirma SHORT (+12 score)
+# Cruce K sobre D en zona extrema → +6 score adicional
+STOCHRSI_PERIODO  = 14
+STOCHRSI_K        = 3      # suavizado K
+STOCHRSI_OS       = 20     # oversold
+STOCHRSI_OB       = 80     # overbought
 
-ATR_PERIODO = 14
+# ── ADX ───────────────────────────────────────────────
+ADX_PERIODO = 14
+ADX_MAX     = 25
 
-# ── FILTRO DE SCORE ───────────────────────────────────
-# 72 = buen equilibrio entre cantidad y calidad de señales
-# (75 era demasiado restrictivo para balance pequeño)
-SCORE_MIN = 72
-
-# ── CALIDAD DE MERCADO ────────────────────────────────
-VOLUMEN_MIN_USD = 400_000   # era 500k — accede a más pares sin riesgo de illiquidez
-SPREAD_MAX_PCT  = 1.8       # era 1.5 — algo más permisivo
-
-# ── SL / TP ──────────────────────────────────────────
-# Clave para "menos pérdidas": SL ajustado + RR mínimo alto
-# SL 1.3×ATR → pérdida por trade contenida
-# TP 3.5×ATR → con RR 2.7 necesitamos ganar solo 1 de cada 3 para ser rentables
-SL_ATR_MULT = 1.3    # era 1.5 → SL más ajustado, menor pérdida por trade
-TP_ATR_MULT = 3.5    # era 3.0 → TP más ambicioso
-RR_MINIMO   = 2.2    # era 1.5 → solo entrar con R:R >= 2.2 (filtro fuerte)
-
-# ── RIESGO ────────────────────────────────────────────
-RIESGO_POR_TRADE = 0.025   # 2.5% del balance
-LEVERAGE         = 15       # igual que BingX usa en práctica
-MAX_POSICIONES   = 6        # era 3 → hasta 6 simultáneas (más diversificación)
-
-# ── MARGEN POR TRADE ──────────────────────────────────
-# Con balance $100 y 6 posiciones: $8 × 6 = $48 comprometido máximo (48%)
-# Con balance $50: máximo 3 posiciones abiertas de forma natural
-MARGEN_POR_TRADE = 8.0
-
-# ── CIRCUIT BREAKER ───────────────────────────────────
-CB_MAX_DAILY_LOSS_PCT   = 0.20   # 20% — tu tolerancia declarada
-CB_MAX_CONSECUTIVE_LOSS = 5      # pausar tras 5 pérdidas seguidas (era 4)
-
-# ── TRAILING STOP ─────────────────────────────────────
-# Activo: protege ganancias sin cortar el trade antes de tiempo
-TRAILING_STOP_ACTIVO        = True
-TRAILING_STOP_ACTIVAR_PCT   = 0.55  # Activa al 55% del camino hacia el TP
-TRAILING_STOP_DISTANCIA_ATR = 0.9   # SL sigue a 0.9×ATR del máximo
-
-# ── CIERRE PARCIAL ────────────────────────────────────
-# Asegura ganancia parcial: importante con balance pequeño
-CIERRE_PARCIAL_ACTIVO  = True
-CIERRE_PARCIAL_PCT_TP  = 0.65   # Cierra 50% al llegar al 65% del TP
-CIERRE_PARCIAL_QTY_PCT = 0.50   # Cierra este % de la posición
-
-# ── OPERACIÓN ─────────────────────────────────────────
-LOOP_SECONDS = 300   # escaneo cada 5 min (era 10)
+# ── EMA200 — DESACTIVADO (backtest confirma) ─────────
+# Sin EMA200: 811t +$14.19 PF:2.0 ✅
+# Con EMA200:  30t  -$2.20 PF:1.74 ❌ (96% bloqueadas)
+EMA200_ACTIVO = False
 
 # ── MULTI-TIMEFRAME ───────────────────────────────────
-# Confirmación en 15m: clave para reducir falsas señales
-MTF_CONFIRMACION_ACTIVO = True
-MTF_INTERVALO           = "15m"
+MTF_ACTIVO    = True
+MTF_INTERVALO = "15m"
 
-# ── VOLATILIDAD MÍNIMA ────────────────────────────────
-# No operar en mercados planos (reduce whipsaws)
-ATR_MIN_PCT_PRECIO = 0.003   # ATR >= 0.3% del precio
+# ── TRAILING STOP ────────────────────────────────────
+TRAILING_ACTIVO    = True
+TRAILING_ACTIVAR   = 1.5
+TRAILING_DISTANCIA = 1.0
 
-# ── FILTRO HORA ───────────────────────────────────────
-# Evitar las horas de menor liquidez cripto (UTC)
-# Las mejores horas son 8-12h y 14-22h UTC
-FILTRO_HORA_ACTIVO = True
-HORAS_PERMITIDAS   = list(range(7, 23))   # 7:00 a 22:59 UTC
+# ── PARTIAL TP (NUEVO v7) ─────────────────────────────
+# TP1 = 1.5×ATR → cerrar 50%, mover SL a breakeven
+# TP2 = 3.0×ATR → cerrar el 50% restante (con trailing)
+# Beneficio: más wins "garantizados" + ride completo en movimientos grandes
+PARTIAL_TP_ACTIVO   = True
+PARTIAL_TP1_MULT    = 1.5   # × ATR para TP1 (50%)
+PARTIAL_TP2_MULT    = 3.0   # × ATR para TP2 (50% restante)
 
-VERSION = "BingX-RSI+BB-v6.0"
+# ── TIME-BASED EXIT (NUEVO v7) ────────────────────────
+# Si posición lleva X horas sin resolver → cerrar
+# Libera capital para nuevas oportunidades
+# En 15m timeframe: si no rebota en 8h = señal falló
+TIME_EXIT_HORAS = 8
+
+# ── CONFIRMACIÓN DE VOLUMEN ──────────────────────────
+VOLUMEN_VELA_MULT = 1.2
+
+# ── SCORE ─────────────────────────────────────────────
+# v7 tiene scoring más granular con StochRSI+Divergencia
+# Score máximo teórico ~115 pero limitado a 100
+# Score 80 = señal de calidad alta en el nuevo sistema
+SCORE_MIN = 80
+
+# ── CALIDAD DE MERCADO ────────────────────────────────
+VOLUMEN_MIN_USD = 500_000
+SPREAD_MAX_PCT  = 1.5
+
+# ── SL / TP ──────────────────────────────────────────
+SL_ATR_MULT  = 1.5
+TP_ATR_MULT  = 3.0   # TP2 (TP final)
+RR_MINIMO    = 1.5
+
+# ── RIESGO ────────────────────────────────────────────
+LEVERAGE          = 7
+RIESGO_MARGEN_PCT = 0.08    # 8% por trade
+MAX_POSICIONES    = 3       # 3 × 8% = 24% capital en margen
+
+# ── CIRCUIT BREAKER ───────────────────────────────────
+CB_MAX_DAILY_LOSS_PCT   = 0.06
+CB_MAX_CONSECUTIVE_LOSS = 3
+
+# ── FILTRO DE SESIÓN ─────────────────────────────────
+SESION_ACTIVO      = True
+SESION_HORAS_MALAS = [2, 3, 4, 5]
+
+# ── PARES BLOQUEADOS — backtest WR < 30% ─────────────
+PARES_BLOQUEADOS = [
+    "BTC-USDT",    # WR 20.8% PnL -$6.10
+    "ETH-USDT",    # WR 23.1% PnL -$5.49
+    "DOGE-USDT",   # WR 22.2% PnL -$6.12
+    "ADA-USDT",    # WR 24.1% PnL -$6.48
+    "HYPE-USDT",   # WR 20.8% PnL -$9.35
+    "WIF-USDT",    # WR 25.0% PnL -$8.13
+    "BNB-USDT",    # WR 29.6% PnL -$3.66
+    "XRP-USDT",    # WR 27.6% PnL -$2.06
+    "RUNE-USDT",   # WR 31.2% PnL -$4.51
+    "SEI-USDT",    # WR 29.0% PnL -$3.65
+    "JUP-USDT",    # WR 29.6% PnL -$4.15
+    "SUI-USDT",    # WR 32.0% PnL -$1.71
+    "ATOM-USDT",   # WR 27.8% PnL -$2.11
+]
+
+# ── PARES PRIORITARIOS — backtest WR > 36% ───────────
+PARES_PRIORITARIOS = [
+    "BERA-USDT",   # WR 51.7% PnL +$15.32 ⭐
+    "PI-USDT",     # WR 56.2% PnL  +$8.56 ⭐
+    "OP-USDT",     # WR 46.2% PnL  +$7.97 ⭐
+    "NEAR-USDT",   # WR 44.0% PnL  +$7.86 ⭐
+    "ARB-USDT",    # WR 39.4% PnL  +$7.84 ⭐
+    "GRASS-USDT",  # WR 39.1% PnL  +$9.62 ⭐
+    "KAITO-USDT",  # WR 39.1% PnL  +$5.14 ⭐
+    "MYX-USDT",    # WR 37.5% PnL  +$5.87 ⭐
+    "LINK-USDT",   # WR 44.8% PnL  +$5.38 ⭐
+    "ONDO-USDT",   # WR 38.5% PnL  +$2.62
+    "POPCAT-USDT", # WR 37.0% PnL  +$2.36
+    "INJ-USDT",    # WR 37.0% PnL  +$0.46
+    "AVAX-USDT",   # WR 36.7% PnL  +$1.01
+    "LTC-USDT",    # WR 43.5% PnL  +$1.80
+]
+
+# ── OPERACIÓN ─────────────────────────────────────────
+LOOP_SECONDS = 600
+
+VERSION = "BingX-RSI+BB-v7.0"
