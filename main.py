@@ -49,37 +49,22 @@ class Estado:
     def __init__(self):
         self.posiciones    = {}
         self.pnl_hoy       = 0.0
-        self.perdidas_cons = 0
-        self.cb_activo     = False
         self.dia_actual    = str(date.today())
         self.wins = self.losses = 0
 
     def reset_diario(self):
         hoy = str(date.today())
         if hoy != self.dia_actual:
-            self.dia_actual    = hoy
-            self.pnl_hoy       = 0.0
-            self.perdidas_cons = 0
-            self.cb_activo     = False
+            self.dia_actual = hoy
+            self.pnl_hoy    = 0.0
             log.info(f"Reset diario — {hoy}")
-
-    def check_circuit_breaker(self, balance):
-        if self.cb_activo:
-            return True
-        if self.pnl_hoy <= -(balance * config.CB_MAX_DAILY_LOSS_PCT):
-            log.warning(f"CB: pérdida diaria ${self.pnl_hoy:.2f}")
-            self.cb_activo = True; return True
-        if self.perdidas_cons >= config.CB_MAX_CONSECUTIVE_LOSS:
-            log.warning(f"CB: {self.perdidas_cons} pérdidas seguidas")
-            self.cb_activo = True; return True
-        return False
 
     def registrar_cierre(self, pnl):
         self.pnl_hoy += pnl
         if pnl > 0:
-            self.wins += 1; self.perdidas_cons = 0
+            self.wins += 1
         else:
-            self.losses += 1; self.perdidas_cons += 1
+            self.losses += 1
 
 estado = Estado()
 
@@ -377,9 +362,8 @@ def ejecutar_senal(r, balance):
         log.info(f"[MEMORIA] {par} bloqueado"); return False
     if len(estado.posiciones) >= config.MAX_POSICIONES:
         return False
-    margen_min = getattr(config, "MARGEN_MIN", 5.0)
-    if balance < margen_min and not config.MODO_DEMO:
-        log.warning(f"Balance insuficiente: ${balance:.2f} < ${margen_min:.2f}"); return False
+    if balance < 8.0 and not config.MODO_DEMO:
+        log.warning(f"Balance insuficiente: ${balance:.2f}"); return False
 
     qty = exchange.calcular_cantidad(par, balance, precio)
     if qty <= 0:
@@ -485,7 +469,7 @@ def enviar_reporte(balance):
         f"🔶 Partial TP | ⏱ Time exit `{getattr(config,'TIME_EXIT_HORAS',8)}h`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📋 Posiciones:\n{pos_txt}"
-        f"{'⚠️ *CIRCUIT BREAKER ACTIVO*' if estado.cb_activo else ''}"
+        f""
     )
 
 
@@ -509,15 +493,12 @@ def main():
         log.error("Balance = 0")
         _notif("🚨 *Balance = $0.00*\nVerifica `BINGX_API_KEY` y `BINGX_SECRET_KEY` en Railway.")
 
-    try:
-        from config_pares import PARES as CP_PARES
-        pares_raw = CP_PARES
-    except ImportError:
-        pares_raw = PARES_FIJOS or [
-            "BERA-USDT","PI-USDT","OP-USDT","NEAR-USDT","ARB-USDT",
-            "LINK-USDT","GRASS-USDT","MYX-USDT","KAITO-USDT","ONDO-USDT",
-            "LTC-USDT","POPCAT-USDT","AVAX-USDT","INJ-USDT",
-        ]
+    pares_raw = PARES_FIJOS or [
+        "BERA-USDT","PI-USDT","OP-USDT","NEAR-USDT","ARB-USDT",
+        "LINK-USDT","GRASS-USDT","MYX-USDT","KAITO-USDT","ONDO-USDT",
+        "LTC-USDT","POPCAT-USDT","AVAX-USDT","INJ-USDT",
+        "DOT-USDT","SUI-USDT","TIA-USDT","RUNE-USDT",
+    ]
     pares = preparar_pares(pares_raw)
     prior = getattr(config, "PARES_PRIORITARIOS", [])
     bloq  = getattr(config, "PARES_BLOQUEADOS",   [])
@@ -555,18 +536,12 @@ def main():
             # 1. Sincronizar con BingX
             sincronizar_posiciones()
 
-            # 2. Circuit breaker
-            if estado.check_circuit_breaker(balance):
-                _notif(f"🚨 *Circuit Breaker*\nPnL hoy:`${estado.pnl_hoy:+.2f}`\nPausado hasta mañana.")
-                time.sleep(3600)
-                continue
-
-            # 3. Gestionar posiciones abiertas
+            # 2. Gestionar posiciones abiertas
             if estado.posiciones:
                 gestionar_posiciones(balance)
                 balance = exchange.get_balance()
 
-            # 4. Buscar señales nuevas
+            # 3. Buscar señales nuevas
             if len(estado.posiciones) < config.MAX_POSICIONES:
                 log.info(f"Escaneando {len(pares)} pares (score≥{config.SCORE_MIN})...")
                 senales = analizar.analizar_todos(pares)
@@ -595,7 +570,7 @@ def main():
                         balance = exchange.get_balance()
                         time.sleep(2)
 
-            # 5. Reporte horario
+            # 4. Reporte horario
             if time.time() - last_reporte >= 3600:
                 enviar_reporte(balance)
                 _notif(memoria.resumen())
