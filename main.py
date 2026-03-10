@@ -353,9 +353,18 @@ def gestionar_posiciones(balance):
 # ═══════════════════════════════════════════════════════
 
 def ejecutar_senal(r, balance):
-    par   = r["par"]
-    lado  = r["lado"]
-    precio = r["precio"]
+    par    = r.get("par")
+    lado   = r.get("lado")
+    precio = r.get("precio", 0)
+
+    if not par or not lado:
+        log.warning(f"Señal incompleta (sin par/lado): {r}")
+        return False
+    if precio <= 0:
+        precio = exchange.get_precio(par)
+    if precio <= 0:
+        log.warning(f"[{par}] precio no disponible — señal descartada")
+        return False
 
     if par in estado.posiciones:              return False
     if memoria.esta_bloqueado(par):
@@ -549,10 +558,14 @@ def main():
                 if senales:
                     log.info(f"✓ {len(senales)} señal(es):")
                     for s in senales:
-                        star = "⭐" if s["par"] in prior else " "
-                        rr   = s.get("rr", 0)  # ✅ FIX: usar .get() para evitar KeyError
-                        log.info(f"  {star}{s['lado']:5s} {s['par']:20s} "
-                                 f"score={s['score']} RSI={s['rsi']:.1f} R:R={rr:.2f}")
+                        star  = "⭐" if s.get("par", "") in prior else " "
+                        rr    = s.get("rr",    0)
+                        rsi   = s.get("rsi",   0)
+                        score = s.get("score", 0)
+                        lado_ = s.get("lado",  "?")
+                        par_  = s.get("par",   "?")
+                        log.info(f"  {star}{lado_:5s} {par_:20s} "
+                                 f"score={score} RSI={rsi:.1f} R:R={rr:.2f}")
                 else:
                     log.info("Sin señales este ciclo")
 
