@@ -117,7 +117,7 @@ def _notif_senal(r, balance, ejecutado):
         f"{tp1_txt}"
         f"✅ TP2     : `{r['tp']:.6f}`\n"
         f"🛑 SL      : `{r['sl']:.6f}`\n"
-        f"📊 R:R     : `{r['rr']:.2f}x`\n"
+        f"📊 R:R     : `{r.get('rr', 0):.2f}x`\n"
         f"🏅 Score   : `{r['score']}/100`\n"
         f"📉 RSI     : `{r['rsi']:.1f}`\n"
         f"💰 Balance : `${balance:.2f} USDT`\n"
@@ -550,8 +550,9 @@ def main():
                     log.info(f"✓ {len(senales)} señal(es):")
                     for s in senales:
                         star = "⭐" if s["par"] in prior else " "
+                        rr   = s.get("rr", 0)  # ✅ FIX: usar .get() para evitar KeyError
                         log.info(f"  {star}{s['lado']:5s} {s['par']:20s} "
-                                 f"score={s['score']} RSI={s['rsi']:.1f} R:R={s['rr']:.2f}")
+                                 f"score={s['score']} RSI={s['rsi']:.1f} R:R={rr:.2f}")
                 else:
                     log.info("Sin señales este ciclo")
 
