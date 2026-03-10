@@ -104,22 +104,29 @@ def _notif(msg):
 
 
 def _notif_senal(r, balance, ejecutado):
-    lado  = "🟢 LONG" if r["lado"] == "LONG" else "🔴 SHORT"
+    lado  = "🟢 LONG" if r.get("lado") == "LONG" else "🔴 SHORT"
     ex    = "✅ *Ejecutado*" if ejecutado else "⚠️ *No ejecutado*"
     prior = getattr(config, "PARES_PRIORITARIOS", [])
-    star  = "⭐ " if r["par"] in prior else ""
+    star  = "⭐ " if r.get("par") in prior else ""
     tp1   = r.get("tp1", 0)
     tp1_txt = f"🔶 TP1     : `{tp1:.6f}` (50%)\n" if tp1 > 0 else ""
+    precio = r.get("precio", 0)
+    tp     = r.get("tp", 0)
+    sl     = r.get("sl", 0)
+    rr     = r.get("rr", 0)
+    score  = r.get("score", 0)
+    rsi    = r.get("rsi", 0)
+    par    = r.get("par", "?")
     _notif(
-        f"{lado} — {star}`{r['par']}`\n"
+        f"{lado} — {star}`{par}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 Entrada : `{r['precio']:.6f}`\n"
+        f"🎯 Entrada : `{precio:.6f}`\n"
         f"{tp1_txt}"
-        f"✅ TP2     : `{r['tp']:.6f}`\n"
-        f"🛑 SL      : `{r['sl']:.6f}`\n"
-        f"📊 R:R     : `{r.get('rr', 0):.2f}x`\n"
-        f"🏅 Score   : `{r['score']}/100`\n"
-        f"📉 RSI     : `{r['rsi']:.1f}`\n"
+        f"✅ TP2     : `{tp:.6f}`\n"
+        f"🛑 SL      : `{sl:.6f}`\n"
+        f"📊 R:R     : `{rr:.2f}x`\n"
+        f"🏅 Score   : `{score}/100`\n"
+        f"📉 RSI     : `{rsi:.1f}`\n"
         f"💰 Balance : `${balance:.2f} USDT`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{ex}"
