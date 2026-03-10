@@ -30,7 +30,7 @@ PARTIAL_TP_PCT = 0.30 # Cerramos solo el 30% en TP1. El 70% corre al TP final.
 MAX_POSICIONES = 3    # No te sobreapalancques
 LEVERAGE       = 5    # 7x era arriesgado, 5x es más seguro para 15m
 MARGEN_USDT    = 10.0 # Cantidad por trade
-SCORE_MIN      = 80
+SCORE_MIN      = 72
 
 # ── TIEMPOS ──────────────────────────────────────────
 LOOP_SECONDS = 60
