@@ -1,13 +1,10 @@
 """
-main.py — BingX RSI+BB Bot v5.1 (Opción A — estable)
-Mejoras sobre v5.0 confirmadas por backtest:
-  - Partial TP: 50% en TP1 + SL a breakeven
-  - Trailing stop activo tras TP1
-  - Time-based exit: >8h sin resolver → cerrar
-  - Pares filtrados por backtest (PRIORITARIOS / BLOQUEADOS)
-  - PnL correcto (sin doble leverage)
-  - Sincronización con BingX
-  - Fill price real
+main.py — BingX RSI+BB Bot v5.2
+Correcciones sobre v5.1:
+  - FIX CRÍTICO: cargar_posiciones_desde_bingx() al arranque
+    → evita abrir LONG/SHORT sobre posición ya abierta tras reinicio
+  - FIX: precio en notificación nunca muestra 0.000000
+  - FIX: R:R correcto (dependía del precio 0)
 """
 
 import sys, os, time, traceback
@@ -20,7 +17,7 @@ logging.basicConfig(
     stream=sys.stdout, force=True,
 )
 log = logging.getLogger("main")
-log.info("=== ARRANQUE BOT v5.1 ===")
+log.info("=== ARRANQUE BOT v5.2 ===")
 
 try:
     import config, exchange, analizar, notifier, memoria
@@ -70,7 +67,7 @@ estado = Estado()
 
 
 # ═══════════════════════════════════════════════════════
-# PARES — prioridad + bloqueos del backtest
+# PARES
 # ═══════════════════════════════════════════════════════
 
 def preparar_pares(pares_raw):
@@ -82,6 +79,94 @@ def preparar_pares(pares_raw):
     log.info(f"Pares: {len(pares_raw)} brutos → {len(bloqueados)} bloqueados → "
              f"{len(top)} prioritarios + {len(resto)} resto = {len(top+resto)} activos")
     return top + resto
+
+
+# ═══════════════════════════════════════════════════════
+# ▶▶ FIX CRÍTICO: CARGAR POSICIONES AL ARRANQUE ◀◀
+# ═══════════════════════════════════════════════════════
+
+def cargar_posiciones_desde_bingx():
+    """
+    Lee las posiciones abiertas reales en BingX y las registra
+    en estado.posiciones para que el bot NO vuelva a entrar
+    en el mismo par tras un reinicio.
+    """
+    if config.MODO_DEMO:
+        log.info("[ARRANQUE] DEMO — no se cargan posiciones de BingX")
+        return
+
+    try:
+        pos_reales = exchange.get_posiciones_abiertas()
+        if not pos_reales:
+            log.info("[ARRANQUE] Sin posiciones abiertas en BingX")
+            return
+
+        cargadas = 0
+        for p in pos_reales:
+            symbol = p.get("symbol", "")
+            # Normalizar símbolo → formato "XXX-USDT"
+            par = symbol if "-" in symbol else symbol.replace("USDT", "-USDT")
+
+            # Evitar duplicados
+            if par in estado.posiciones:
+                continue
+
+            # Determinar lado desde BingX (positionSide o qty positivo/negativo)
+            pos_side = p.get("positionSide", "").upper()
+            amt      = float(p.get("positionAmt", p.get("qty", 0)) or 0)
+
+            if pos_side == "LONG" or amt > 0:
+                lado = "LONG"
+            elif pos_side == "SHORT" or amt < 0:
+                lado = "SHORT"
+            else:
+                log.warning(f"[ARRANQUE] {par} — no se pudo determinar lado, ignorado")
+                continue
+
+            entrada = float(p.get("entryPrice", p.get("entrada", 0)) or 0)
+            qty     = abs(amt)
+
+            if entrada <= 0 or qty <= 0:
+                log.warning(f"[ARRANQUE] {par} — entrada/qty inválido, ignorado")
+                continue
+
+            # Reconstruir SL/TP mínimos basados en ATR 0 (se actualizarán en el ciclo)
+            # Lo importante es bloquear la entrada en este par
+            estado.posiciones[par] = {
+                "lado":        lado,
+                "entrada":     entrada,
+                "qty":         qty,
+                "sl":          float(p.get("sl", 0) or 0),
+                "tp":          float(p.get("tp", 0) or 0),
+                "tp1":         0.0,
+                "atr":         0.0,
+                "sl_trailing": float(p.get("sl", 0) or 0),
+                "tp1_hit":     False,
+                "ts":          datetime.now(timezone.utc).isoformat(),
+                "recuperada":  True,   # marcar para saber que viene del arranque
+            }
+            cargadas += 1
+            log.info(f"[ARRANQUE] Posición recuperada: {lado} {par} "
+                     f"entrada={entrada} qty={qty}")
+
+        if cargadas:
+            log.warning(f"[ARRANQUE] ⚠️ {cargadas} posición(es) cargadas desde BingX "
+                        f"— el bot NO abrirá nuevas órdenes en esos pares")
+            _notif(
+                f"♻️ *Bot reiniciado — posiciones recuperadas*\n"
+                + "\n".join(
+                    f"  {'🟢' if v['lado']=='LONG' else '🔴'} `{k}` "
+                    f"{v['lado']} @ `{v['entrada']:.6f}`"
+                    for k, v in estado.posiciones.items()
+                    if v.get("recuperada")
+                )
+            )
+        else:
+            log.info("[ARRANQUE] Sin posiciones activas recuperadas")
+
+    except Exception as e:
+        log.error(f"[ARRANQUE] Error cargando posiciones: {e}")
+        log.error(traceback.format_exc())
 
 
 # ═══════════════════════════════════════════════════════
@@ -110,13 +195,27 @@ def _notif_senal(r, balance, ejecutado):
     star  = "⭐ " if r.get("par") in prior else ""
     tp1   = r.get("tp1", 0)
     tp1_txt = f"🔶 TP1     : `{tp1:.6f}` (50%)\n" if tp1 > 0 else ""
+
+    # ── FIX: precio nunca debe ser 0 en la notificación ──
     precio = r.get("precio", 0)
+    if precio <= 0:
+        precio = exchange.get_precio(r.get("par", ""))
+
     tp     = r.get("tp", 0)
     sl     = r.get("sl", 0)
-    rr     = r.get("rr", 0)
     score  = r.get("score", 0)
     rsi    = r.get("rsi", 0)
     par    = r.get("par", "?")
+
+    # ── FIX: R:R calculado aquí, no depende del campo r["rr"] ──
+    if precio > 0 and tp > 0 and sl > 0:
+        if r.get("lado") == "LONG":
+            rr = (tp - precio) / (precio - sl) if precio > sl else 0
+        else:
+            rr = (precio - tp) / (sl - precio) if sl > precio else 0
+    else:
+        rr = r.get("rr", 0)
+
     _notif(
         f"{lado} — {star}`{par}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -181,7 +280,7 @@ def gestionar_partial_tp(par, pos, precio):
     if not getattr(config, "PARTIAL_TP_ACTIVO", True):
         return
     if pos.get("tp1_hit"):
-        return   # Ya en fase 2
+        return
 
     tp1  = pos.get("tp1", 0)
     lado = pos["lado"]
@@ -206,7 +305,6 @@ def gestionar_partial_tp(par, pos, precio):
                           else (entrada - salida_real))
     estado.pnl_hoy += pnl_p
 
-    # SL a breakeven
     be = entrada * 1.0005 if lado == "LONG" else entrada * 0.9995
     pos["sl"]          = be
     pos["sl_trailing"] = be
@@ -309,7 +407,12 @@ def gestionar_posiciones(balance):
             lado = pos["lado"]
             qty  = pos["qty"]
 
-            # 1. Partial TP (fase 1)
+            # Posiciones recuperadas sin SL/TP → no gestionar hasta que se actualicen
+            if pos.get("recuperada") and pos.get("sl", 0) <= 0:
+                log.info(f"[RECUPERADA] {par} sin SL/TP — esperando datos del analizar")
+                continue
+
+            # 1. Partial TP
             gestionar_partial_tp(par, pos, precio)
 
             # 2. Time exit
@@ -324,7 +427,7 @@ def gestionar_posiciones(balance):
                 _notif_cierre(par, lado, pos["entrada"], salida_real, pnl, "TIME")
                 continue
 
-            # 3. Trailing stop
+            # 3. Trailing
             actualizar_trailing(par, pos, precio)
             sl_ef = pos.get("sl_trailing", pos["sl"])
             tp    = pos["tp"]
@@ -367,13 +470,22 @@ def ejecutar_senal(r, balance):
     if not par or not lado:
         log.warning(f"Señal incompleta (sin par/lado): {r}")
         return False
+
+    # ── FIX: precio real antes de todo ──
     if precio <= 0:
         precio = exchange.get_precio(par)
     if precio <= 0:
         log.warning(f"[{par}] precio no disponible — señal descartada")
         return False
+    r["precio"] = precio   # guardar precio real en la señal para la notificación
 
-    if par in estado.posiciones:              return False
+    # ── FIX CRÍTICO: verificar par en estado.posiciones (cargado desde BingX) ──
+    if par in estado.posiciones:
+        pos_existente = estado.posiciones[par]
+        log.warning(f"[BLOQUEO] {par} ya tiene posición {pos_existente['lado']} abierta "
+                    f"— señal {lado} descartada")
+        return False
+
     if memoria.esta_bloqueado(par):
         log.info(f"[MEMORIA] {par} bloqueado"); return False
     if len(estado.posiciones) >= config.MAX_POSICIONES:
@@ -395,14 +507,12 @@ def ejecutar_senal(r, balance):
         _notif(f"🚨 *Orden fallida {lado} `{par}`*\n❌ `{err}`")
         return False
 
-    # Precio real de ejecución (fill price)
     entrada_real = float(res.get("fill_price", 0) or 0)
     if entrada_real <= 0:
         entrada_real = exchange.get_precio(par)
     if entrada_real <= 0:
         entrada_real = precio
 
-    # Recalcular SL/TP desde precio real
     atr = r.get("atr", 0)
     if atr > 0:
         sl_r  = (entrada_real - atr * config.SL_ATR_MULT) if lado == "LONG" \
@@ -430,6 +540,7 @@ def ejecutar_senal(r, balance):
         "sl_trailing": sl_r,
         "tp1_hit":     False,
         "ts":          datetime.now(timezone.utc).isoformat(),
+        "recuperada":  False,
     }
 
     slip = abs(entrada_real - precio) / precio * 100 if precio > 0 else 0
@@ -456,6 +567,7 @@ def enviar_reporte(balance):
         fase   = "🔶→TP2" if pos.get("tp1_hit") else "▶️TP1"
         ico    = "🟢" if pos["lado"] == "LONG" else "🔴"
         star   = "⭐" if par in prior else ""
+        rec    = "♻️" if pos.get("recuperada") else ""
         ts_str = pos.get("ts", "")
         horas  = ""
         if ts_str:
@@ -466,7 +578,7 @@ def enviar_reporte(balance):
                 horas = f" {h:.1f}h"
             except Exception:
                 pass
-        pos_txt += (f"  {ico}{star} `{par}` e:`{pos['entrada']:.4f}` "
+        pos_txt += (f"  {ico}{star}{rec} `{par}` e:`{pos['entrada']:.4f}` "
                     f"est:${pnl_est:+.2f} {fase}{horas}\n")
 
     if not pos_txt:
@@ -485,7 +597,6 @@ def enviar_reporte(balance):
         f"🔶 Partial TP | ⏱ Time exit `{getattr(config,'TIME_EXIT_HORAS',8)}h`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📋 Posiciones:\n{pos_txt}"
-        f""
     )
 
 
@@ -508,6 +619,9 @@ def main():
     if balance <= 0 and not config.MODO_DEMO:
         log.error("Balance = 0")
         _notif("🚨 *Balance = $0.00*\nVerifica `BINGX_API_KEY` y `BINGX_SECRET_KEY` en Railway.")
+
+    # ══ FIX CRÍTICO: cargar posiciones existentes ANTES del primer ciclo ══
+    cargar_posiciones_desde_bingx()
 
     pares_raw = PARES_FIJOS or [
         "BERA-USDT","PI-USDT","OP-USDT","NEAR-USDT","ARB-USDT",
