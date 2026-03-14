@@ -219,7 +219,7 @@ def get_balance() -> float:
     endpoints = [
         "/openApi/swap/v2/user/balance",
         "/openApi/swap/v3/user/balance",
-        "/openApi/account/v1/balance",
+        # NOTA: /openApi/account/v1/balance NO existe en BingX — eliminado
     ]
 
     for ep in endpoints:
@@ -237,7 +237,7 @@ def get_available_margin() -> float:
     endpoints = [
         "/openApi/swap/v2/user/balance",
         "/openApi/swap/v3/user/balance",
-        "/openApi/account/v1/balance",
+        # NOTA: /openApi/account/v1/balance NO existe en BingX — eliminado
     ]
 
     for ep in endpoints:
@@ -612,7 +612,7 @@ def diagnostico_balance():
     endpoints = [
         "/openApi/swap/v2/user/balance",
         "/openApi/swap/v3/user/balance",
-        "/openApi/account/v1/balance",
+        # "/openApi/account/v1/balance",  ← NO existe en BingX
         "/openApi/swap/v2/user/margin",
     ]
     for ep in endpoints:
