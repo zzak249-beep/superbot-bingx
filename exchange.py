@@ -27,6 +27,7 @@ _blocked_pairs: set = set()
 _time_offset: int = 0
 _QTY_PRECISION: dict = {}
 _MIN_QTY: dict = {}
+_ONE_WAY_PAIRS: set = set()   # Pares que sólo aceptan modo one-way (sin positionSide)
 
 
 # ═══════════════════════════════════════════════════════
@@ -343,6 +344,26 @@ def _detectar_limite_notional(par: str, err_msg: str):
         registrar_max_notional(par, limite)
 
 
+def _detectar_one_way(par: str, code: int, err_msg: str) -> bool:
+    """
+    Detecta si el error 109400 indica que el par sólo acepta modo one-way.
+    Lo marca en _ONE_WAY_PAIRS para evitar reintentos innecesarios.
+    """
+    if code == 109400 and ("positionSide" in err_msg or "position side" in err_msg.lower()
+                           or "one-way" in err_msg.lower() or "invalid parameters" in err_msg.lower()):
+        if par not in _ONE_WAY_PAIRS:
+            _ONE_WAY_PAIRS.add(par)
+            log.info(f"[ONE-WAY] {par} marcado como one-way (sin positionSide)")
+        return True
+    # Para 109400 genérico también marcar como one-way para intentarlo
+    if code == 109400:
+        if par not in _ONE_WAY_PAIRS:
+            _ONE_WAY_PAIRS.add(par)
+            log.info(f"[ONE-WAY] {par} 109400 genérico — probando one-way")
+        return True
+    return False
+
+
 def _set_leverage(par: str, lado: str):
     try:
         res = _post("/openApi/swap/v2/trade/leverage", {
@@ -366,56 +387,86 @@ def abrir_long(par: str, qty: float, precio: float, sl: float, tp: float) -> Opt
         return {"fill_price": precio, "executedQty": qty}
     try:
         _set_leverage(par, "LONG")
-        params: dict = {
-            "symbol": par, "side": "BUY",
-            "positionSide": "LONG", "type": "MARKET", "quantity": qty,
-        }
-        if sl > 0:
-            params["stopLoss"] = {
-                "type": "STOP_MARKET", "stopPrice": round(sl, 8),
-                "price": round(sl, 8), "workingType": "MARK_PRICE",
-            }
-        if tp > 0:
-            params["takeProfit"] = {
-                "type": "TAKE_PROFIT_MARKET", "stopPrice": round(tp, 8),
-                "price": round(tp, 8), "workingType": "MARK_PRICE",
-            }
+        one_way = par in _ONE_WAY_PAIRS
 
-        data = _post("/openApi/swap/v2/trade/order", params)
-        sl_tp_incluidos = True
+        def _build_params(con_pos_side: bool, con_sl_tp: bool) -> dict:
+            p: dict = {"symbol": par, "side": "BUY", "type": "MARKET", "quantity": qty}
+            if con_pos_side:
+                p["positionSide"] = "LONG"
+            if con_sl_tp:
+                if sl > 0:
+                    p["stopLoss"] = {
+                        "type": "STOP_MARKET", "stopPrice": round(sl, 8),
+                        "price": round(sl, 8), "workingType": "MARK_PRICE",
+                    }
+                if tp > 0:
+                    p["takeProfit"] = {
+                        "type": "TAKE_PROFIT_MARKET", "stopPrice": round(tp, 8),
+                        "price": round(tp, 8), "workingType": "MARK_PRICE",
+                    }
+            return p
 
-        if data.get("code", -1) != 0:
-            err = data.get("msg", str(data))
-            log.warning(f"abrir_long {par}: {err}")
-            _detectar_limite_notional(par, err)
-            # Retry SIN SL/TP — pero marcamos que hay que colocarlos después
-            params.pop("stopLoss", None)
-            params.pop("takeProfit", None)
-            sl_tp_incluidos = False
-            data = _post("/openApi/swap/v2/trade/order", params)
-            if data.get("code", -1) != 0:
-                err2 = data.get("msg", str(data))
-                _detectar_limite_notional(par, err2)
-                log.error(f"[API-ERR] {par}: {err2}")
-                return {"error": err2}
+        # ── Intento 1: hedge (positionSide) con SL/TP ─────────────────────
+        if not one_way:
+            data = _post("/openApi/swap/v2/trade/order", _build_params(True, True))
+            if data.get("code", -1) == 0:
+                sl_tp_incluidos = True
+            else:
+                err = data.get("msg", str(data))
+                code = data.get("code", -1)
+                log.warning(f"abrir_long hedge+sl {par} [{code}]: {err}")
+                _detectar_limite_notional(par, err)
+
+                if _detectar_one_way(par, code, err):
+                    one_way = True
+                    # Caer al bloque one-way
+                else:
+                    # ── Intento 2: hedge sin SL/TP ──────────────────────
+                    data = _post("/openApi/swap/v2/trade/order", _build_params(True, False))
+                    if data.get("code", -1) == 0:
+                        sl_tp_incluidos = False
+                    else:
+                        err2 = data.get("msg", str(data))
+                        code2 = data.get("code", -1)
+                        _detectar_limite_notional(par, err2)
+                        _detectar_one_way(par, code2, err2)
+                        log.error(f"[API-ERR] {par}: {err2}")
+                        return {"error": err2}
+
+        # ── Intento one-way (sin positionSide) ───────────────────────────
+        if one_way:
+            data = _post("/openApi/swap/v2/trade/order", _build_params(False, True))
+            if data.get("code", -1) == 0:
+                sl_tp_incluidos = True
+            else:
+                err = data.get("msg", str(data))
+                log.warning(f"abrir_long one-way+sl {par}: {err}")
+                _detectar_limite_notional(par, err)
+                # Último intento: one-way sin SL/TP
+                data = _post("/openApi/swap/v2/trade/order", _build_params(False, False))
+                if data.get("code", -1) == 0:
+                    sl_tp_incluidos = False
+                else:
+                    err2 = data.get("msg", str(data))
+                    _detectar_limite_notional(par, err2)
+                    log.error(f"[API-ERR] {par}: {err2}")
+                    return {"error": err2}
 
         order = data.get("data", {}).get("order", {})
         fill  = float(order.get("avgPrice", 0) or order.get("price", 0) or precio)
         qty_r = float(order.get("executedQty", qty) or qty)
-        log.info(f"✅ LONG {par} fill={fill:.6f} qty={qty_r}")
+        log.info(f"✅ LONG {par} fill={fill:.6f} qty={qty_r} {'[one-way]' if one_way else '[hedge]'}")
 
-        # FIX CRÍTICO: Si SL/TP no se incluyeron en la orden, colocarlos ahora
         if not sl_tp_incluidos:
             log.warning(f"[SL-FIX] {par} LONG — colocando SL/TP separados (fill={fill:.6f})")
-            time.sleep(1)  # Esperar a que la posición se registre en BingX
-            _colocar_sl_tp_separados(par, sl, tp, "LONG", qty_r or qty)
+            time.sleep(1)
+            _colocar_sl_tp_separados(par, sl, tp, "LONG", qty_r or qty, one_way=one_way)
 
-        # FIX CRÍTICO: Verificar que SL está presente en BingX
         time.sleep(2)
         tiene_sl, tiene_tp = verificar_sl_tp_presentes(par)
         if not tiene_sl and sl > 0:
             log.warning(f"[SL-CHECK] {par} LONG — SL ausente en BingX, reintentando...")
-            _colocar_sl_tp_separados(par, sl, tp, "LONG", qty_r or qty)
+            _colocar_sl_tp_separados(par, sl, tp, "LONG", qty_r or qty, one_way=one_way)
         elif tiene_sl:
             log.info(f"[SL-CHECK] {par} ✅ SL confirmado en BingX")
 
@@ -435,52 +486,81 @@ def abrir_short(par: str, qty: float, precio: float, sl: float, tp: float) -> Op
         return {"fill_price": precio, "executedQty": qty}
     try:
         _set_leverage(par, "SHORT")
-        params: dict = {
-            "symbol": par, "side": "SELL",
-            "positionSide": "SHORT", "type": "MARKET", "quantity": qty,
-        }
-        if sl > 0:
-            params["stopLoss"] = {
-                "type": "STOP_MARKET", "stopPrice": round(sl, 8),
-                "price": round(sl, 8), "workingType": "MARK_PRICE",
-            }
-        if tp > 0:
-            params["takeProfit"] = {
-                "type": "TAKE_PROFIT_MARKET", "stopPrice": round(tp, 8),
-                "price": round(tp, 8), "workingType": "MARK_PRICE",
-            }
+        one_way = par in _ONE_WAY_PAIRS
 
-        data = _post("/openApi/swap/v2/trade/order", params)
-        sl_tp_incluidos = True
+        def _build_params(con_pos_side: bool, con_sl_tp: bool) -> dict:
+            p: dict = {"symbol": par, "side": "SELL", "type": "MARKET", "quantity": qty}
+            if con_pos_side:
+                p["positionSide"] = "SHORT"
+            if con_sl_tp:
+                if sl > 0:
+                    p["stopLoss"] = {
+                        "type": "STOP_MARKET", "stopPrice": round(sl, 8),
+                        "price": round(sl, 8), "workingType": "MARK_PRICE",
+                    }
+                if tp > 0:
+                    p["takeProfit"] = {
+                        "type": "TAKE_PROFIT_MARKET", "stopPrice": round(tp, 8),
+                        "price": round(tp, 8), "workingType": "MARK_PRICE",
+                    }
+            return p
 
-        if data.get("code", -1) != 0:
-            err = data.get("msg", str(data))
-            log.warning(f"abrir_short {par}: {err}")
-            _detectar_limite_notional(par, err)
-            params.pop("stopLoss", None)
-            params.pop("takeProfit", None)
-            sl_tp_incluidos = False
-            data = _post("/openApi/swap/v2/trade/order", params)
-            if data.get("code", -1) != 0:
-                return {"error": data.get("msg", str(data))}
+        if not one_way:
+            data = _post("/openApi/swap/v2/trade/order", _build_params(True, True))
+            if data.get("code", -1) == 0:
+                sl_tp_incluidos = True
+            else:
+                err = data.get("msg", str(data))
+                code = data.get("code", -1)
+                log.warning(f"abrir_short hedge+sl {par} [{code}]: {err}")
+                _detectar_limite_notional(par, err)
+
+                if _detectar_one_way(par, code, err):
+                    one_way = True
+                else:
+                    data = _post("/openApi/swap/v2/trade/order", _build_params(True, False))
+                    if data.get("code", -1) == 0:
+                        sl_tp_incluidos = False
+                    else:
+                        err2 = data.get("msg", str(data))
+                        code2 = data.get("code", -1)
+                        _detectar_limite_notional(par, err2)
+                        _detectar_one_way(par, code2, err2)
+                        log.error(f"[API-ERR] {par}: {err2}")
+                        return {"error": err2}
+
+        if one_way:
+            data = _post("/openApi/swap/v2/trade/order", _build_params(False, True))
+            if data.get("code", -1) == 0:
+                sl_tp_incluidos = True
+            else:
+                err = data.get("msg", str(data))
+                log.warning(f"abrir_short one-way+sl {par}: {err}")
+                _detectar_limite_notional(par, err)
+                data = _post("/openApi/swap/v2/trade/order", _build_params(False, False))
+                if data.get("code", -1) == 0:
+                    sl_tp_incluidos = False
+                else:
+                    err2 = data.get("msg", str(data))
+                    _detectar_limite_notional(par, err2)
+                    log.error(f"[API-ERR] {par}: {err2}")
+                    return {"error": err2}
 
         order = data.get("data", {}).get("order", {})
         fill  = float(order.get("avgPrice", 0) or order.get("price", 0) or precio)
         qty_r = float(order.get("executedQty", qty) or qty)
-        log.info(f"✅ SHORT {par} fill={fill:.6f} qty={qty_r}")
+        log.info(f"✅ SHORT {par} fill={fill:.6f} qty={qty_r} {'[one-way]' if one_way else '[hedge]'}")
 
-        # FIX CRÍTICO: Si SL/TP no se incluyeron en la orden, colocarlos ahora
         if not sl_tp_incluidos:
             log.warning(f"[SL-FIX] {par} SHORT — colocando SL/TP separados (fill={fill:.6f})")
             time.sleep(1)
-            _colocar_sl_tp_separados(par, sl, tp, "SHORT", qty_r or qty)
+            _colocar_sl_tp_separados(par, sl, tp, "SHORT", qty_r or qty, one_way=one_way)
 
-        # FIX CRÍTICO: Verificar que SL está presente en BingX
         time.sleep(2)
         tiene_sl, tiene_tp = verificar_sl_tp_presentes(par)
         if not tiene_sl and sl > 0:
             log.warning(f"[SL-CHECK] {par} SHORT — SL ausente en BingX, reintentando...")
-            _colocar_sl_tp_separados(par, sl, tp, "SHORT", qty_r or qty)
+            _colocar_sl_tp_separados(par, sl, tp, "SHORT", qty_r or qty, one_way=one_way)
         elif tiene_sl:
             log.info(f"[SL-CHECK] {par} ✅ SL confirmado en BingX")
 
@@ -490,26 +570,32 @@ def abrir_short(par: str, qty: float, precio: float, sl: float, tp: float) -> Op
         return {"error": str(e)}
 
 
-def _colocar_sl_tp_separados(par: str, sl: float, tp: float, lado: str, qty: float):
+def _colocar_sl_tp_separados(par: str, sl: float, tp: float, lado: str, qty: float, one_way: bool = False):
     try:
         pos_side = "LONG" if lado == "LONG" else "SHORT"
         cl_side  = "SELL" if lado == "LONG" else "BUY"
         if sl > 0:
-            res = _post("/openApi/swap/v2/trade/order", {
-                "symbol": par, "side": cl_side, "positionSide": pos_side,
+            p = {
+                "symbol": par, "side": cl_side,
                 "type": "STOP_MARKET", "quantity": qty,
                 "stopPrice": round(sl, 8), "workingType": "MARK_PRICE", "reduceOnly": "true",
-            })
+            }
+            if not one_way:
+                p["positionSide"] = pos_side
+            res = _post("/openApi/swap/v2/trade/order", p)
             if res.get("code", -1) == 0:
                 log.info(f"[SL-SEP] {par} SL={sl:.8f} colocado ✅")
             else:
                 log.warning(f"[SL-SEP] {par} SL falló: {res.get('msg')}")
         if tp > 0:
-            res = _post("/openApi/swap/v2/trade/order", {
-                "symbol": par, "side": cl_side, "positionSide": pos_side,
+            p = {
+                "symbol": par, "side": cl_side,
                 "type": "TAKE_PROFIT_MARKET", "quantity": qty,
                 "stopPrice": round(tp, 8), "workingType": "MARK_PRICE", "reduceOnly": "true",
-            })
+            }
+            if not one_way:
+                p["positionSide"] = pos_side
+            res = _post("/openApi/swap/v2/trade/order", p)
             if res.get("code", -1) == 0:
                 log.info(f"[TP-SEP] {par} TP={tp:.8f} colocado ✅")
             else:
