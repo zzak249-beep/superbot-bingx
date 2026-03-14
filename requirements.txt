@@ -1,4 +1,0 @@
-requests
-numpy
-pandas>=2.2.2
-python-dotenv
