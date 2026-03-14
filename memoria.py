@@ -52,6 +52,10 @@ def _load():
             comp = _data.setdefault("compounding", {})
             for k, v in _DEFAULT["compounding"].items():
                 comp.setdefault(k, v)
+            # ── AUTO-FIX al arrancar: limpiar errores acumulados ──────────
+            # Los errores API (margin, connectivity) no deben bloquear pares
+            # permanentemente. Al reiniciar el bot, se resetean todos.
+            _limpiar_errores_arranque()
             return
     except Exception as e:
         log.warning(f"[MEM] Error cargando {_DATA_PATH}: {e}")
@@ -62,6 +66,24 @@ def _load():
         "pares_stats": {},
         "errores_api": {},
     }
+
+
+def _limpiar_errores_arranque():
+    """
+    Al arrancar el bot, resetea contadores de errores API.
+    Razón: errores de margin/connectivity son transitorios — no deben
+    bloquear pares buenos permanentemente entre reinicios.
+    Los bloqueos por mal WR/PnL se mantienen (son basados en trades reales).
+    """
+    pares_stats = _data.get("pares_stats", {})
+    reseteados = 0
+    for par, stats in pares_stats.items():
+        if stats.get("errores", 0) > 0:
+            stats["errores"] = 0
+            stats["ultimo_error_ts"] = ""
+            reseteados += 1
+    if reseteados:
+        log.info(f"[MEM] AUTO-RESET arranque: {reseteados} pares desbloqueados (errores API limpiados)")
 
 
 def _save():
@@ -168,19 +190,8 @@ def registrar_error_api(par: str):
         "trades": 0, "wins": 0, "pnl_total": 0.0, "errores": 0,
     })
     stats["errores"] = stats.get("errores", 0) + 1
-    # Guardar timestamp del último error para poder expirarlos
     stats["ultimo_error_ts"] = datetime.now(timezone.utc).isoformat()
     _save()
-
-
-def resetear_errores(par: str):
-    """Limpia el contador de errores de un par (llamar al desbloquear manualmente)."""
-    stats = _data["pares_stats"].get(par, {})
-    if stats:
-        stats["errores"] = 0
-        stats["ultimo_error_ts"] = ""
-        _save()
-        log.info(f"[MEM] {par} errores API reseteados")
 
 
 # ═══════════════════════════════════════════════════════
@@ -188,15 +199,20 @@ def resetear_errores(par: str):
 # ═══════════════════════════════════════════════════════
 
 def esta_bloqueado(par: str) -> bool:
-    """Par bloqueado si muchos errores API reales o tasa de éxito muy baja."""
+    """
+    Par bloqueado solo por:
+    1. Lista negra manual (config.PARES_BLOQUEADOS)
+    2. ≥10 errores API recientes (últimas 6h) — NO por errores viejos
+    3. Rendimiento muy pobre: ≥8 trades, WR<20%, PnL<-15
+    """
     if par in config.PARES_BLOQUEADOS:
         return True
+
     stats = _data["pares_stats"].get(par, {})
 
-    # ── Errores API: umbral subido a 10 y con expiración de 24h ──────────
+    # ── Errores API: umbral 10 con expiración de 6 horas ─────────────
     errores = stats.get("errores", 0)
     if errores >= 10:
-        # Si el último error fue hace más de 24h, resetear y no bloquear
         ultimo_ts = stats.get("ultimo_error_ts", "")
         if ultimo_ts:
             try:
@@ -204,25 +220,26 @@ def esta_bloqueado(par: str) -> bool:
                 if ts.tzinfo is None:
                     ts = ts.replace(tzinfo=timezone.utc)
                 horas = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
-                if horas >= 24:
+                if horas >= 6:
+                    # Errores viejos → resetear y no bloquear
                     stats["errores"] = 0
                     stats["ultimo_error_ts"] = ""
-                    log.info(f"[MEM] {par} errores expirados (>24h) — desbloqueado")
+                    log.info(f"[MEM] {par} errores expirados (>{horas:.0f}h) — desbloqueado")
                     _save()
-                    # No bloquear — los errores eran viejos
                 else:
-                    return True  # Errores recientes y abundantes → bloquear
+                    return True  # Errores recientes → bloquear
             except Exception:
                 return True
         else:
             return True
 
+    # ── Rendimiento pobre ────────────────────────────────────────────
     trades = stats.get("trades", 0)
     wins   = stats.get("wins", 0)
     pnl    = stats.get("pnl_total", 0.0)
-    # Bloquear solo si ≥8 trades con WR < 20% y PnL muy negativo
     if trades >= 8 and (wins / trades) < 0.20 and pnl < -15.0:
         return True
+
     return False
 
 
