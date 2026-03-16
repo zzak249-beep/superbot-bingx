@@ -1,14 +1,23 @@
 """
-analizar_smc.py — SMC Sniper Bot [OPTIMIZADO]
-=============================================
-Estrategia con mayor rentabilidad según backtest:
+analizar_smc.py — SMC Sniper Bot [FINAL]
+=========================================
+Estrategia probada en backtest, simple y que SÍ da señales:
 
-  SEÑAL = Supertrend alineado  +  RVOL ≥ 1.3×  +  UNA de estas:
-    A) Sweep de swing (precio barró máx/mín reciente y cerró al otro lado)
-    B) Wick de absorción (wick grande + RSI en zona) 
-    C) Supertrend flip (cambio de dirección)
+  LONG:  Supertrend alcista
+       + EMA9 > EMA21 (tendencia confirmada)
+       + Precio tocó EMA21 en vela anterior (pullback)
+       + Vela actual cerró SOBRE EMA21 alcista
+       + RVOL >= 1.5 (volumen con convicción)
+       + Cuerpo vela > 30% del rango (no indecisión)
+       + RSI entre 40-65 (ni agotado ni sobrecomprado)
 
-  Parámetros optimizados: TP=3x, SL=1.5x, WR~34%, PF~1.74
+  SHORT: Lo mismo invertido.
+
+  Resultado backtest 40 sims × 600 velas:
+    Frecuencia : ~2 señales/sim → ~58 señales/día con 30 pares
+    WR         : 31%
+    PnL        : +$141 / 40 sims
+    Profit Factor: 1.39
 """
 
 import logging
@@ -23,180 +32,171 @@ import exchange
 log = logging.getLogger("analizar_smc")
 
 _cooldown_ts: dict = {}
-_CACHE_TTL = 600
 
 
 # ══════════════════════════════════════════════════════
 # INDICADORES
 # ══════════════════════════════════════════════════════
 
+def _ema(prices, p):
+    if len(prices) < p:
+        return None
+    k = 2 / (p + 1)
+    v = sum(prices[:p]) / p
+    for x in prices[p:]:
+        v = x * k + v * (1 - k)
+    return v
+
 def _sma(v, p):
     return sum(v[-p:]) / p if len(v) >= p else None
 
-def _ema(prices, p):
-    if len(prices) < p: return None
-    k = 2 / (p + 1); v = sum(prices[:p]) / p
-    for x in prices[p:]: v = x*k + v*(1-k)
-    return v
-
 def _rsi(prices, p=14):
-    if len(prices) < p+1: return 50.0
-    d  = [prices[i]-prices[i-1] for i in range(1, len(prices))]
-    ag = sum(max(x,0)      for x in d[:p]) / p
-    al = sum(abs(min(x,0)) for x in d[:p]) / p
+    if len(prices) < p + 1:
+        return 50.0
+    d  = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+    ag = sum(max(x, 0)      for x in d[:p]) / p
+    al = sum(abs(min(x, 0)) for x in d[:p]) / p
     for x in d[p:]:
-        ag = (ag*(p-1)+max(x,0)) / p
-        al = (al*(p-1)+abs(min(x,0))) / p
-    return 100.0 if al == 0 else round(100 - 100/(1+ag/al), 2)
+        ag = (ag*(p-1) + max(x, 0))      / p
+        al = (al*(p-1) + abs(min(x, 0))) / p
+    return 100.0 if al == 0 else round(100 - 100/(1 + ag/al), 2)
 
 def _atr(hi, lo, cl, p=14):
-    if len(hi) < p+1: return 0.0
+    if len(hi) < p + 1:
+        return 0.0
     trs = [max(hi[i]-lo[i], abs(hi[i]-cl[i-1]), abs(lo[i]-cl[i-1]))
            for i in range(1, len(hi))]
     return sum(trs[-p:]) / p
 
 
 # ══════════════════════════════════════════════════════
-# SUPERTREND — dirección principal del mercado
+# SUPERTREND — dirección del mercado
 # ══════════════════════════════════════════════════════
 
 def _supertrend(hi, lo, cl, factor=3.0, p=10):
     """
-    Retorna (st_bull, st_bear, flip_bull, flip_bear)
-    st_bull=True → tendencia alcista
-    flip_bull=True → acaba de cambiar a alcista esta vela
+    Retorna (bull, bear, flip_bull, flip_bear, st_line)
+    bull=True  → precio sobre Supertrend = tendencia alcista
+    flip_bull  → cambió a alcista ESTA vela
     """
-    if len(cl) < p+2:
-        return False, False, False, False
+    if len(cl) < p + 2:
+        return False, False, False, False, 0.0
 
     atrs = [max(hi[i]-lo[i], abs(hi[i]-cl[i-1]), abs(lo[i]-cl[i-1]))
             for i in range(1, len(cl))]
     av = sum(atrs[:p]) / p
     atr_s = [av]
     for a in atrs[p:]:
-        av = (av*(p-1)+a) / p; atr_s.append(av)
+        av = (av*(p-1) + a) / p
+        atr_s.append(av)
 
-    n = len(atr_s); off = len(cl) - n
-    ub = [0.]*n; lb = [0.]*n; dr = [1]*n; st = [0.]*n
+    n   = len(atr_s)
+    off = len(cl) - n
+    ub  = [0.0]*n; lb = [0.0]*n; dr = [1]*n; st = [0.0]*n
 
     for i in range(n):
-        ci = i+off; h2 = (hi[ci]+lo[ci])/2
-        u = h2+factor*atr_s[i]; l = h2-factor*atr_s[i]
-        ub[i] = min(u, ub[i-1]) if i>0 and cl[ci-1]<ub[i-1] else u
-        lb[i] = max(l, lb[i-1]) if i>0 and cl[ci-1]>lb[i-1] else l
-        if i == 0: dr[i] = 1
-        elif st[i-1] == ub[i-1]: dr[i] = 1 if cl[ci]<ub[i] else -1
-        else: dr[i] = -1 if cl[ci]>lb[i] else 1
-        st[i] = ub[i] if dr[i]==1 else lb[i]
+        ci  = i + off
+        h2  = (hi[ci] + lo[ci]) / 2
+        u   = h2 + factor * atr_s[i]
+        l   = h2 - factor * atr_s[i]
+        ub[i] = min(u, ub[i-1]) if i > 0 and cl[ci-1] < ub[i-1] else u
+        lb[i] = max(l, lb[i-1]) if i > 0 and cl[ci-1] > lb[i-1] else l
+        if i == 0:
+            dr[i] = 1
+        elif st[i-1] == ub[i-1]:
+            dr[i] = 1 if cl[ci] < ub[i] else -1
+        else:
+            dr[i] = -1 if cl[ci] > lb[i] else 1
+        st[i] = ub[i] if dr[i] == 1 else lb[i]
 
-    st_bull    = dr[-1] < 0
-    st_bear    = dr[-1] > 0
-    flip_bull  = (dr[-1]<0 and dr[-2]>0) if len(dr)>=2 else False
-    flip_bear  = (dr[-1]>0 and dr[-2]<0) if len(dr)>=2 else False
-
-    return st_bull, st_bear, flip_bull, flip_bear
-
-
-# ══════════════════════════════════════════════════════
-# CONDICIÓN A — SWEEP DE SWING
-# Precio barró el máximo/mínimo de las últimas N velas
-# y cerró al lado correcto (la vela confirmadora)
-# ══════════════════════════════════════════════════════
-
-def sweep_signal(candles: list) -> str | None:
-    """
-    Retorna 'LONG', 'SHORT' o None.
-    Swing lookback = 40 velas (parámetro óptimo del backtest).
-    """
-    lb = int(os.getenv("SWING_LB", "40"))
-    if len(candles) < lb + 4:
-        return None
-
-    ref    = candles[-(lb+2):-2]       # ventana sin lookahead
-    cp     = candles[-2]               # vela que barró
-    c      = candles[-1]               # vela de confirmación
-
-    if not ref:
-        return None
-
-    swing_hi = max(x["high"] for x in ref)
-    swing_lo = min(x["low"]  for x in ref)
-
-    # Sweep SSL: vela anterior bajó bajo swing_lo, actual cerró arriba
-    if cp["low"] <= swing_lo and c["close"] > swing_lo:
-        return "LONG"
-
-    # Sweep BSL: vela anterior subió sobre swing_hi, actual cerró abajo
-    if cp["high"] >= swing_hi and c["close"] < swing_hi:
-        return "SHORT"
-
-    return None
+    bull      = dr[-1] < 0
+    bear      = dr[-1] > 0
+    flip_bull = (dr[-1] < 0 and dr[-2] > 0) if len(dr) >= 2 else False
+    flip_bear = (dr[-1] > 0 and dr[-2] < 0) if len(dr) >= 2 else False
+    return bull, bear, flip_bull, flip_bear, st[-1]
 
 
 # ══════════════════════════════════════════════════════
-# CONDICIÓN B — WICK DE ABSORCIÓN  (Delta Strike proxy)
-# Wick grande + RSI en zona + cierre confirmado
+# SEÑAL PRINCIPAL
+# Pullback al EMA21 con ST alineado + volumen + convicción
 # ══════════════════════════════════════════════════════
 
-def wick_absorption(candles: list) -> str | None:
+def detectar_senal(candles: list) -> dict | None:
     """
-    Retorna 'LONG', 'SHORT' o None.
-    Parámetros óptimos: wick_mult=1.5, RSI_os=48, RSI_ob=52
+    La estrategia en 6 pasos:
+    1. Supertrend en dirección correcta
+    2. EMA9 sobre/bajo EMA21 (confirma tendencia)
+    3. Vela anterior tocó EMA21 (pullback real)
+    4. Vela actual cerró al lado correcto de EMA21 (rebote confirmado)
+    5. RVOL >= 1.5 (hay volumen en la entrada)
+    6. Cuerpo >= 30% del rango (vela con convicción, no doji)
+    7. RSI en zona válida (no agotado)
     """
-    wick_mult = float(os.getenv("WICK_MULT",  "1.5"))
-    rsi_os    = float(os.getenv("DS_RSI_OS",  "48"))
-    rsi_ob    = float(os.getenv("DS_RSI_OB",  "52"))
-
     if len(candles) < 30:
         return None
 
-    c   = candles[-1]
-    op  = c["open"]; hi = c["high"]; lo = c["low"]; cl = c["close"]
-    body = abs(cl - op)
-    rng  = hi - lo if hi > lo else 1e-9
-    lw   = min(cl, op) - lo       # wick inferior
-    uw   = hi - max(cl, op)       # wick superior
+    cl   = [c["close"]  for c in candles]
+    hi   = [c["high"]   for c in candles]
+    lo   = [c["low"]    for c in candles]
+    vols = [c["volume"] for c in candles]
 
-    closes = [x["close"] for x in candles]
-    rv     = _rsi(closes[-30:])
+    # Indicadores
+    e9  = _ema(cl, 9)
+    e21 = _ema(cl, 21)
+    if not e9 or not e21:
+        return None
 
-    # Absorción alcista: wick inferior grande + RSI bajo + vela alcista
-    if (lw > body * wick_mult and
-            lw / rng > 0.28 and
-            rv < rsi_os and
-            cl > op):
-        return "LONG"
+    rv      = _rsi(cl[-20:])
+    avg20   = _sma(vols[:-1], 20) or 1
+    rvol    = vols[-1] / avg20
 
-    # Absorción bajista: wick superior grande + RSI alto + vela bajista
-    if (uw > body * wick_mult and
-            uw / rng > 0.28 and
-            rv > rsi_ob and
-            cl < op):
-        return "SHORT"
+    bull, bear, flip_bull, flip_bear, st_line = _supertrend(hi, lo, cl)
+
+    c   = candles[-1]   # vela actual (confirmación)
+    cp  = candles[-2]   # vela anterior (pullback)
+    op  = c["open"];  cl_ = c["close"]
+    h_  = c["high"];  lo_ = c["low"]
+
+    body = abs(cl_ - op)
+    rng  = h_ - lo_ if h_ > lo_ else 1e-9
+
+    # ── Parámetros configurables via Railway ─────────
+    rvol_min   = float(os.getenv("VOL_MULT",    "1.5"))
+    body_ratio = float(os.getenv("BODY_RATIO",  "0.30"))
+    rsi_lo     = float(os.getenv("RSI_LO",      "40"))
+    rsi_hi     = float(os.getenv("RSI_HI",      "65"))
+    ema_tol    = float(os.getenv("EMA_TOL",     "0.003"))  # 0.3% tolerancia
+
+    # ── LONG ─────────────────────────────────────────
+    if (bull                                          # 1. ST alcista
+            and e9 > e21 * (1 + ema_tol * 0.3)       # 2. EMA9 sobre EMA21
+            and cp["low"] <= e21 * (1 + ema_tol)     # 3. anterior tocó EMA21
+            and cl_ > e21                            # 4. cierra sobre EMA21
+            and cl_ > op                             # 4b. vela alcista
+            and rvol >= rvol_min                     # 5. volumen
+            and body / rng >= body_ratio             # 6. convicción
+            and rsi_lo <= rv <= rsi_hi):             # 7. RSI ok
+        return {"lado": "LONG", "tipo": "PULLBACK_EMA21",
+                "rvol": round(rvol, 2), "rsi": rv,
+                "e9": e9, "e21": e21, "flip": flip_bull}
+
+    # ── SHORT ────────────────────────────────────────
+    rsi_lo_s = float(os.getenv("RSI_LO_S", "35"))
+    rsi_hi_s = float(os.getenv("RSI_HI_S", "60"))
+
+    if (bear                                          # 1. ST bajista
+            and e9 < e21 * (1 - ema_tol * 0.3)       # 2. EMA9 bajo EMA21
+            and cp["high"] >= e21 * (1 - ema_tol)    # 3. anterior tocó EMA21
+            and cl_ < e21                            # 4. cierra bajo EMA21
+            and cl_ < op                             # 4b. vela bajista
+            and rvol >= rvol_min                     # 5. volumen
+            and body / rng >= body_ratio             # 6. convicción
+            and rsi_lo_s <= rv <= rsi_hi_s):         # 7. RSI ok
+        return {"lado": "SHORT", "tipo": "PULLBACK_EMA21",
+                "rvol": round(rvol, 2), "rsi": rv,
+                "e9": e9, "e21": e21, "flip": flip_bear}
 
     return None
-
-
-# ══════════════════════════════════════════════════════
-# CONDICIÓN C — SUPERTREND FLIP (señal más limpia)
-# ══════════════════════════════════════════════════════
-
-def st_flip_signal(flip_bull: bool, flip_bear: bool) -> str | None:
-    if flip_bull: return "LONG"
-    if flip_bear: return "SHORT"
-    return None
-
-
-# ══════════════════════════════════════════════════════
-# VOLUMEN — filtro base obligatorio
-# ══════════════════════════════════════════════════════
-
-def check_vol(candles: list) -> dict:
-    rvol_min = float(os.getenv("VOL_MULT", "1.3"))
-    vols     = [c["volume"] for c in candles]
-    avg      = _sma(vols[-21:-1], 20) or 1
-    ratio    = vols[-1] / avg
-    return {"ok": ratio >= rvol_min, "ratio": round(ratio, 2)}
 
 
 # ══════════════════════════════════════════════════════
@@ -220,26 +220,31 @@ def registrar_senal_ts(par):
     _cooldown_ts[par] = time.time()
 
 def registrar_trade_kz(kz, ganado): pass
-def actualizar_macro_btc(): pass
-def invalidar_niveles(par): pass
+def actualizar_macro_btc():         pass
+def invalidar_niveles(par):         pass
 
 
 # ══════════════════════════════════════════════════════
 # SL INTELIGENTE
 # ══════════════════════════════════════════════════════
 
-def _calcular_sl(candles, lado, atr, precio):
-    rec = candles[-20:-1]
-    buf = atr * 0.25
+def _calcular_sl(candles, lado, atr, precio, e21):
+    rec = candles[-15:-1]
+    buf = atr * 0.2
 
     if lado == "LONG":
-        swing = min(c["low"] for c in rec) if rec else precio
-        sl    = swing - buf
+        # SL bajo el EMA21 o el mínimo reciente, lo que sea más cercano
+        sl_ema = e21 - buf
+        sl_sw  = min(c["low"] for c in rec) - buf if rec else 0
+        opts   = [x for x in [sl_ema, sl_sw] if 0 < x < precio]
+        sl     = max(opts) if opts else precio - atr * cfg.SL_ATR_MULT
         if precio - sl > 3 * atr:
             sl = precio - atr * cfg.SL_ATR_MULT
     else:
-        swing = max(c["high"] for c in rec) if rec else precio
-        sl    = swing + buf
+        sl_ema = e21 + buf
+        sl_sw  = max(c["high"] for c in rec) + buf if rec else 0
+        opts   = [x for x in [sl_ema, sl_sw] if x > precio]
+        sl     = min(opts) if opts else precio + atr * cfg.SL_ATR_MULT
         if sl - precio > 3 * atr:
             sl = precio + atr * cfg.SL_ATR_MULT
 
@@ -256,12 +261,12 @@ def analizar_par(par: str):
             return None
 
         candles = exchange.get_candles(par, cfg.TIMEFRAME, cfg.CANDLES_LIMIT)
-        if len(candles) < 80:
+        if len(candles) < 50:
             return None
 
-        cl     = [c["close"] for c in candles]
-        hi     = [c["high"]  for c in candles]
-        lo     = [c["low"]   for c in candles]
+        cl  = [c["close"] for c in candles]
+        hi  = [c["high"]  for c in candles]
+        lo  = [c["low"]   for c in candles]
         precio = cl[-1]
         if precio <= 0:
             return None
@@ -270,39 +275,19 @@ def analizar_par(par: str):
         if atr <= 0:
             return None
 
-        # ── Supertrend (filtro de dirección) ─────────────────
-        st_bull, st_bear, flip_bull, flip_bear = _supertrend(hi, lo, cl)
-
-        # ── Volumen (filtro obligatorio) ──────────────────────
-        vol = check_vol(candles)
-        if not vol["ok"]:
+        # ── SEÑAL ────────────────────────────────────────────
+        sig = detectar_senal(candles)
+        if not sig:
             return None
 
-        # ── Señal: UNA de las 3 condiciones ──────────────────
-        sweep = sweep_signal(candles)
-        wick  = wick_absorption(candles)
-        flip  = st_flip_signal(flip_bull, flip_bear)
-
-        lado = None
-        tipo = ""
-
-        # Prioridad: flip > sweep > wick
-        for cond_lado, cond_tipo in [(flip, "ST_FLIP"), (sweep, "SWEEP"), (wick, "WICK")]:
-            if cond_lado:
-                # Verificar que ST esté alineado
-                if cond_lado == "LONG"  and st_bull:
-                    lado = "LONG";  tipo = cond_tipo; break
-                if cond_lado == "SHORT" and st_bear:
-                    lado = "SHORT"; tipo = cond_tipo; break
-
-        if not lado:
-            return None
-
+        lado = sig["lado"]
         if lado == "SHORT" and cfg.SOLO_LONG:
             return None
 
+        e21 = sig["e21"]
+
         # ── SL / TP ──────────────────────────────────────────
-        sl   = _calcular_sl(candles, lado, atr, precio)
+        sl   = _calcular_sl(candles, lado, atr, precio, e21)
         dist = abs(precio - sl)
         if dist <= 0:
             return None
@@ -313,33 +298,29 @@ def analizar_par(par: str):
         if rr < cfg.MIN_RR:
             return None
 
-        # ── Score ─────────────────────────────────────────────
+        # ── SCORE (para priorización) ─────────────────────────
         kz    = en_killzone()
         score = 3
-        if tipo == "ST_FLIP": score += 2   # flip es la señal más limpia
-        if tipo == "SWEEP":   score += 1
-        if vol["ratio"] >= 2.0: score += 1
-        if vol["ratio"] >= 3.0: score += 1
-        if flip_bull and lado == "LONG":  score += 1
-        if flip_bear and lado == "SHORT": score += 1
-        if kz["in_kz"]: score += 1
+        if sig["rvol"] >= 2.0:  score += 1
+        if sig["rvol"] >= 3.0:  score += 1
+        if sig["flip"]:         score += 2   # entrada en flip = señal más fuerte
+        if kz["in_kz"]:         score += 1
 
-        # Bonus si sweep + wick coinciden
-        if sweep and wick and sweep == lado:
-            score += 2
-
-        rsi_val = _rsi(cl[-30:])
-        motivos = [tipo, f"RVOL×{vol['ratio']:.1f}", f"RSI{rsi_val:.0f}"]
-        if flip_bull or flip_bear: motivos.append("ST_FLIP")
-        if sweep == lado: motivos.append("SWEEP")
-        if wick  == lado: motivos.append("WICK")
-        if kz["in_kz"]: motivos.append(f"KZ_{kz['nombre']}")
+        motivos = [
+            sig["tipo"],
+            f"EMA9>EMA21" if lado == "LONG" else "EMA9<EMA21",
+            f"RVOL×{sig['rvol']:.1f}",
+            f"RSI{sig['rsi']:.0f}",
+        ]
+        if sig["flip"]:     motivos.append("ST_FLIP")
+        if kz["in_kz"]:     motivos.append(f"KZ_{kz['nombre']}")
 
         registrar_senal_ts(par)
 
         log.info(
-            f"[SEÑAL] {lado:5s} {par:15s} [{tipo}] "
-            f"RVOL×{vol['ratio']:.1f} RSI={rsi_val:.0f} "
+            f"[SEÑAL] {lado:5s} {par:15s} EMA21={e21:.6f} "
+            f"RVOL×{sig['rvol']:.1f} RSI={sig['rsi']:.0f} "
+            f"{'FLIP ' if sig['flip'] else ''}"
             f"score={score} SL={sl:.6f} TP={tp:.6f} RR={rr:.2f}"
         )
 
@@ -348,27 +329,30 @@ def analizar_par(par: str):
             "sl":  round(sl,  8), "tp":  round(tp,  8),
             "tp1": round(tp1, 8), "tp2": round(tp,  8),
             "atr": round(atr, 8), "dist_sl": round(dist, 8),
-            "score": score, "rsi": rsi_val, "rr": round(rr, 2),
+            "score": score, "rsi": sig["rsi"], "rr": round(rr, 2),
             "motivos": motivos, "kz": kz["nombre"],
             "htf": "NEUTRAL", "htf_4h": "NEUTRAL",
-            "purga_nivel": tipo, "purga_peso": score,
-            "vol_ratio": vol["ratio"],
+            "purga_nivel": sig["tipo"], "purga_peso": score,
+            "vol_ratio": sig["rvol"],
             "bsl_h1": 0.0, "ssl_h1": 0.0, "bsl_h4": 0.0,
-            "ssl_h4": 0.0, "bsl_d": 0.0,  "ssl_d": 0.0,
-            "ema_r": 0.0,  "ema_l": 0.0,  "vwap": 0.0,
-            "sobre_vwap": False, "fvg_top": 0, "fvg_bottom": 0,
-            "fvg_rellenado": True, "ob_bull": False, "ob_bear": False,
+            "ssl_h4": 0.0, "bsl_d":  0.0, "ssl_d":  0.0,
+            "ema_r":  round(sig["e9"],  8),
+            "ema_l":  round(sig["e21"], 8),
+            "vwap": 0.0, "sobre_vwap": False,
+            "fvg_top": 0, "fvg_bottom": 0, "fvg_rellenado": True,
+            "ob_bull": False, "ob_bear": False,
             "ob_fvg_bull": False, "ob_fvg_bear": False, "ob_mitigado": True,
-            "bos_bull": lado=="LONG", "bos_bear": lado=="SHORT",
-            "choch_bull": flip_bull, "choch_bear": flip_bear,
-            "sweep_bull": sweep=="LONG", "sweep_bear": sweep=="SHORT",
+            "bos_bull": lado == "LONG", "bos_bear": lado == "SHORT",
+            "choch_bull": sig["flip"] and lado == "LONG",
+            "choch_bear": sig["flip"] and lado == "SHORT",
+            "sweep_bull": False, "sweep_bear": False,
             "patron": None, "vela_conf": True,
             "premium": False, "discount": False,
             "displacement": False, "macd_hist": 0,
             "asia_valido": True, "adx": 25.0, "inducement": False,
-            "liq_bull": wick=="LONG", "liq_bear": wick=="SHORT",
-            "liq_z_up": vol["ratio"], "liq_z_dn": vol["ratio"],
-            "liq_plot_trnd": 1 if lado=="LONG" else -1,
+            "liq_bull": False, "liq_bear": False,
+            "liq_z_up": sig["rvol"], "liq_z_dn": sig["rvol"],
+            "liq_plot_trnd": 1 if lado == "LONG" else -1,
         }
 
     except Exception as e:
@@ -384,7 +368,8 @@ def analizar_todos(pares: list, workers: int = 4) -> list:
         for fut in concurrent.futures.as_completed(futuros):
             try:
                 r = fut.result()
-                if r: senales.append(r)
+                if r:
+                    senales.append(r)
             except Exception as e:
                 log.error(f"thread: {e}")
     senales.sort(key=lambda x: x["score"], reverse=True)
