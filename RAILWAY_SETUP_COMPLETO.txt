@@ -1,0 +1,464 @@
+================================================================================
+🚀 GUÍA COMPLETA: DESPLEGAR BOT EN RAILWAY
+================================================================================
+
+RAILWAY PERMITE QUE TU BOT FUNCIONE 24/7 GRATIS
+
+================================================================================
+PASO 1: PREPARATIVOS (5 MINUTOS)
+================================================================================
+
+1.1 CREAR CUENTA GITHUB (si no tienes)
+────────────────────────────────────────
+- Ve a https://github.com
+- Click "Sign up"
+- Completa los datos
+- Verifica tu email
+- ✅ LISTO
+
+1.2 OBTENER CREDENCIALES BINGX
+──────────────────────────────────
+- Ve a https://bingx.com
+- Login
+- Account → API Management → Create New API Key
+- Copia: API Key y API Secret
+- ⚠️ GUÁRDALOS - NUNCA LOS COMPARTAS
+
+1.3 CREAR BOT TELEGRAM
+──────────────────────
+- Abre Telegram
+- Busca @BotFather
+- Envía /newbot
+- Completa datos
+- Copia el Bot Token
+- Busca @userinfobot
+- Copia tu Chat ID
+- ✅ LISTO
+
+================================================================================
+PASO 2: SUBIR CÓDIGO A GITHUB (3 MINUTOS)
+================================================================================
+
+2.1 CREAR CARPETA Y ARCHIVOS LOCALES
+─────────────────────────────────────
+En tu computadora:
+
+1. Crea carpeta: trading-bot
+2. Coloca TODOS estos archivos:
+   ✅ main.py
+   ✅ strategy.py
+   ✅ bingx_client.py
+   ✅ telegram_notifier.py
+   ✅ requirements.txt
+   ✅ Dockerfile
+   ✅ railway.json
+   ✅ .gitignore
+
+NO incluyas:
+   ❌ .env (nunca en GitHub)
+   ❌ *.log
+   ❌ __pycache__
+
+2.2 INICIALIZAR GIT Y SUBIR
+────────────────────────────
+En terminal/CMD:
+
+$ cd trading-bot
+$ git init
+$ git add .
+$ git commit -m "Bot trading ultra-optimizado"
+
+2.3 CREAR REPOSITORIO EN GITHUB
+────────────────────────────────
+- Ve a https://github.com/new
+- Name: trading-bot
+- Description: Multi-pair trading bot BingX
+- Public: SI
+- Create repository
+
+2.4 CONECTAR Y HACER PUSH
+──────────────────────────
+En terminal:
+
+$ git remote add origin https://github.com/TU_USUARIO/trading-bot.git
+$ git branch -M main
+$ git push -u origin main
+
+✅ LISTO - Tu código está en GitHub
+
+================================================================================
+PASO 3: DESPLEGAR EN RAILWAY (2 MINUTOS)
+================================================================================
+
+3.1 REGISTRARSE EN RAILWAY
+──────────────────────────
+- Ve a https://railway.app
+- Click "Login with GitHub"
+- Autoriza acceso
+- ✅ LISTO
+
+3.2 CREAR NUEVO PROYECTO
+────────────────────────
+- Dashboard → "+ New Project"
+- Selecciona "Deploy from GitHub repo"
+- Autoriza Railway para acceder a GitHub
+- Selecciona: trading-bot
+- ✅ Railway empieza a buildear (2-3 min)
+
+3.3 ESPERAR DEPLOYMENT
+─────────────────────
+Verás:
+[Building...] → [Build successful] → [Deploying...]
+
+¡NO CIERRES LA PÁGINA!
+
+3.4 ACCEDER A VARIABLES
+───────────────────────
+Una vez desplegado:
+- Click en tu proyecto
+- Pestaña "Variables"
+- Click "+ Add Variable"
+
+================================================================================
+PASO 4: AÑADIR VARIABLES EN RAILWAY (5 MINUTOS)
+================================================================================
+
+MÉTODO A: UNO POR UNO (MÁS SEGURO)
+────────────────────────────────────
+
+En Railway → Variables, añade cada una:
+
+1. BINGX_API_KEY
+   Valor: tu_api_key_real_aqui
+
+2. BINGX_API_SECRET
+   Valor: tu_api_secret_real_aqui
+
+3. TELEGRAM_BOT_TOKEN
+   Valor: tu_bot_token_real_aqui
+
+4. TELEGRAM_CHAT_ID
+   Valor: tu_chat_id_real_aqui
+
+5. SYMBOLS (TODOS LOS PARES)
+   Valor: BTC-USDT,ETH-USDT,BNB-USDT,SOL-USDT,XRP-USDT,ADA-USDT,DOGE-USDT,AVAX-USDT,DOT-USDT,MATIC-USDT,LINK-USDT,UNI-USDT,ATOM-USDT,LTC-USDT,ETC-USDT,ARB-USDT,OP-USDT,APT-USDT,SUI-USDT,SEI-USDT,TIA-USDT,INJ-USDT,AAVE-USDT,MKR-USDT,CRV-USDT,COMP-USDT,SNX-USDT,SUSHI-USDT,AXS-USDT,SAND-USDT,MANA-USDT,GALA-USDT,IMX-USDT,FTM-USDT,NEAR-USDT,ALGO-USDT,ONE-USDT,CELO-USDT,SHIB-USDT,PEPE-USDT,FLOKI-USDT,BONK-USDT,WIF-USDT,JTO-USDT,WLD-USDT,ME-USDT,ONDO-USDT,ENA-USDT,PENDLE-USDT,ENS-USDT,GRT-USDT,STRK-USDT,BLUR-USDT,LDO-USDT,LIDO-USDT,STETH-USDT,RETH-USDT,XEC-USDT,ICP-USDT
+
+6. TIMEFRAME
+   Valor: 15m
+
+7. CHECK_INTERVAL
+   Valor: 60
+
+8. MAX_POSITION_SIZE
+   Valor: 100
+
+9. MAX_POSITIONS
+   Valor: 8
+
+10. LINREG_LENGTH
+    Valor: 50
+
+11. LINREG_MULT
+    Valor: 2.2
+
+12. ADX_THRESHOLD
+    Valor: 25
+
+13. RISK_REWARD
+    Valor: 2.5
+
+DESPUÉS DE CADA VARIABLE: Click "Add"
+
+MÉTODO B: COPIAR/PEGAR (MÁS RÁPIDO)
+────────────────────────────────────
+
+Si Railway permite variables en bulk:
+1. Descarga: .env.railway
+2. Railway → Settings → Import Environment Variables
+3. Pega el contenido
+
+================================================================================
+PASO 5: HACER DEPLOY (1 MINUTO)
+================================================================================
+
+5.1 EN RAILWAY
+──────────────
+- Después de añadir TODAS las variables
+- Pestaña "Deployments"
+- Click en el deployment actual
+- "..." → Redeploy
+
+5.2 ESPERAR EJECUCIÓN
+──────────────────────
+Verás:
+[Building...] → [Deploying...] → [Running] ✅
+
+En 2-3 MINUTOS:
+- El bot está operativo
+- Deberías recibir mensaje en Telegram
+
+5.3 VERIFICAR LOGS
+──────────────────
+- Deployments → Click en el deployment
+- Pestaña "Logs"
+- Deberías ver:
+
+✅ Bot Ultra-Optimizado v4 Inicializado
+📊 Pares: 60+ | Timeframe: 15m
+🚀 Iniciando loop de trading...
+🤖 Bot iniciado y monitoreando...
+
+================================================================================
+PASO 6: VERIFICAR QUE FUNCIONA (2 MINUTOS)
+================================================================================
+
+6.1 TELEGRAM
+────────────
+Deberías recibir mensaje:
+
+🤖 Bot Multi-Par Ultra-Optimizado v4
+
+📊 Análisis: 60+ pares
+  • BTC-USDT
+  • ETH-USDT
+  • SOL-USDT
+  • ...
+
+⏱ Timeframe: 15m
+💰 Max Posiciones: 8
+📦 Tamaño/Posición: $100
+
+🎯 Parámetros:
+  • LinReg: 50 periodos x2.2
+  • ADX Threshold: 25
+  • Ratio R:R: 1:2.5
+
+✅ Bot iniciado y monitoreando...
+
+6.2 RAILWAY LOGS
+────────────────
+Busca en los logs:
+- ✅ Bot inicializado
+- 📊 Analizando 60+ pares
+- 🔄 Ciclo completado
+
+6.3 SI NO FUNCIONA
+──────────────────
+Comprueba:
+1. ¿Recibiste mensaje en Telegram? SI → OK
+2. ¿Los logs no tienen errores? SI → OK
+3. ¿Están TODAS las variables? Sí → OK
+
+Si algo falla:
+- Revisa los logs de Railway
+- Busca "ERROR" o "❌"
+- Verifica credenciales
+
+================================================================================
+PASO 7: MONITOREAR EL BOT EN RAILWAY
+================================================================================
+
+7.1 LOGS EN TIEMPO REAL
+──────────────────────
+- Railway Dashboard
+- Tu proyecto
+- Pestaña "Logs"
+- Verás actividad en vivo
+
+Qué deberías ver:
+✅ [BTC-USDT] LONG - Conf: 82% | P:45250
+✅ [ETH-USDT] SHORT - Conf: 75% | P:2200
+🔄 Ciclo completado - Próximo en 60s
+
+7.2 NOTIFICACIONES TELEGRAM
+────────────────────────────
+Recibirás alertas cuando:
+- 🟢 Abre una posición LONG
+- 🔴 Abre una posición SHORT
+- 🔒 Cierra una posición (con PnL)
+- ⚠️ Hay un error
+
+7.3 ESTADÍSTICAS
+────────────────
+Cada posición cerrada incluye:
+💯 Confianza: 82%
+📊 Precio: 45,250
+🛑 Stop Loss: 44,800
+🎯 Take Profit: 46,375
+📦 Cantidad: 0.00222
+📈 R:R: 1:2.50
+
+================================================================================
+PASO 8: CONTROL Y CAMBIOS DESDE RAILWAY
+================================================================================
+
+8.1 CAMBIAR VARIABLES
+─────────────────────
+Para cambiar MAX_POSITION_SIZE de $100 a $150:
+
+1. Railway Dashboard
+2. Variables
+3. Busca MAX_POSITION_SIZE
+4. Haz clic → Edita
+5. Guarda
+
+El bot automáticamente REINICIA con nuevos valores
+
+8.2 VER ESTADÍSTICAS
+────────────────────
+En Railway puedes ver:
+- Memoria usada: ~50-100 MB
+- CPU: ~1-5%
+- Uptime: 99.9%
+- Ancho de banda: ~1-2 MB/día
+
+8.3 DETENER EL BOT
+──────────────────
+Si necesitas detenerlo:
+1. Deployments
+2. Click en el deployment
+3. "..." → Pause o Delete
+
+Para reiniciar:
+1. Click "Redeploy"
+
+================================================================================
+PASO 9: OPTIMIZACIONES Y TIPS
+================================================================================
+
+9.1 MEJORAR PERFORMANCE
+──────────────────────
+Si el bot es lento:
+
+1. Reducir SYMBOLS (60 → 30 pares)
+2. Aumentar CHECK_INTERVAL (60s → 120s)
+3. Reducir MAX_POSITIONS (8 → 4)
+
+Si quieres más señales:
+1. Disminuir ADX_THRESHOLD (25 → 20)
+2. Aumentar SYMBOLS (60 → 80 pares)
+3. Disminuir CHECK_INTERVAL (60s → 30s)
+
+9.2 MONITOREO REMOTO
+────────────────────
+Usa script en tu PC:
+$ python monitor_pairs.py
+
+Muestra análisis sin afectar a Railway
+
+9.3 ANÁLISIS DE RESULTADOS
+──────────────────────────
+Cada semana, ejecuta localmente:
+$ python statistics.py
+
+Genera reportes con:
+- Win rate
+- PnL total
+- Resultados por símbolo
+
+================================================================================
+PASO 10: TROUBLESHOOTING EN RAILWAY
+================================================================================
+
+PROBLEMA: "Bot no inicia"
+SOLUCIÓN:
+1. Revisa logs
+2. Busca "ERROR"
+3. Verifica TODAS las variables están
+4. Redeploy
+
+PROBLEMA: "No recibo mensajes Telegram"
+SOLUCIÓN:
+1. Verifica TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID
+2. Inicia conversación con el bot primero
+3. Redeploy
+
+PROBLEMA: "API BingX error"
+SOLUCIÓN:
+1. Verifica BINGX_API_KEY y BINGX_API_SECRET
+2. Comprueba que son válidos
+3. Espera 5 minutos si acabas de crear
+4. Redeploy
+
+PROBLEMA: "Bot conecta pero no genera señales"
+SOLUCIÓN:
+1. Ejecuta localmente: python monitor_pairs.py
+2. Ve qué pares tienen señales
+3. Si NONE en todos: mercado sin tendencia (normal)
+4. Espera a que aparezca una tendencia clara
+
+PROBLEMA: "Uso mucho CPU/RAM"
+SOLUCIÓN:
+1. Reducir número de pares en SYMBOLS
+2. Aumentar CHECK_INTERVAL
+3. Reducir MAX_POSITIONS
+
+================================================================================
+CHECKLIST FINAL - ANTES DE EJECUTAR
+================================================================================
+
+GITHUB:
+☐ Creé repositorio
+☐ Subí los archivos
+☐ .env NO está en GitHub
+
+CREDENCIALES:
+☐ Tengo API Key BingX
+☐ Tengo API Secret BingX
+☐ Tengo Bot Token Telegram
+☐ Tengo Chat ID Telegram
+
+RAILWAY:
+☐ Creé cuenta (con GitHub)
+☐ Creé proyecto
+☐ Seleccioné el repositorio
+☐ Build fue exitoso
+☐ Añadí TODAS las variables
+☐ Hice Redeploy
+
+VERIFICACIÓN:
+☐ Veo mensaje en Telegram
+☐ Los logs de Railway son limpios
+☐ Proyecto está "Running"
+
+================================================================================
+🎉 ¡COMPLETADO!
+================================================================================
+
+Tu bot está operando 24/7 en Railway:
+
+✅ Analizando 60+ pares
+✅ Notificaciones en Telegram
+✅ Operaciones automáticas
+✅ Sin costo (free tier)
+✅ Sin intervención requerida
+
+PRÓXIMOS PASOS:
+1. Monitorea logs de Railway
+2. Revisa mensajes de Telegram
+3. Después de 1 semana: ejecuta statistics.py
+4. Ajusta parámetros si es necesario
+
+================================================================================
+VARIABLES QUICK COPY-PASTE PARA RAILWAY
+================================================================================
+
+Si necesitas copiar rápido todas las variables:
+
+BINGX_API_KEY=tu_api_key_aqui
+BINGX_API_SECRET=tu_api_secret_aqui
+TELEGRAM_BOT_TOKEN=tu_bot_token_aqui
+TELEGRAM_CHAT_ID=tu_chat_id_aqui
+SYMBOLS=BTC-USDT,ETH-USDT,BNB-USDT,SOL-USDT,XRP-USDT,ADA-USDT,DOGE-USDT,AVAX-USDT,DOT-USDT,MATIC-USDT,LINK-USDT,UNI-USDT,ATOM-USDT,LTC-USDT,ETC-USDT,ARB-USDT,OP-USDT,APT-USDT,SUI-USDT,SEI-USDT,TIA-USDT,INJ-USDT,AAVE-USDT,MKR-USDT,CRV-USDT,COMP-USDT,SNX-USDT,SUSHI-USDT,AXS-USDT,SAND-USDT,MANA-USDT,GALA-USDT,IMX-USDT,FTM-USDT,NEAR-USDT,ALGO-USDT,ONE-USDT,CELO-USDT,SHIB-USDT,PEPE-USDT,FLOKI-USDT,BONK-USDT,WIF-USDT,JTO-USDT,WLD-USDT,ME-USDT,ONDO-USDT,ENA-USDT,PENDLE-USDT,ENS-USDT,GRT-USDT,STRK-USDT,BLUR-USDT,LDO-USDT,LIDO-USDT,STETH-USDT,RETH-USDT,XEC-USDT,ICP-USDT
+TIMEFRAME=15m
+CHECK_INTERVAL=60
+MAX_POSITION_SIZE=100
+MAX_POSITIONS=8
+LINREG_LENGTH=50
+LINREG_MULT=2.2
+ADX_THRESHOLD=25
+RISK_REWARD=2.5
+
+================================================================================
+¡BUENA SUERTE CON TU TRADING AUTOMATIZADO EN RAILWAY! 🚀💰📈
+================================================================================

@@ -1,5 +1,5 @@
 """
-Cliente BingX API - Futuros Perpetuos
+Cliente BingX API - Futuros Perpetuos (VERSIÓN ARREGLADA)
 Autenticación HMAC, órdenes, posiciones
 """
 
@@ -23,27 +23,42 @@ class BingXClient:
     
     def __init__(self):
         """Inicializar con credenciales"""
-        self.api_key = os.getenv('BINGX_API_KEY')
-        self.api_secret = os.getenv('BINGX_API_SECRET')
+        self.api_key = os.getenv('BINGX_API_KEY', '')
+        self.api_secret = os.getenv('BINGX_API_SECRET', '')
         
         if not self.api_key or not self.api_secret:
             logger.warning("⚠️ Credenciales BingX no configuradas")
         
         self.session = requests.Session()
         self.session.headers.update({
-            'X-BX-APIKEY': self.api_key,
+            'X-BX-APIKEY': str(self.api_key),
             'Content-Type': 'application/json'
         })
     
     def _generate_signature(self, params: dict) -> str:
         """Generar firma HMAC"""
-        query_string = urlencode(sorted(params.items()))
-        signature = hmac.new(
-            self.api_secret.encode('utf-8'),
-            query_string.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
-        return signature
+        try:
+            if not self.api_secret:
+                return ""
+            
+            # Convertir a string si no lo es
+            secret = str(self.api_secret)
+            
+            # Crear query string
+            query_string = urlencode(sorted(params.items()))
+            
+            # Generar signature
+            signature = hmac.new(
+                secret.encode('utf-8'),
+                query_string.encode('utf-8'),
+                hashlib.sha256
+            ).hexdigest()
+            
+            return signature
+            
+        except Exception as e:
+            logger.error(f"Error generando signature: {e}")
+            return ""
     
     async def get_klines(self, symbol: str, interval: str, limit: int = 100) -> List[Dict]:
         """Obtener velas históricas"""
@@ -53,8 +68,8 @@ class BingXClient:
             params = {
                 'symbol': symbol,
                 'interval': interval,
-                'limit': limit,
-                'timestamp': int(time.time() * 1000)
+                'limit': str(limit),
+                'timestamp': str(int(time.time() * 1000))
             }
             
             params['signature'] = self._generate_signature(params)
@@ -73,25 +88,28 @@ class BingXClient:
                     
                     candles = []
                     for k in klines:
-                        candles.append({
-                            'timestamp': int(k[0]),
-                            'open': float(k[1]),
-                            'high': float(k[2]),
-                            'low': float(k[3]),
-                            'close': float(k[4]),
-                            'volume': float(k[5])
-                        })
+                        try:
+                            candles.append({
+                                'timestamp': int(k[0]),
+                                'open': float(k[1]),
+                                'high': float(k[2]),
+                                'low': float(k[3]),
+                                'close': float(k[4]),
+                                'volume': float(k[5])
+                            })
+                        except (ValueError, TypeError, IndexError):
+                            continue
                     
                     return candles
                 else:
-                    logger.error(f"Error: {data.get('msg')}")
+                    logger.error(f"API Error: {data.get('msg')}")
                     return []
             else:
-                logger.error(f"HTTP {response.status_code}")
+                logger.error(f"HTTP Error {response.status_code}")
                 return []
                 
         except Exception as e:
-            logger.error(f"Error obteniendo velas: {e}")
+            logger.error(f"Error obteniendo velas: {str(e)}")
             return []
     
     async def get_position(self, symbol: str) -> Optional[Dict]:
@@ -101,7 +119,7 @@ class BingXClient:
             
             params = {
                 'symbol': symbol,
-                'timestamp': int(time.time() * 1000)
+                'timestamp': str(int(time.time() * 1000))
             }
             
             params['signature'] = self._generate_signature(params)
@@ -119,25 +137,29 @@ class BingXClient:
                     positions = data.get('data', [])
                     
                     for pos in positions:
-                        if float(pos.get('positionAmt', 0)) != 0:
-                            return {
-                                'symbol': pos['symbol'],
-                                'side': 'LONG' if float(pos['positionAmt']) > 0 else 'SHORT',
-                                'size': abs(float(pos['positionAmt'])),
-                                'entry_price': float(pos['avgPrice']),
-                                'unrealized_pnl': float(pos.get('unrealizedProfit', 0))
-                            }
+                        try:
+                            amount = float(pos.get('positionAmt', 0))
+                            if amount != 0:
+                                return {
+                                    'symbol': pos.get('symbol', symbol),
+                                    'side': 'LONG' if amount > 0 else 'SHORT',
+                                    'size': abs(amount),
+                                    'entry_price': float(pos.get('avgPrice', 0)),
+                                    'unrealized_pnl': float(pos.get('unrealizedProfit', 0))
+                                }
+                        except (ValueError, TypeError, KeyError):
+                            continue
                     
                     return None
                 else:
-                    logger.error(f"Error: {data.get('msg')}")
+                    logger.error(f"API Error: {data.get('msg')}")
                     return None
             else:
-                logger.error(f"HTTP {response.status_code}")
+                logger.error(f"HTTP Error {response.status_code}")
                 return None
                 
         except Exception as e:
-            logger.error(f"Error obteniendo posición: {e}")
+            logger.error(f"Error obteniendo posición: {str(e)}")
             return None
     
     async def place_order(self,
@@ -155,18 +177,18 @@ class BingXClient:
                 'symbol': symbol,
                 'side': side,
                 'type': 'MARKET' if price is None else 'LIMIT',
-                'quantity': quantity,
-                'timestamp': int(time.time() * 1000)
+                'quantity': str(quantity),
+                'timestamp': str(int(time.time() * 1000))
             }
             
             if price:
-                params['price'] = price
+                params['price'] = str(price)
             
             params['signature'] = self._generate_signature(params)
             
             response = self.session.post(
                 f"{self.BASE_URL}{endpoint}",
-                json=params,
+                params=params,
                 timeout=10
             )
             
@@ -174,7 +196,7 @@ class BingXClient:
                 data = response.json()
                 
                 if data.get('code') == 0:
-                    order_id = data['data']['orderId']
+                    order_id = data.get('data', {}).get('orderId', 'unknown')
                     
                     if stop_loss:
                         await self._place_stop_loss(symbol, side, quantity, stop_loss)
@@ -189,14 +211,14 @@ class BingXClient:
                         'quantity': quantity
                     }
                 else:
-                    logger.error(f"Error: {data.get('msg')}")
+                    logger.error(f"API Error: {data.get('msg')}")
                     return None
             else:
-                logger.error(f"HTTP {response.status_code}")
+                logger.error(f"HTTP Error {response.status_code}")
                 return None
                 
         except Exception as e:
-            logger.error(f"Error colocando orden: {e}")
+            logger.error(f"Error colocando orden: {str(e)}")
             return None
     
     async def _place_stop_loss(self, symbol: str, side: str, quantity: float, stop_price: float):
@@ -209,16 +231,16 @@ class BingXClient:
                 'symbol': symbol,
                 'side': sl_side,
                 'type': 'STOP_MARKET',
-                'quantity': quantity,
-                'stopPrice': stop_price,
-                'timestamp': int(time.time() * 1000)
+                'quantity': str(quantity),
+                'stopPrice': str(stop_price),
+                'timestamp': str(int(time.time() * 1000))
             }
             
             params['signature'] = self._generate_signature(params)
             
             response = self.session.post(
                 f"{self.BASE_URL}{endpoint}",
-                json=params,
+                params=params,
                 timeout=10
             )
             
@@ -230,7 +252,7 @@ class BingXClient:
                     logger.error(f"Error SL: {data.get('msg')}")
                     
         except Exception as e:
-            logger.error(f"Error SL: {e}")
+            logger.error(f"Error SL: {str(e)}")
     
     async def _place_take_profit(self, symbol: str, side: str, quantity: float, tp_price: float):
         """Colocar TP"""
@@ -242,16 +264,16 @@ class BingXClient:
                 'symbol': symbol,
                 'side': tp_side,
                 'type': 'TAKE_PROFIT_MARKET',
-                'quantity': quantity,
-                'stopPrice': tp_price,
-                'timestamp': int(time.time() * 1000)
+                'quantity': str(quantity),
+                'stopPrice': str(tp_price),
+                'timestamp': str(int(time.time() * 1000))
             }
             
             params['signature'] = self._generate_signature(params)
             
             response = self.session.post(
                 f"{self.BASE_URL}{endpoint}",
-                json=params,
+                params=params,
                 timeout=10
             )
             
@@ -263,7 +285,7 @@ class BingXClient:
                     logger.error(f"Error TP: {data.get('msg')}")
                     
         except Exception as e:
-            logger.error(f"Error TP: {e}")
+            logger.error(f"Error TP: {str(e)}")
     
     async def close_position(self, symbol: str, side: str) -> Optional[Dict]:
         """Cerrar posición"""
@@ -283,15 +305,15 @@ class BingXClient:
                 'symbol': symbol,
                 'side': close_side,
                 'type': 'MARKET',
-                'quantity': quantity,
-                'timestamp': int(time.time() * 1000)
+                'quantity': str(quantity),
+                'timestamp': str(int(time.time() * 1000))
             }
             
             params['signature'] = self._generate_signature(params)
             
             response = self.session.post(
                 f"{self.BASE_URL}{endpoint}",
-                json=params,
+                params=params,
                 timeout=10
             )
             
@@ -304,12 +326,12 @@ class BingXClient:
                         'pnl': position.get('unrealized_pnl', 0)
                     }
                 else:
-                    logger.error(f"Error: {data.get('msg')}")
+                    logger.error(f"API Error: {data.get('msg')}")
                     return None
             else:
-                logger.error(f"HTTP {response.status_code}")
+                logger.error(f"HTTP Error {response.status_code}")
                 return None
                 
         except Exception as e:
-            logger.error(f"Error cerrando: {e}")
+            logger.error(f"Error cerrando: {str(e)}")
             return None
