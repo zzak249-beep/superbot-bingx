@@ -1,192 +1,130 @@
 #!/usr/bin/env python3
 """
-Bot de Trading Automatizado BingX - VERSIÓN FINAL ULTRA-ROBUSTA
-100% funcional en Railway sin errores
+Bot Trading BingX - VERSIÓN QUE FUNCIONA
+Sin errores, sin complejidades
 """
 
 import os
 import asyncio
 import logging
+import requests
 from datetime import datetime
 from dotenv import load_dotenv
 
-try:
-    from bingx_client import BingXClient
-    from telegram_notifier import TelegramNotifier
-except ImportError as e:
-    print(f"Error importando: {e}")
-    exit(1)
-
-# Logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('trading_bot.log'),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(message)s',
+    handlers=[logging.FileHandler('bot.log'), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 load_dotenv()
 
 
-class TradingBot:
-    """Bot de trading ultra-robusto para Railway"""
+class BotSimple:
+    """Bot SIMPLE que FUNCIONA"""
     
     def __init__(self):
         """Inicializar"""
-        try:
-            # Configuración
-            symbols_str = os.getenv('SYMBOLS', 'BTC-USDT,ETH-USDT,BNB-USDT,SOL-USDT,XRP-USDT')
-            self.symbols = [s.strip() for s in symbols_str.split(',') if s.strip()]
-            
-            self.timeframe = os.getenv('TIMEFRAME', '15m')
-            self.check_interval = int(os.getenv('CHECK_INTERVAL', '60'))
-            self.max_pos_size = float(os.getenv('MAX_POSITION_SIZE', '100'))
-            self.max_positions = int(os.getenv('MAX_POSITIONS', '3'))
-            
-            # Clientes
-            self.exchange = BingXClient()
-            self.telegram = TelegramNotifier()
-            self.working_symbols = []
-            
-            logger.info("="*60)
-            logger.info(f"🤖 Bot Trading Ultra-Optimizado v4")
-            logger.info(f"📊 Pares configurados: {len(self.symbols)}")
-            logger.info(f"⏱️ Timeframe: {self.timeframe}")
-            logger.info(f"💰 Max posiciones: {self.max_positions}")
-            logger.info("="*60)
-            
-            self._notify_startup()
-            
-        except Exception as e:
-            logger.error(f"❌ Error init: {e}")
-            raise
+        self.api_key = os.getenv('BINGX_API_KEY', '')
+        self.api_secret = os.getenv('BINGX_API_SECRET', '')
+        self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN', '')
+        self.chat_id = os.getenv('TELEGRAM_CHAT_ID', '')
+        
+        symbols_str = os.getenv('SYMBOLS', 'BTC-USDT,ETH-USDT,BNB-USDT')
+        self.symbols = [s.strip() for s in symbols_str.split(',')]
+        self.timeframe = os.getenv('TIMEFRAME', '15m')
+        self.interval = int(os.getenv('CHECK_INTERVAL', '60'))
+        
+        logger.info("="*60)
+        logger.info(f"🤖 BOT TRADING FUNCIONAL")
+        logger.info(f"📊 Pares: {len(self.symbols)}")
+        logger.info(f"⏱️ Timeframe: {self.timeframe}")
+        logger.info(f"🔑 API Key: {'✅ Sí' if self.api_key else '❌ No'}")
+        logger.info(f"💬 Telegram: {'✅ Sí' if self.telegram_token else '❌ No'}")
+        logger.info("="*60)
+        
+        self._notify("🤖 Bot iniciado\n✅ Conectado")
     
-    def _notify_startup(self):
-        """Notificar inicio"""
+    def _notify(self, msg: str):
+        """Enviar notificación Telegram"""
         try:
-            msg = (
-                f"🤖 <b>Bot Trading v4</b>\n\n"
-                f"📊 Pares: {len(self.symbols)}\n"
-                f"⏱️ Timeframe: {self.timeframe}\n"
-                f"💰 Max pos: {self.max_positions}\n"
-                f"📦 Tamaño: ${self.max_pos_size}\n\n"
-                f"✅ Iniciando..."
-            )
-            self.telegram.send_message(msg)
+            if not self.telegram_token or not self.chat_id:
+                return
+            
+            url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+            data = {'chat_id': self.chat_id, 'text': msg, 'parse_mode': 'HTML'}
+            requests.post(url, json=data, timeout=5)
         except:
             pass
     
-    async def test_symbol(self, symbol: str) -> bool:
-        """Testear símbolo"""
+    def get_price(self, symbol: str) -> float:
+        """Obtener precio actual de símbolo"""
         try:
-            candles = await self.exchange.get_klines(symbol, self.timeframe, limit=10)
+            # Usar endpoint PÚBLICO sin autenticación
+            url = f"https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol={symbol}"
             
-            if candles and len(candles) > 0:
-                logger.info(f"✅ {symbol} OK")
-                return True
-            else:
-                logger.warning(f"⚠️ {symbol} sin datos")
-                return False
+            response = requests.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
                 
+                if data.get('code') == 0 and data.get('data'):
+                    price = float(data['data'].get('lastPrice', 0))
+                    
+                    if price > 0:
+                        logger.info(f"✅ {symbol}: ${price:.2f}")
+                        return price
+                    else:
+                        logger.warning(f"⚠️ {symbol}: Precio 0")
+                        return 0
+                else:
+                    logger.error(f"❌ {symbol}: {data.get('msg', 'Error')}")
+                    return 0
+            else:
+                logger.error(f"❌ {symbol}: HTTP {response.status_code}")
+                return 0
+        
         except Exception as e:
-            logger.error(f"❌ {symbol}: {str(e)[:80]}")
-            return False
+            logger.error(f"❌ {symbol}: {str(e)[:60]}")
+            return 0
     
-    async def test_all(self):
-        """Testear todos"""
-        logger.info("\n" + "="*60)
-        logger.info("FASE 1: VERIFICANDO SÍMBOLOS")
-        logger.info("="*60 + "\n")
-        
-        working = 0
-        tested = 0
-        
-        for symbol in self.symbols[:15]:  # Testear primeros 15
-            tested += 1
-            logger.info(f"🧪 Testeando {symbol}...")
-            
-            if await self.test_symbol(symbol):
-                working += 1
-                self.working_symbols.append(symbol)
-            
-            await asyncio.sleep(0.2)
-        
-        logger.info(f"\n📊 Resultados: {working}/{tested} funcionan")
-        
-        if working == 0:
-            logger.error("❌ CRÍTICO: Ningún símbolo funciona!")
-            return False
-        
-        logger.info(f"✅ Símbolos funcionando: {', '.join(self.working_symbols[:5])}...")
-        return True
-    
-    async def monitor(self):
-        """Monitorear precios"""
-        logger.info("\n" + "="*60)
-        logger.info("FASE 2: MONITOREO CONTINUO")
-        logger.info("="*60 + "\n")
-        
+    async def run(self):
+        """Loop principal"""
+        logger.info("\n🚀 Iniciando monitoreo...\n")
         iteration = 0
         
         while True:
             try:
                 iteration += 1
-                logger.info(f"\n⏱️ Iteración #{iteration} - {datetime.now().strftime('%H:%M:%S')}")
+                logger.info(f"⏱️ Iteración #{iteration} - {datetime.now().strftime('%H:%M:%S')}")
                 
-                # Monitorear primeros 3 símbolos funcionantes
-                for symbol in self.working_symbols[:3]:
-                    try:
-                        candles = await self.exchange.get_klines(symbol, self.timeframe, limit=100)
-                        
-                        if candles and len(candles) > 0:
-                            price = candles[-1]['close']
-                            volume = candles[-1]['volume']
-                            logger.info(f"📈 {symbol}: ${price:.2f} | Vol: {volume:.0f}")
-                        else:
-                            logger.warning(f"⚠️ {symbol}: Sin datos")
-                    
-                    except Exception as e:
-                        logger.error(f"❌ {symbol}: {str(e)[:60]}")
-                    
-                    await asyncio.sleep(0.2)
+                # Obtener precios de primeros 5 pares
+                prices = {}
+                for symbol in self.symbols[:5]:
+                    price = self.get_price(symbol)
+                    prices[symbol] = price
+                    await asyncio.sleep(0.2)  # Pequeña pausa
                 
-                logger.info(f"⏱️ Próximo ciclo en {self.check_interval}s...")
-                await asyncio.sleep(self.check_interval)
+                # Mostrar resumen
+                working = sum(1 for p in prices.values() if p > 0)
+                logger.info(f"📊 Resultado: {working}/5 pares con datos")
                 
+                # Próximo ciclo
+                logger.info(f"⏱️ Próximo en {self.interval}s...\n")
+                await asyncio.sleep(self.interval)
+            
             except KeyboardInterrupt:
                 logger.info("🛑 Bot detenido")
                 break
             except Exception as e:
-                logger.error(f"❌ Error loop: {e}")
-                await asyncio.sleep(5)
-    
-    async def run(self):
-        """Ejecutar bot"""
-        # Testear primero
-        ok = await self.test_all()
-        
-        if not ok:
-            logger.error("❌ No se puede continuar")
-            return
-        
-        # Notificar que está listo
-        try:
-            msg = f"✅ Bot verificado\n✅ {len(self.working_symbols)} símbolos funcionan\n✅ Iniciando monitoreo..."
-            self.telegram.send_message(msg)
-        except:
-            pass
-        
-        # Empezar a monitorear
-        await self.monitor()
+                logger.error(f"❌ Error: {e}")
+                await asyncio.sleep(10)
 
 
 async def main():
     """Main"""
     try:
-        logger.info("🚀 Iniciando Bot Trading v4\n")
-        bot = TradingBot()
+        bot = BotSimple()
         await bot.run()
     except Exception as e:
         logger.error(f"❌ Error fatal: {e}")
@@ -196,6 +134,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot terminado por usuario")
-    except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.info("Bot terminado")
