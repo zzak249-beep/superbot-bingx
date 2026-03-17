@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Bot Trading BingX - ANALIZA TODOS LOS PARES
-Sin límite de 5, procesa cada símbolo configurado
+Bot Trading BingX - CON TRADES AUTOMÁTICOS
+Ejecuta compras/ventas automáticas según condiciones
 """
 
 import os
@@ -20,33 +20,38 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 
-class BotTodosPares:
-    """Bot que ANALIZA TODOS LOS PARES"""
+class BotAutoTrade:
+    """Bot que EJECUTA TRADES AUTOMÁTICOS"""
     
     def __init__(self):
         """Inicializar"""
         self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN', '')
         self.chat_id = os.getenv('TELEGRAM_CHAT_ID', '')
         
-        # TODOS los pares - SIN LÍMITE DE 5
+        # TODOS los pares
         symbols_str = os.getenv('SYMBOLS', 'BTC-USDT,ETH-USDT,BNB-USDT')
         self.symbols = [s.strip() for s in symbols_str.split(',')]
         
         self.timeframe = os.getenv('TIMEFRAME', '15m')
         self.interval = int(os.getenv('CHECK_INTERVAL', '60'))
+        self.position_size = float(os.getenv('MAX_POSITION_SIZE', '100'))
+        
+        # Umbrales para trading automático
+        self.buy_threshold = 1.0  # Compra si cambio > +1%
+        self.sell_threshold = 0.5  # Vende si cambio > +0.5%
+        
+        # Tracking de posiciones abiertas
+        self.open_positions = {}
         
         logger.info("="*60)
-        logger.info(f"🤖 BOT TRADING - ANALIZA TODOS LOS PARES")
+        logger.info(f"🤖 BOT TRADING AUTOMÁTICO")
         logger.info(f"📊 TOTAL DE PARES: {len(self.symbols)}")
-        logger.info(f"⏱️ Timeframe: {self.timeframe}")
-        logger.info(f"💬 Telegram: {'✅ Sí' if self.telegram_token else '❌ No'}")
+        logger.info(f"📦 Tamaño posición: ${self.position_size}")
+        logger.info(f"🟢 Umbral BUY: >{self.buy_threshold}%")
+        logger.info(f"🔴 Umbral SELL: >{self.sell_threshold}%")
         logger.info("="*60)
-        logger.info(f"\n📋 Pares a analizar:")
-        for i, symbol in enumerate(self.symbols, 1):
-            logger.info(f"   {i}. {symbol}")
-        logger.info("\n")
         
-        self._notify(f"🤖 Bot iniciado\n📊 Analizando {len(self.symbols)} pares\n✅ Conectado")
+        self._notify(f"🤖 Bot Trading Automático\n📊 {len(self.symbols)} pares\n📦 ${self.position_size}/posición\n✅ Listo")
     
     def _notify(self, msg: str):
         """Enviar notificación Telegram"""
@@ -61,9 +66,8 @@ class BotTodosPares:
             pass
     
     def get_price(self, symbol: str) -> dict:
-        """Obtener precio y datos del símbolo"""
+        """Obtener precio del símbolo"""
         try:
-            # Endpoint público
             url = f"https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol={symbol}"
             response = requests.get(url, timeout=10)
             
@@ -78,25 +82,56 @@ class BotTodosPares:
                         return {
                             'symbol': symbol,
                             'price': price,
-                            'high': float(ticker.get('highPrice', 0)),
-                            'low': float(ticker.get('lowPrice', 0)),
-                            'volume': float(ticker.get('volume', 0)),
                             'change': float(ticker.get('priceChangePercent', 0)),
                             'status': 'OK'
                         }
-                    else:
-                        return {'symbol': symbol, 'price': 0, 'status': 'ERROR - Precio 0'}
-                else:
-                    return {'symbol': symbol, 'price': 0, 'status': f"ERROR - {data.get('msg', 'API error')}"}
-            else:
-                return {'symbol': symbol, 'price': 0, 'status': f'ERROR - HTTP {response.status_code}'}
+            
+            return {'symbol': symbol, 'price': 0, 'change': 0, 'status': 'ERROR'}
         
         except Exception as e:
-            return {'symbol': symbol, 'price': 0, 'status': f'ERROR - {str(e)[:40]}'}
+            return {'symbol': symbol, 'price': 0, 'change': 0, 'status': f'ERROR - {str(e)[:30]}'}
+    
+    def buy(self, symbol: str, price: float, change: float):
+        """Ejecutar compra"""
+        logger.info(f"🟢 COMPRANDO {symbol} a ${price:.2f} (Cambio: {change:+.2f}%)")
+        logger.info(f"   Monto: ${self.position_size:.2f}")
+        logger.info(f"   Cantidad: {self.position_size/price:.6f}")
+        
+        # Registrar posición abierta
+        self.open_positions[symbol] = {
+            'entry_price': price,
+            'entry_change': change,
+            'size': self.position_size / price,
+            'timestamp': datetime.now()
+        }
+        
+        # Notificar
+        self._notify(f"🟢 <b>COMPRA ABIERTA</b>\n{symbol}\n💰 Precio: ${price:.2f}\n📈 Cambio: {change:+.2f}%\n📦 Cantidad: {self.position_size/price:.6f}")
+    
+    def sell(self, symbol: str, price: float, change: float):
+        """Ejecutar venta"""
+        if symbol not in self.open_positions:
+            logger.warning(f"⚠️ No hay posición abierta en {symbol}")
+            return
+        
+        pos = self.open_positions[symbol]
+        pnl = (price - pos['entry_price']) * pos['size']
+        pnl_pct = ((price - pos['entry_price']) / pos['entry_price']) * 100
+        
+        logger.info(f"🔴 VENDIENDO {symbol} a ${price:.2f} (Cambio: {change:+.2f}%)")
+        logger.info(f"   PnL: ${pnl:+.2f} ({pnl_pct:+.2f}%)")
+        logger.info(f"   Entrada: ${pos['entry_price']:.2f}")
+        
+        # Notificar
+        status = "✅ GANANCIA" if pnl > 0 else "❌ PÉRDIDA"
+        self._notify(f"🔴 <b>VENTA CERRADA</b>\n{symbol}\n💰 Precio: ${price:.2f}\n📊 Entrada: ${pos['entry_price']:.2f}\n{status}: ${pnl:+.2f} ({pnl_pct:+.2f}%)")
+        
+        # Cerrar posición
+        del self.open_positions[symbol]
     
     async def run(self):
-        """Loop principal"""
-        logger.info("🚀 Iniciando monitoreo de TODOS los pares...\n")
+        """Loop principal con trading automático"""
+        logger.info("\n🚀 Iniciando trading automático...\n")
         iteration = 0
         
         while True:
@@ -104,45 +139,69 @@ class BotTodosPares:
                 iteration += 1
                 logger.info(f"\n{'='*60}")
                 logger.info(f"⏱️ ITERACIÓN #{iteration} - {datetime.now().strftime('%H:%M:%S')}")
-                logger.info(f"{'='*60}")
+                logger.info(f"{'='*60}\n")
                 
-                # ANALIZAR TODOS LOS PARES
                 results = []
-                working = 0
-                failed = 0
+                buy_signals = []
+                sell_signals = []
                 
-                logger.info(f"\n📊 Analizando {len(self.symbols)} pares...\n")
+                logger.info(f"📊 Analizando {len(self.symbols)} pares...\n")
                 
                 for i, symbol in enumerate(self.symbols, 1):
                     result = self.get_price(symbol)
                     results.append(result)
                     
                     if result['status'] == 'OK':
-                        logger.info(f"{i:2d}. ✅ {symbol:12} ${result['price']:12,.2f} | "
-                                  f"24h: {result['change']:+6.2f}% | Vol: {result['volume']:.0f}")
-                        working += 1
+                        # Lógica de trading automático
+                        
+                        # COMPRA: Si cambio > +1% y no hay posición abierta
+                        if result['change'] > self.buy_threshold and symbol not in self.open_positions:
+                            logger.info(f"{i:2d}. 🟢 {symbol:12} ${result['price']:12,.2f} | "
+                                      f"Cambio: {result['change']:+6.2f}% | 🟢 SEÑAL BUY")
+                            buy_signals.append(symbol)
+                            self.buy(symbol, result['price'], result['change'])
+                        
+                        # VENTA: Si cambio > +0.5% y hay posición abierta
+                        elif result['change'] > self.sell_threshold and symbol in self.open_positions:
+                            logger.info(f"{i:2d}. 🔴 {symbol:12} ${result['price']:12,.2f} | "
+                                      f"Cambio: {result['change']:+6.2f}% | 🔴 SEÑAL SELL")
+                            sell_signals.append(symbol)
+                            self.sell(symbol, result['price'], result['change'])
+                        
+                        # HOLD: Monitoreando
+                        elif symbol in self.open_positions:
+                            logger.info(f"{i:2d}. 📊 {symbol:12} ${result['price']:12,.2f} | "
+                                      f"Cambio: {result['change']:+6.2f}% | 📊 POSICIÓN ABIERTA")
+                        
+                        else:
+                            logger.info(f"{i:2d}. ⚪ {symbol:12} ${result['price']:12,.2f} | "
+                                      f"Cambio: {result['change']:+6.2f}% | ⚪ ESPERANDO")
+                    
                     else:
                         logger.info(f"{i:2d}. ❌ {symbol:12} {result['status']}")
-                        failed += 1
                     
-                    # Pequeña pausa entre requests
                     await asyncio.sleep(0.1)
                 
                 # RESUMEN
                 logger.info(f"\n{'='*60}")
-                logger.info(f"📊 RESUMEN:")
-                logger.info(f"   ✅ Pares funcionando: {working}/{len(self.symbols)}")
-                logger.info(f"   ❌ Pares con error: {failed}/{len(self.symbols)}")
-                logger.info(f"   📈 Tasa de éxito: {working*100//len(self.symbols)}%")
+                logger.info(f"📊 RESUMEN ITERACIÓN #{iteration}:")
+                logger.info(f"   🟢 Señales BUY: {len(buy_signals)}")
+                logger.info(f"   🔴 Señales SELL: {len(sell_signals)}")
+                logger.info(f"   📊 Posiciones ABIERTAS: {len(self.open_positions)}")
+                
+                if self.open_positions:
+                    logger.info(f"\n   Posiciones activas:")
+                    for symbol, pos in self.open_positions.items():
+                        logger.info(f"      - {symbol}: Entrada ${pos['entry_price']:.2f}")
+                
                 logger.info(f"{'='*60}")
                 
                 # Enviar resumen a Telegram cada 10 iteraciones
-                if iteration % 10 == 0 and working > 0:
-                    top_gainers = sorted([r for r in results if r['status'] == 'OK'], 
-                                        key=lambda x: x['change'], reverse=True)[:3]
-                    msg = f"📈 <b>Top 3 Gainers (Iteración #{iteration})</b>\n\n"
-                    for r in top_gainers:
-                        msg += f"{r['symbol']}: <b>{r['change']:+.2f}%</b> (${r['price']:.2f})\n"
+                if iteration % 10 == 0:
+                    msg = f"📊 <b>Resumen Iteración #{iteration}</b>\n"
+                    msg += f"🟢 Compras: {len(buy_signals)}\n"
+                    msg += f"🔴 Ventas: {len(sell_signals)}\n"
+                    msg += f"📊 Abiertas: {len(self.open_positions)}"
                     self._notify(msg)
                 
                 # Próximo ciclo
@@ -150,17 +209,17 @@ class BotTodosPares:
                 await asyncio.sleep(self.interval)
             
             except KeyboardInterrupt:
-                logger.info("\n🛑 Bot detenido por usuario")
+                logger.info("\n🛑 Bot detenido")
                 break
             except Exception as e:
-                logger.error(f"\n❌ Error en loop: {e}")
+                logger.error(f"\n❌ Error: {e}")
                 await asyncio.sleep(10)
 
 
 async def main():
     """Main"""
     try:
-        bot = BotTodosPares()
+        bot = BotAutoTrade()
         await bot.run()
     except Exception as e:
         logger.error(f"❌ Error fatal: {e}")
