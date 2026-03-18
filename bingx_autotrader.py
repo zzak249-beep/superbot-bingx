@@ -1,54 +1,67 @@
-import os, time, hmac, hashlib, requests, logging
-from urllib.parse import urlencode
+import os, asyncio, logging, requests
+from bingx_autotrader import BingXAutoTrader
+from dotenv import load_dotenv
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
+load_dotenv()
 
-class BingXAutoTrader:
+class BotProRentable:
     def __init__(self):
-        self.api_key = os.getenv('BINGX_API_KEY', '')
-        self.api_secret = os.getenv('BINGX_API_SECRET', '')
-        self.base_url = "https://open-api.bingx.com"
-        self.leverage = int(os.getenv('LEVERAGE', '5'))
+        self.symbols = ['BTC-USDT', 'ETH-USDT', 'SOL-USDT']
+        self.trader = BingXAutoTrader()
+        self.active_trades = {} # Diccionario para rastrear trades y sus SL
 
-    def _generate_signature(self, params):
-        query_string = urlencode(params)
-        return hmac.new(self.api_secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
+    async def manage_trailing_stop(self, symbol, current_price):
+        """Lógica de protección de ganancias"""
+        if symbol not in self.active_trades: return
 
-    def update_stop_loss(self, symbol, direction, new_sl):
-        """Mueve el Stop Loss para proteger ganancias (Trailing Stop)"""
-        symbol_clean = symbol.replace("-", "")
-        endpoint = "/openApi/swap/v2/trade/order" # En V2 se usa el mismo endpoint para SL/TP
-        
-        params = {
-            "symbol": symbol_clean,
-            "type": "STOP_LOSS",
-            "side": "SELL" if direction == "LONG" else "BUY",
-            "stopPrice": round(new_sl, 4),
-            "timestamp": int(time.time() * 1000)
-        }
-        
-        params["signature"] = self._generate_signature(params)
-        try:
-            r = requests.post(f"{self.base_url}{endpoint}", params=params, headers={"X-BX-APIKEY": self.api_key})
-            return r.json().get("code") == 0
-        except:
-            return False
+        trade = self.active_trades[symbol]
+        entry = trade['entry']
+        direction = trade['direction']
+        last_sl = trade['sl']
 
-    def execute_trade(self, symbol, direction, price, sl):
-        """Ejecuta orden inicial"""
-        symbol_clean = symbol.replace("-", "")
-        margin = float(os.getenv('MAX_POSITION_SIZE', '10'))
-        quantity = (margin * self.leverage) / price
+        # Si es LONG y el precio subió 0.6% desde la entrada
+        if direction == "LONG":
+            if current_price > entry * 1.006 and last_sl < entry:
+                # Mover SL al precio de entrada + pequeña comisión (Break-even)
+                new_sl = entry * 1.001 
+                if self.trader.update_stop_loss(symbol, direction, new_sl):
+                    logger.info(f"🛡️ BREAK-EVEN ACTIVADO para {symbol}")
+                    self.active_trades[symbol]['sl'] = new_sl
 
-        params = {
-            "symbol": symbol_clean,
-            "side": "BUY" if direction == "LONG" else "SELL",
-            "positionSide": "LONG" if direction == "LONG" else "SHORT",
-            "type": "MARKET",
-            "quantity": round(quantity, 4),
-            "timestamp": int(time.time() * 1000)
-        }
-        
-        params["signature"] = self._generate_signature(params)
-        r = requests.post(f"{self.base_url}/openApi/swap/v2/trade/order", params=params, headers={"X-BX-APIKEY": self.api_key})
-        return r.json().get("code") == 0
+        # Si es SHORT y el precio bajó 0.6%
+        elif direction == "SHORT":
+            if current_price < entry * 0.994 and last_sl > entry:
+                new_sl = entry * 0.999
+                if self.trader.update_stop_loss(symbol, direction, new_sl):
+                    logger.info(f"🛡️ BREAK-EVEN ACTIVADO para {symbol}")
+                    self.active_trades[symbol]['sl'] = new_sl
+
+    async def run(self):
+        logger.info("🚀 Bot v4.0 con Trailing Stop activado")
+        while True:
+            for symbol in self.symbols:
+                # 1. Obtener precio actual
+                price_url = f"https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol={symbol.replace('-','')}"
+                try:
+                    current_price = float(requests.get(price_url).json()['data']['lastPrice'])
+                    
+                    # 2. Gestionar Trailing Stop de posiciones existentes
+                    await self.manage_trailing_stop(symbol, current_price)
+
+                    # 3. Buscar nuevas entradas (Solo si no hay trade activo en ese par)
+                    if symbol not in self.active_trades:
+                        # ... aquí iría tu lógica de análisis (EMA, RSI, etc) ...
+                        # Ejemplo: Si hay señal:
+                        # success = self.trader.execute_trade(symbol, direction, current_price, sl_inicial)
+                        # if success: self.active_trades[symbol] = {'entry': current_price, 'direction': direction, 'sl': sl_inicial}
+                        pass
+
+                except Exception as e:
+                    logger.error(f"Error en ciclo: {e}")
+            
+            await asyncio.sleep(30) # Revisar cada 30 seg para ser más reactivo
+
+if __name__ == "__main__":
+    asyncio.run(BotProRentable().run())
