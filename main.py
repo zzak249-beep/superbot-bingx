@@ -1,135 +1,383 @@
 #!/usr/bin/env python3
+"""
+Bot con AUTO-TRADING REAL - VERSIÓN CORREGIDA
+Ejecuta trades automáticamente en BingX con formato de API correcto
+"""
+
 import os
 import asyncio
 import logging
 import requests
-import json
+import hmac
+import hashlib
+import time
 from datetime import datetime
-from pathlib import Path
+from urllib.parse import urlencode
 from dotenv import load_dotenv
 
-# IMPORTACIÓN DEL MÓDULO BINGX
-try:
-    from bingx_autotrader import BingXAutoTrader
-except ImportError:
-    print("❌ ERROR: No se encontró bingx_autotrader.py. Asegúrate de que el archivo existe.")
-
-# Configuración de Logs
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(message)s',
-    handlers=[logging.FileHandler('bot_ejecucion.log'), logging.StreamHandler()]
+    handlers=[logging.FileHandler('bot.log'), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 load_dotenv()
 
-class MasterBot:
+
+class AutoTraderReal:
+    """Auto-Trader que REALMENTE ejecuta trades en BingX - FORMATO CORRECTO"""
+    
     def __init__(self):
-        # Símbolos con guion (necesario para la API de consulta de precio de BingX)
-        self.symbols = ['BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'AVAX-USDT', 'LINK-USDT']
+        """Inicializar"""
+        self.symbols = [
+            'BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'MATIC-USDT', 'AVAX-USDT',
+            'DOGE-USDT', 'ADA-USDT', 'XRP-USDT', 'DOT-USDT', 'LINK-USDT'
+        ]
         
-        # Cargar configuración desde Railway
-        self.auto_trading = os.getenv('AUTO_TRADING_ENABLED', 'false').lower() == 'true'
-        self.interval = int(os.getenv('CHECK_INTERVAL', '60'))
+        # TELEGRAM
         self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN', '')
         self.chat_id = os.getenv('TELEGRAM_CHAT_ID', '')
         
-        # Inicializar Trader y Stats
-        self.trader = BingXAutoTrader() if self.auto_trading else None
-        self.active_trades = {} # Diccionario para rastrear trades y aplicar Trailing Stop
+        # BINGX API
+        self.bingx_api_key = os.getenv('BINGX_API_KEY', '')
+        self.bingx_api_secret = os.getenv('BINGX_API_SECRET', '')
+        self.base_url = "https://open-api.bingx.com"
         
-        logger.info(f"🚀 MASTER BOT INICIADO | Auto-Trading: {self.auto_trading}")
-
-    def _notify(self, msg):
-        """Envía notificaciones a Telegram si está configurado"""
-        if not self.telegram_token or not self.chat_id: return
+        # PARAMETROS DE TRADING
+        self.position_size = float(os.getenv('MAX_POSITION_SIZE', '100'))
+        self.leverage = int(os.getenv('LEVERAGE', '2'))
+        self.interval = int(os.getenv('CHECK_INTERVAL', '180'))
+        self.buy_threshold = 0.8
+        
+        # AUTO-TRADING ACTIVADO?
+        self.auto_trading = os.getenv('AUTO_TRADING_ENABLED', 'false').lower() == 'true'
+        
+        self.stats = {
+            'signals_generated': 0,
+            'trades_executed': 0,
+            'trades_success': 0,
+            'trades_failed': 0,
+            'total_pnl': 0.0
+        }
+        
+        self.open_trades = {}
+        
+        logger.info("="*80)
+        logger.info("🤖 BOT CON AUTO-TRADING REAL - FORMATO CORRECTO")
+        if self.auto_trading:
+            logger.info("✅ AUTO-TRADING ACTIVADO - EJECUTARÁ TRADES REALES")
+        else:
+            logger.info("⏹️ AUTO-TRADING DESACTIVADO - Solo señales")
+        logger.info(f"📊 Pares: {len(self.symbols)}")
+        logger.info(f"💰 Position Size: ${self.position_size}")
+        logger.info(f"⚡ Leverage: {self.leverage}x")
+        logger.info(f"⏱️ Intervalo: {self.interval}s")
+        logger.info("="*80)
+        
+        # Verificar credenciales
+        self._verify_credentials()
+        
+        # Verificar balance
+        self._check_balance()
+        
+        self._notify("🤖 Bot con Auto-Trading iniciado (Formato Corregido)\n" + 
+                    ("✅ AUTO-TRADING ACTIVADO" if self.auto_trading else "⏹️ Solo señales"))
+    
+    def _verify_credentials(self):
+        """Verificar credenciales de BingX"""
+        logger.info("\n🔐 VERIFICANDO CREDENCIALES:")
+        
+        if not self.bingx_api_key:
+            logger.error("❌ BINGX_API_KEY no configurada")
+        else:
+            logger.info(f"✅ API Key: {self.bingx_api_key[:10]}...***")
+        
+        if not self.bingx_api_secret:
+            logger.error("❌ BINGX_API_SECRET no configurada")
+        else:
+            logger.info(f"✅ API Secret: ***configurada***")
+        
+        if self.auto_trading and (not self.bingx_api_key or not self.bingx_api_secret):
+            logger.error("\n⚠️ AUTO-TRADING DESACTIVADO - Faltan credenciales BingX")
+            self.auto_trading = False
+    
+    def _check_balance(self):
+        """Verificar balance en BingX"""
+        if not self.auto_trading:
+            return
+        
         try:
-            url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-            requests.post(url, json={'chat_id': self.chat_id, 'text': msg, 'parse_mode': 'HTML'}, timeout=5)
+            timestamp = int(time.time() * 1000)
+            params = {'timestamp': timestamp}
+            
+            # Firmar petición
+            query_string = urlencode(params)
+            signature = hmac.new(
+                self.bingx_api_secret.encode(),
+                query_string.encode(),
+                hashlib.sha256
+            ).hexdigest()
+            
+            params['signature'] = signature
+            
+            url = f"{self.base_url}/openApi/swap/v2/user/balance"
+            headers = {'X-BX-APIKEY': self.bingx_api_key}
+            
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('code') == 0:
+                    balance_data = data.get('data', {}).get('balance', {})
+                    usdt_balance = balance_data.get('balance', 0) if isinstance(balance_data, dict) else 0
+                    logger.info(f"💰 Balance USDT en BingX: ${usdt_balance:.2f}")
+                else:
+                    logger.warning(f"⚠️ Error obteniendo balance: {data.get('msg')}")
+            else:
+                logger.warning(f"⚠️ Error HTTP: {response.status_code}")
+        
         except Exception as e:
-            logger.error(f"Error Telegram: {e}")
-
-    def get_market_data(self, symbol):
-        """Obtiene precio y cambio porcentual usando el formato con guion"""
+            logger.error(f"❌ Error verificando balance: {e}")
+    
+    def _execute_trade(self, symbol, direction, price, quantity):
+        """Ejecutar trade real en BingX - FORMATO CORRECTO"""
+        if not self.auto_trading or not self.bingx_api_key:
+            logger.warning(f"⚠️ Auto-trading desactivado - No ejecuta {direction} en {symbol}")
+            return False
+        
+        try:
+            timestamp = int(time.time() * 1000)
+            
+            # Parámetros en formato correcto (query string, no JSON)
+            params = {
+                'symbol': symbol,
+                'side': 'BUY' if direction == 'LONG' else 'SELL',
+                'positionSide': direction,
+                'type': 'MARKET',
+                'quantity': str(quantity),
+                'timestamp': timestamp
+            }
+            
+            # Firmar con query string (NO con JSON)
+            query_string = urlencode(params)
+            signature = hmac.new(
+                self.bingx_api_secret.encode(),
+                query_string.encode(),
+                hashlib.sha256
+            ).hexdigest()
+            
+            params['signature'] = signature
+            
+            url = f"{self.base_url}/openApi/swap/v2/trade/order"
+            headers = {
+                'X-BX-APIKEY': self.bingx_api_key,
+                'Content-Type': 'application/x-www-form-urlencoded'
+            }
+            
+            # Enviar como query string, NO como JSON
+            response = requests.post(url, params=params, headers=headers, timeout=10)
+            
+            logger.info(f"→ Status Code: {response.status_code}")
+            logger.info(f"→ Respuesta: {response.text}")
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('code') == 0:
+                    order_data = data.get('data', {})
+                    order_id = order_data.get('order', {}).get('orderId', 'N/A')
+                    
+                    logger.info(f"✅ TRADE EJECUTADO")
+                    logger.info(f"   {direction}: {symbol} @ ${price:.4f}")
+                    logger.info(f"   Cantidad: {quantity:.4f}")
+                    logger.info(f"   Order ID: {order_id}")
+                    
+                    self.stats['trades_executed'] += 1
+                    self.stats['trades_success'] += 1
+                    
+                    # Registrar trade
+                    self.open_trades[symbol] = {
+                        'direction': direction,
+                        'entry_price': price,
+                        'quantity': quantity,
+                        'order_id': order_id,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    
+                    msg = f"✅ <b>TRADE EJECUTADO</b>\n"
+                    msg += f"{direction} {symbol}\n"
+                    msg += f"💰 Precio: ${price:.4f}\n"
+                    msg += f"📊 Cantidad: {quantity:.4f}\n"
+                    msg += f"📍 Order ID: {order_id}"
+                    self._notify(msg)
+                    
+                    return True
+                else:
+                    logger.error(f"❌ Error BingX: {data.get('msg')}")
+                    logger.error(f"   Código: {data.get('code')}")
+                    self.stats['trades_failed'] += 1
+                    return False
+            else:
+                logger.error(f"❌ Error HTTP: {response.status_code}")
+                logger.error(f"   Respuesta: {response.text}")
+                self.stats['trades_failed'] += 1
+                return False
+        
+        except Exception as e:
+            logger.error(f"❌ Error ejecutando trade: {e}")
+            self.stats['trades_failed'] += 1
+            return False
+    
+    def _notify(self, msg: str):
+        """Enviar Telegram"""
+        try:
+            if not self.telegram_token or not self.chat_id:
+                return
+            url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+            data = {'chat_id': self.chat_id, 'text': msg, 'parse_mode': 'HTML'}
+            requests.post(url, json=data, timeout=5)
+        except:
+            pass
+    
+    def get_price_data(self, symbol: str) -> dict:
+        """Obtener datos de precio"""
         try:
             url = f"https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol={symbol}"
-            r = requests.get(url, timeout=10).json()
-            if r.get('code') == 0:
-                data = r['data']
-                # Si es lista tomamos el primer elemento, si no el objeto directo
-                d = data[0] if isinstance(data, list) else data
-                return float(d['lastPrice']), float(d['priceChangePercent'])
-            return None, None
-        except:
-            return None, None
-
-    async def manage_trailing_stop(self, symbol, current_price):
-        """Mueve el Stop Loss a Break-even cuando ganamos un 0.6%"""
-        if symbol not in self.active_trades: return
-
-        trade = self.active_trades[symbol]
-        if trade.get('protected', False): return # Ya está protegido
-
-        entry = trade['entry']
-        direction = trade['direction']
-
-        # Si el precio se mueve a nuestro favor un 0.6%, protegemos entrada
-        move_to_be = False
-        if direction == "LONG" and current_price > entry * 1.006:
-            move_to_be = True
-        elif direction == "SHORT" and current_price < entry * 0.994:
-            move_to_be = True
-
-        if move_to_be and self.auto_trading:
-            # New SL es el precio de entrada (Break Even)
-            new_sl = entry * 1.001 if direction == "LONG" else entry * 0.999
-            success = self.trader.update_stop_loss(symbol, direction, new_sl)
-            if success:
-                self.active_trades[symbol]['protected'] = True
-                logger.info(f"🛡️ {symbol}: Stop Loss movido a BREAK-EVEN")
-                self._notify(f"🛡️ <b>{symbol} PROTEGIDO</b>\nStop Loss movido al precio de entrada.")
-
-    async def run(self):
-        iteration = 0
-        while True:
-            iteration += 1
-            logger.info(f"--- Ciclo de Análisis #{iteration} ---")
+            response = requests.get(url, timeout=10)
             
-            for symbol in self.symbols:
-                price, change = self.get_market_data(symbol)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('code') == 0 and data.get('data'):
+                    ticker = data['data']
+                    price = float(ticker.get('lastPrice', 0))
+                    
+                    if price > 0:
+                        return {
+                            'symbol': symbol,
+                            'price': price,
+                            'change': float(ticker.get('priceChangePercent', 0)),
+                            'status': 'OK'
+                        }
+            
+            return {'symbol': symbol, 'status': 'ERROR'}
+        except:
+            return {'symbol': symbol, 'status': 'ERROR'}
+    
+    def analyze_signal(self, symbol: str, data: dict) -> dict:
+        """Analizar señal"""
+        try:
+            change = data.get('change', 0)
+            price = data.get('price', 0)
+            
+            if change >= self.buy_threshold:
+                score = min(95, 50 + (change * 10))
+                return {'direction': 'LONG', 'score': score, 'change': change, 'price': price}
+            
+            elif change <= -self.buy_threshold:
+                score = min(95, 50 + (abs(change) * 10))
+                return {'direction': 'SHORT', 'score': score, 'change': change, 'price': price}
+            
+            else:
+                return {'direction': 'NEUTRAL', 'score': 0, 'change': change, 'price': price}
+        except:
+            return {'direction': 'NEUTRAL', 'score': 0, 'change': 0, 'price': 0}
+    
+    async def run(self):
+        """Loop principal"""
+        logger.info("\n🚀 Bot iniciado...\n")
+        iteration = 0
+        
+        while True:
+            try:
+                iteration += 1
+                logger.info(f"\n{'='*80}")
+                logger.info(f"⏱️ ITERACIÓN #{iteration} | {datetime.now().strftime('%H:%M:%S')}")
+                if self.auto_trading:
+                    logger.info(f"🤖 AUTO-TRADING: ACTIVADO ✅")
+                logger.info(f"{'='*80}\n")
                 
-                if price is None:
-                    logger.warning(f"⚠️ No se pudo obtener datos de {symbol}")
-                    continue
-
-                # 1. Gestionar trades abiertos (Trailing Stop)
-                await self.manage_trailing_stop(symbol, price)
-
-                # 2. Lógica de entrada si no hay trade activo
-                if symbol not in self.active_trades:
-                    direction = None
-                    # Estrategia: Ruptura de tendencia 1.8%
-                    if change > 1.8: direction = "LONG"
-                    elif change < -1.8: direction = "SHORT"
-
-                    if direction:
-                        logger.info(f"🎯 SEÑAL DETECTADA: {symbol} {direction} a {price}")
+                long_count = 0
+                short_count = 0
+                analyzed = 0
+                
+                for i, symbol in enumerate(self.symbols, 1):
+                    try:
+                        data = self.get_price_data(symbol)
                         
-                        if self.auto_trading:
-                            if self.trader.execute_trade(symbol, direction, price):
-                                self.active_trades[symbol] = {
-                                    'entry': price, 
-                                    'direction': direction,
-                                    'protected': False
-                                }
-                                emoji = "🟢" if direction == "LONG" else "🔴"
-                                self._notify(f"{emoji} <b>ORDEN EJECUTADA</b>\n<b>Par:</b> {symbol}\n<b>Tipo:</b> {direction}\n<b>Precio:</b> {price}")
+                        if data['status'] != 'OK':
+                            continue
+                        
+                        analyzed += 1
+                        signal = self.analyze_signal(symbol, data)
+                        
+                        if signal['direction'] == 'LONG':
+                            long_count += 1
+                            self.stats['signals_generated'] += 1
+                            
+                            logger.info(f"{i:2d}. 🟢 {symbol}: ${data['price']:.4f} | {signal['change']:+.2f}% | LONG")
+                            
+                            # EJECUTAR TRADE SI AUTO-TRADING ACTIVADO
+                            if self.auto_trading:
+                                quantity = self.position_size / data['price']
+                                self._execute_trade(symbol, 'LONG', data['price'], quantity)
+                            else:
+                                logger.info(f"     (Auto-trading desactivado - Sin ejecutar)")
+                        
+                        elif signal['direction'] == 'SHORT':
+                            short_count += 1
+                            self.stats['signals_generated'] += 1
+                            
+                            logger.info(f"{i:2d}. 🔴 {symbol}: ${data['price']:.4f} | {signal['change']:+.2f}% | SHORT")
+                            
+                            # EJECUTAR TRADE SI AUTO-TRADING ACTIVADO
+                            if self.auto_trading:
+                                quantity = self.position_size / data['price']
+                                self._execute_trade(symbol, 'SHORT', data['price'], quantity)
+                            else:
+                                logger.info(f"     (Auto-trading desactivado - Sin ejecutar)")
+                        
+                        else:
+                            logger.info(f"{i:2d}. ⚪ {symbol}: ${data['price']:.4f} | {signal['change']:+.2f}% | NEUTRAL")
+                    
+                    except Exception as e:
+                        logger.debug(f"Error {symbol}: {str(e)[:40]}")
+                    
+                    await asyncio.sleep(0.05)
+                
+                logger.info(f"\n{'='*80}")
+                logger.info(f"📊 RESUMEN #{iteration}:")
+                logger.info(f"   ✅ Analizados: {analyzed}/10")
+                logger.info(f"   🟢 LONG: {long_count}")
+                logger.info(f"   🔴 SHORT: {short_count}")
+                logger.info(f"   📈 Signals: {self.stats['signals_generated']} total")
+                
+                if self.auto_trading:
+                    logger.info(f"   🤖 Trades ejecutados: {self.stats['trades_executed']}")
+                    logger.info(f"      ✅ Exitosos: {self.stats['trades_success']}")
+                    logger.info(f"      ❌ Fallidos: {self.stats['trades_failed']}")
+                
+                logger.info(f"{'='*80}")
+                
+                logger.info(f"\n⏱️ Próximo en {self.interval}s...\n")
+                await asyncio.sleep(self.interval)
+            
+            except KeyboardInterrupt:
+                logger.info("\n🛑 Bot detenido")
+                break
+            except Exception as e:
+                logger.error(f"\n❌ Error: {e}")
+                await asyncio.sleep(10)
 
-                logger.info(f"📊 {symbol}: ${price} ({change:+.2f}%)")
-                await asyncio.sleep(1) # Evitar rate limit
 
-            await asyncio.sleep(self.interval)
+async def main():
+    try:
+        bot = AutoTraderReal()
+        await bot.run()
+    except Exception as e:
+        logger.error(f"❌ Error fatal: {e}")
+
 
 if __name__ == "__main__":
-    bot = MasterBot()
-    asyncio.run(bot.run())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot terminado")
