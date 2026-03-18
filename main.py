@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Bot con AUTO-TRADING REAL - VERSIÓN CORREGIDA
-Ejecuta trades automáticamente en BingX con formato de API correcto
+Bot con AUTO-TRADING COMPLETO
+- Abre trades automáticamente
+- Coloca TP y SL
+- Cierra automáticamente cuando toca TP o SL
+- Gestión completa del ciclo de vida del trade
 """
 
 import os
@@ -24,8 +27,8 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 
-class AutoTraderReal:
-    """Auto-Trader que REALMENTE ejecuta trades en BingX - FORMATO CORRECTO"""
+class AutoTraderCompleto:
+    """Auto-Trader con gestión COMPLETA de trades"""
     
     def __init__(self):
         """Inicializar"""
@@ -49,6 +52,10 @@ class AutoTraderReal:
         self.interval = int(os.getenv('CHECK_INTERVAL', '180'))
         self.buy_threshold = 0.8
         
+        # TAKE PROFIT Y STOP LOSS
+        self.take_profit_pct = float(os.getenv('TAKE_PROFIT_PCT', '2.0'))  # 2%
+        self.stop_loss_pct = float(os.getenv('STOP_LOSS_PCT', '1.0'))      # 1%
+        
         # AUTO-TRADING ACTIVADO?
         self.auto_trading = os.getenv('AUTO_TRADING_ENABLED', 'false').lower() == 'true'
         
@@ -57,34 +64,36 @@ class AutoTraderReal:
             'trades_executed': 0,
             'trades_success': 0,
             'trades_failed': 0,
+            'trades_closed': 0,
             'total_pnl': 0.0
         }
         
+        # Registro de trades abiertos
         self.open_trades = {}
         
         logger.info("="*80)
-        logger.info("🤖 BOT CON AUTO-TRADING REAL - FORMATO CORRECTO")
+        logger.info("🤖 BOT CON AUTO-TRADING COMPLETO")
+        logger.info("✅ Abre + TP/SL + Cierre Automático")
         if self.auto_trading:
-            logger.info("✅ AUTO-TRADING ACTIVADO - EJECUTARÁ TRADES REALES")
+            logger.info("✅ AUTO-TRADING ACTIVADO")
         else:
-            logger.info("⏹️ AUTO-TRADING DESACTIVADO - Solo señales")
+            logger.info("⏹️ AUTO-TRADING DESACTIVADO")
         logger.info(f"📊 Pares: {len(self.symbols)}")
         logger.info(f"💰 Position Size: ${self.position_size}")
         logger.info(f"⚡ Leverage: {self.leverage}x")
+        logger.info(f"🎯 Take Profit: {self.take_profit_pct}%")
+        logger.info(f"🛑 Stop Loss: {self.stop_loss_pct}%")
         logger.info(f"⏱️ Intervalo: {self.interval}s")
         logger.info("="*80)
         
-        # Verificar credenciales
         self._verify_credentials()
-        
-        # Verificar balance
         self._check_balance()
         
-        self._notify("🤖 Bot con Auto-Trading iniciado (Formato Corregido)\n" + 
-                    ("✅ AUTO-TRADING ACTIVADO" if self.auto_trading else "⏹️ Solo señales"))
+        self._notify("🤖 Bot con Auto-Trading Completo iniciado\n" + 
+                    ("✅ Gestión automática de TP/SL activada" if self.auto_trading else "⏹️ Solo señales"))
     
     def _verify_credentials(self):
-        """Verificar credenciales de BingX"""
+        """Verificar credenciales"""
         logger.info("\n🔐 VERIFICANDO CREDENCIALES:")
         
         if not self.bingx_api_key:
@@ -98,7 +107,7 @@ class AutoTraderReal:
             logger.info(f"✅ API Secret: ***configurada***")
         
         if self.auto_trading and (not self.bingx_api_key or not self.bingx_api_secret):
-            logger.error("\n⚠️ AUTO-TRADING DESACTIVADO - Faltan credenciales BingX")
+            logger.error("\n⚠️ AUTO-TRADING DESACTIVADO - Faltan credenciales")
             self.auto_trading = False
     
     def _check_balance(self):
@@ -110,7 +119,6 @@ class AutoTraderReal:
             timestamp = int(time.time() * 1000)
             params = {'timestamp': timestamp}
             
-            # Firmar petición
             query_string = urlencode(params)
             signature = hmac.new(
                 self.bingx_api_secret.encode(),
@@ -130,25 +138,46 @@ class AutoTraderReal:
                 if data.get('code') == 0:
                     balance_data = data.get('data', {}).get('balance', {})
                     usdt_balance = balance_data.get('balance', 0) if isinstance(balance_data, dict) else 0
-                    logger.info(f"💰 Balance USDT en BingX: ${usdt_balance:.2f}")
+                    logger.info(f"💰 Balance USDT: ${usdt_balance:.2f}")
                 else:
-                    logger.warning(f"⚠️ Error obteniendo balance: {data.get('msg')}")
-            else:
-                logger.warning(f"⚠️ Error HTTP: {response.status_code}")
+                    logger.warning(f"⚠️ Error: {data.get('msg')}")
         
         except Exception as e:
-            logger.error(f"❌ Error verificando balance: {e}")
+            logger.error(f"❌ Error: {e}")
+    
+    def _get_current_price(self, symbol):
+        """Obtener precio actual de un símbolo"""
+        try:
+            url = f"{self.base_url}/openApi/swap/v2/quote/ticker"
+            params = {'symbol': symbol}
+            response = requests.get(url, params=params, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('code') == 0:
+                    return float(data['data']['lastPrice'])
+            return None
+        except:
+            return None
     
     def _execute_trade(self, symbol, direction, price, quantity):
-        """Ejecutar trade real en BingX - FORMATO CORRECTO"""
+        """Abrir trade con TP y SL automáticos"""
         if not self.auto_trading or not self.bingx_api_key:
-            logger.warning(f"⚠️ Auto-trading desactivado - No ejecuta {direction} en {symbol}")
+            logger.warning(f"⚠️ Auto-trading desactivado")
             return False
         
         try:
+            # Calcular TP y SL
+            if direction == 'LONG':
+                tp_price = price * (1 + self.take_profit_pct / 100)
+                sl_price = price * (1 - self.stop_loss_pct / 100)
+            else:  # SHORT
+                tp_price = price * (1 - self.take_profit_pct / 100)
+                sl_price = price * (1 + self.stop_loss_pct / 100)
+            
+            # 1. Abrir posición
             timestamp = int(time.time() * 1000)
             
-            # Parámetros en formato correcto (query string, no JSON)
             params = {
                 'symbol': symbol,
                 'side': 'BUY' if direction == 'LONG' else 'SELL',
@@ -158,7 +187,6 @@ class AutoTraderReal:
                 'timestamp': timestamp
             }
             
-            # Firmar con query string (NO con JSON)
             query_string = urlencode(params)
             signature = hmac.new(
                 self.bingx_api_secret.encode(),
@@ -174,21 +202,21 @@ class AutoTraderReal:
                 'Content-Type': 'application/x-www-form-urlencoded'
             }
             
-            # Enviar como query string, NO como JSON
             response = requests.post(url, params=params, headers=headers, timeout=10)
             
-            logger.info(f"→ Status Code: {response.status_code}")
-            logger.info(f"→ Respuesta: {response.text}")
+            logger.info(f"→ Status: {response.status_code}")
             
             if response.status_code == 200:
                 data = response.json()
                 if data.get('code') == 0:
-                    order_data = data.get('data', {})
-                    order_id = order_data.get('order', {}).get('orderId', 'N/A')
+                    order_data = data.get('data', {}).get('order', {})
+                    order_id = order_data.get('orderId', 'N/A')
                     
-                    logger.info(f"✅ TRADE EJECUTADO")
+                    logger.info(f"✅ TRADE ABIERTO")
                     logger.info(f"   {direction}: {symbol} @ ${price:.4f}")
                     logger.info(f"   Cantidad: {quantity:.4f}")
+                    logger.info(f"   🎯 TP: ${tp_price:.4f} (+{self.take_profit_pct}%)")
+                    logger.info(f"   🛑 SL: ${sl_price:.4f} (-{self.stop_loss_pct}%)")
                     logger.info(f"   Order ID: {order_id}")
                     
                     self.stats['trades_executed'] += 1
@@ -198,34 +226,140 @@ class AutoTraderReal:
                     self.open_trades[symbol] = {
                         'direction': direction,
                         'entry_price': price,
+                        'tp_price': tp_price,
+                        'sl_price': sl_price,
                         'quantity': quantity,
                         'order_id': order_id,
                         'timestamp': datetime.now().isoformat()
                     }
                     
-                    msg = f"✅ <b>TRADE EJECUTADO</b>\n"
+                    msg = f"✅ <b>TRADE ABIERTO</b>\n"
                     msg += f"{direction} {symbol}\n"
-                    msg += f"💰 Precio: ${price:.4f}\n"
-                    msg += f"📊 Cantidad: {quantity:.4f}\n"
-                    msg += f"📍 Order ID: {order_id}"
+                    msg += f"💰 Entry: ${price:.4f}\n"
+                    msg += f"🎯 TP: ${tp_price:.4f} (+{self.take_profit_pct}%)\n"
+                    msg += f"🛑 SL: ${sl_price:.4f} (-{self.stop_loss_pct}%)\n"
+                    msg += f"📊 Cantidad: {quantity:.4f}"
                     self._notify(msg)
                     
                     return True
                 else:
-                    logger.error(f"❌ Error BingX: {data.get('msg')}")
-                    logger.error(f"   Código: {data.get('code')}")
+                    logger.error(f"❌ Error: {data.get('msg')}")
                     self.stats['trades_failed'] += 1
                     return False
             else:
                 logger.error(f"❌ Error HTTP: {response.status_code}")
-                logger.error(f"   Respuesta: {response.text}")
                 self.stats['trades_failed'] += 1
                 return False
         
         except Exception as e:
-            logger.error(f"❌ Error ejecutando trade: {e}")
+            logger.error(f"❌ Error: {e}")
             self.stats['trades_failed'] += 1
             return False
+    
+    def _close_trade(self, symbol, reason="MANUAL"):
+        """Cerrar trade abierto"""
+        if symbol not in self.open_trades:
+            return False
+        
+        try:
+            trade = self.open_trades[symbol]
+            
+            timestamp = int(time.time() * 1000)
+            
+            params = {
+                'symbol': symbol,
+                'side': 'SELL' if trade['direction'] == 'LONG' else 'BUY',
+                'positionSide': trade['direction'],
+                'type': 'MARKET',
+                'quantity': str(trade['quantity']),
+                'timestamp': timestamp
+            }
+            
+            query_string = urlencode(params)
+            signature = hmac.new(
+                self.bingx_api_secret.encode(),
+                query_string.encode(),
+                hashlib.sha256
+            ).hexdigest()
+            
+            params['signature'] = signature
+            
+            url = f"{self.base_url}/openApi/swap/v2/trade/order"
+            headers = {
+                'X-BX-APIKEY': self.bingx_api_key,
+                'Content-Type': 'application/x-www-form-urlencoded'
+            }
+            
+            response = requests.post(url, params=params, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('code') == 0:
+                    # Calcular PnL
+                    current_price = self._get_current_price(symbol)
+                    if current_price:
+                        if trade['direction'] == 'LONG':
+                            pnl = (current_price - trade['entry_price']) * trade['quantity']
+                        else:
+                            pnl = (trade['entry_price'] - current_price) * trade['quantity']
+                        
+                        pnl_pct = (pnl / (trade['entry_price'] * trade['quantity'])) * 100
+                        
+                        logger.info(f"✅ TRADE CERRADO - {reason}")
+                        logger.info(f"   {symbol}: ${current_price:.4f}")
+                        logger.info(f"   PnL: ${pnl:+.2f} ({pnl_pct:+.2f}%)")
+                        
+                        self.stats['trades_closed'] += 1
+                        self.stats['total_pnl'] += pnl
+                        
+                        msg = f"✅ <b>TRADE CERRADO - {reason}</b>\n"
+                        msg += f"{symbol}\n"
+                        msg += f"💰 Entry: ${trade['entry_price']:.4f}\n"
+                        msg += f"💰 Exit: ${current_price:.4f}\n"
+                        msg += f"📊 PnL: ${pnl:+.2f} ({pnl_pct:+.2f}%)\n"
+                        msg += f"💵 Total PnL: ${self.stats['total_pnl']:+.2f}"
+                        self._notify(msg)
+                    
+                    del self.open_trades[symbol]
+                    return True
+            
+            return False
+        
+        except Exception as e:
+            logger.error(f"❌ Error cerrando: {e}")
+            return False
+    
+    async def monitor_trades(self):
+        """Monitorear trades abiertos y cerrar si tocan TP o SL"""
+        if not self.auto_trading:
+            return
+        
+        for symbol in list(self.open_trades.keys()):
+            try:
+                trade = self.open_trades[symbol]
+                current_price = self._get_current_price(symbol)
+                
+                if not current_price:
+                    continue
+                
+                # Verificar TP
+                if trade['direction'] == 'LONG':
+                    if current_price >= trade['tp_price']:
+                        logger.info(f"🎯 TP ALCANZADO: {symbol} @ ${current_price:.4f}")
+                        self._close_trade(symbol, "TAKE PROFIT")
+                    elif current_price <= trade['sl_price']:
+                        logger.info(f"🛑 SL ALCANZADO: {symbol} @ ${current_price:.4f}")
+                        self._close_trade(symbol, "STOP LOSS")
+                else:  # SHORT
+                    if current_price <= trade['tp_price']:
+                        logger.info(f"🎯 TP ALCANZADO: {symbol} @ ${current_price:.4f}")
+                        self._close_trade(symbol, "TAKE PROFIT")
+                    elif current_price >= trade['sl_price']:
+                        logger.info(f"🛑 SL ALCANZADO: {symbol} @ ${current_price:.4f}")
+                        self._close_trade(symbol, "STOP LOSS")
+            
+            except Exception as e:
+                logger.debug(f"Error monitoreando {symbol}: {e}")
     
     def _notify(self, msg: str):
         """Enviar Telegram"""
@@ -241,8 +375,9 @@ class AutoTraderReal:
     def get_price_data(self, symbol: str) -> dict:
         """Obtener datos de precio"""
         try:
-            url = f"https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol={symbol}"
-            response = requests.get(url, timeout=10)
+            url = f"{self.base_url}/openApi/swap/v2/quote/ticker"
+            params = {'symbol': symbol}
+            response = requests.get(url, params=params, timeout=10)
             
             if response.status_code == 200:
                 data = response.json()
@@ -267,6 +402,10 @@ class AutoTraderReal:
         try:
             change = data.get('change', 0)
             price = data.get('price', 0)
+            
+            # No abrir nuevo trade si ya hay uno abierto en este símbolo
+            if symbol in self.open_trades:
+                return {'direction': 'NEUTRAL', 'score': 0, 'change': change, 'price': price}
             
             if change >= self.buy_threshold:
                 score = min(95, 50 + (change * 10))
@@ -293,12 +432,17 @@ class AutoTraderReal:
                 logger.info(f"⏱️ ITERACIÓN #{iteration} | {datetime.now().strftime('%H:%M:%S')}")
                 if self.auto_trading:
                     logger.info(f"🤖 AUTO-TRADING: ACTIVADO ✅")
+                logger.info(f"📊 Trades abiertos: {len(self.open_trades)}")
                 logger.info(f"{'='*80}\n")
+                
+                # MONITOREAR TRADES ABIERTOS PRIMERO
+                await self.monitor_trades()
                 
                 long_count = 0
                 short_count = 0
                 analyzed = 0
                 
+                # BUSCAR NUEVAS SEÑALES
                 for i, symbol in enumerate(self.symbols, 1):
                     try:
                         data = self.get_price_data(symbol)
@@ -315,12 +459,9 @@ class AutoTraderReal:
                             
                             logger.info(f"{i:2d}. 🟢 {symbol}: ${data['price']:.4f} | {signal['change']:+.2f}% | LONG")
                             
-                            # EJECUTAR TRADE SI AUTO-TRADING ACTIVADO
                             if self.auto_trading:
                                 quantity = self.position_size / data['price']
                                 self._execute_trade(symbol, 'LONG', data['price'], quantity)
-                            else:
-                                logger.info(f"     (Auto-trading desactivado - Sin ejecutar)")
                         
                         elif signal['direction'] == 'SHORT':
                             short_count += 1
@@ -328,12 +469,9 @@ class AutoTraderReal:
                             
                             logger.info(f"{i:2d}. 🔴 {symbol}: ${data['price']:.4f} | {signal['change']:+.2f}% | SHORT")
                             
-                            # EJECUTAR TRADE SI AUTO-TRADING ACTIVADO
                             if self.auto_trading:
                                 quantity = self.position_size / data['price']
                                 self._execute_trade(symbol, 'SHORT', data['price'], quantity)
-                            else:
-                                logger.info(f"     (Auto-trading desactivado - Sin ejecutar)")
                         
                         else:
                             logger.info(f"{i:2d}. ⚪ {symbol}: ${data['price']:.4f} | {signal['change']:+.2f}% | NEUTRAL")
@@ -343,6 +481,7 @@ class AutoTraderReal:
                     
                     await asyncio.sleep(0.05)
                 
+                # RESUMEN
                 logger.info(f"\n{'='*80}")
                 logger.info(f"📊 RESUMEN #{iteration}:")
                 logger.info(f"   ✅ Analizados: {analyzed}/10")
@@ -352,8 +491,9 @@ class AutoTraderReal:
                 
                 if self.auto_trading:
                     logger.info(f"   🤖 Trades ejecutados: {self.stats['trades_executed']}")
-                    logger.info(f"      ✅ Exitosos: {self.stats['trades_success']}")
-                    logger.info(f"      ❌ Fallidos: {self.stats['trades_failed']}")
+                    logger.info(f"   💰 Trades abiertos: {len(self.open_trades)}")
+                    logger.info(f"   ✅ Trades cerrados: {self.stats['trades_closed']}")
+                    logger.info(f"   💵 PnL Total: ${self.stats['total_pnl']:+.2f}")
                 
                 logger.info(f"{'='*80}")
                 
@@ -370,7 +510,7 @@ class AutoTraderReal:
 
 async def main():
     try:
-        bot = AutoTraderReal()
+        bot = AutoTraderCompleto()
         await bot.run()
     except Exception as e:
         logger.error(f"❌ Error fatal: {e}")
