@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-BOT TRADING MAESTRO v2.5 - CORREGIDO Y COMPLETO
-Dashboard + Auto-Trading Real + Notificaciones
-"""
-
 import os
 import asyncio
 import logging
@@ -22,29 +17,28 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 load_dotenv()
 
-# Importación segura del ejecutor de BingX
+# Intentar importar el trader de BingX
 try:
     from bingx_autotrader import BingXAutoTrader
 except ImportError:
-    logger.error("❌ ERROR: No se encontró bingx_autotrader.py")
+    logger.error("❌ No se encontró bingx_autotrader.py")
 
 class DashboardStats:
     def __init__(self):
         self.data_file = 'bot_stats.json'
-        self.load_stats()
+        self.stats = self.load_stats()
     
     def load_stats(self):
         if Path(self.data_file).exists():
             try:
                 with open(self.data_file, 'r') as f:
-                    self.stats = json.load(f)
+                    return json.load(f)
             except:
-                self.stats = self.create_empty()
-        else:
-            self.stats = self.create_empty()
+                return self.create_empty()
+        return self.create_empty()
     
     def create_empty(self):
-        cap = float(os.getenv('INITIAL_CAPITAL', '0'))
+        cap = float(os.getenv('INITIAL_CAPITAL', '100'))
         return {
             'start_date': datetime.now().isoformat(),
             'capital_inicial': cap,
@@ -55,121 +49,81 @@ class DashboardStats:
             'historial': []
         }
     
-    def save(self):
-        try:
-            with open(self.data_file, 'w') as f:
-                json.dump(self.stats, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error guardando stats: {e}")
-
-    def add_signal(self, symbol, direction, entry_price, tp, sl):
-        # CORRECCIÓN DE SINTAXIS AQUÍ (Línea 81 corregida)
+    def add_signal(self, symbol, direction, entry, tp, sl):
         signal = {
             'id': len(self.stats['historial']) + 1,
             'symbol': symbol,
             'direction': direction,
-            'entry': entry_price,
-            'tp1': tp,
-            'tp2': tp,
+            'entry': entry,
+            'tp': tp,
             'sl': sl,
             'timestamp': datetime.now().isoformat(),
             'status': 'OPEN'
         }
         self.stats['historial'].append(signal)
         self.stats['trades']['total'] += 1
-        if direction == 'LONG':
-            self.stats['signals']['long_total'] += 1
-        else:
-            self.stats['signals']['short_total'] += 1
-        self.save()
-        return signal
+        if direction == 'LONG': self.stats['signals']['long_total'] += 1
+        else: self.stats['signals']['short_total'] += 1
+        
+        with open(self.data_file, 'w') as f:
+            json.dump(self.stats, f, indent=2)
 
 class BotMaestro:
     def __init__(self):
-        self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN', '')
-        self.chat_id = os.getenv('TELEGRAM_CHAT_ID', '')
         self.symbols = ['BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'MATIC-USDT', 'AVAX-USDT', 'LINK-USDT']
         self.interval = int(os.getenv('CHECK_INTERVAL', '120'))
-        
-        # Activar Auto-Trading Real
         self.auto_trading = os.getenv('AUTO_TRADING_ENABLED', 'false').lower() == 'true'
-        if self.auto_trading:
+        
+        # Verificar que las llaves existan
+        key = os.getenv('BINGX_API_KEY')
+        secret = os.getenv('BINGX_API_SECRET')
+        
+        if self.auto_trading and key and secret:
             self.trader = BingXAutoTrader()
             logger.info("🚀 MODO AUTO-TRADING: ACTIVADO ✅")
         else:
             self.trader = None
-            logger.info("⚠️ MODO AUTO-TRADING: DESACTIVADO (Solo señales)")
+            logger.warning("⚠️ MODO AUTO-TRADING: DESACTIVADO o faltan APIs")
             
         self.dashboard = DashboardStats()
 
-    def _notify(self, msg: str):
-        if not self.telegram_token or not self.chat_id: return
-        try:
-            url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-            requests.post(url, json={'chat_id': self.chat_id, 'text': msg, 'parse_mode': 'HTML'}, timeout=5)
-        except Exception as e:
-            logger.error(f"Error Telegram: {e}")
-
-    def get_price_data(self, symbol: str):
-        try:
-            url = f"https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol={symbol}"
-            r = requests.get(url, timeout=10).json()
-            if r.get('code') == 0:
-                d = r['data']
-                return {
-                    'price': float(d['lastPrice']), 
-                    'change': float(d['priceChangePercent']),
-                    'status': 'OK'
-                }
-            return {'status': 'ERROR'}
-        except:
-            return {'status': 'ERROR'}
-
     async def run(self):
-        logger.info("🤖 Bot en ejecución...")
         while True:
             for symbol in self.symbols:
                 try:
-                    data = self.get_price_data(symbol)
-                    if data['status'] != 'OK': continue
+                    # Simulación de obtención de datos para el ejemplo
+                    url = f"https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol={symbol}"
+                    r = requests.get(url, timeout=10).json()
+                    if r.get('code') != 0: continue
                     
-                    price = data['price']
-                    change = data['change']
+                    price = float(r['data']['lastPrice'])
+                    change = float(r['data']['priceChangePercent'])
+                    
                     direction = None
-
-                    # Estrategia: Cambio rápido mayor al 1.5%
-                    if change > 1.5: direction = 'LONG'
-                    elif change < -1.5: direction = 'SHORT'
+                    if change > 1.8: direction = 'LONG'
+                    elif change < -1.8: direction = 'SHORT'
                     
                     if direction:
-                        # Cálculo de targets
-                        tp = price * 1.015 if direction == 'LONG' else price * 0.985
-                        sl = price * 0.992 if direction == 'LONG' else price * 1.008
+                        tp = price * 1.02 if direction == 'LONG' else price * 0.98
+                        sl = price * 0.99 if direction == 'LONG' else price * 1.01
                         
                         logger.info(f"🎯 OPORTUNIDAD: {symbol} | {direction} | Precio: {price}")
                         
-                        # 1. Dashboard
+                        # 1. Registrar señal
                         self.dashboard.add_signal(symbol, direction, price, tp, sl)
                         
-                        # 2. Ejecutar Trade Real en BingX
+                        # 2. Ejecutar en BingX
                         if self.auto_trading and self.trader:
-                            try:
-                                # Usamos la función execute_trade del archivo bingx_autotrader.py
-                                self.trader.execute_trade(symbol, direction, price, tp, tp, sl)
-                                logger.info(f"✅ ORDEN ENVIADA A BINGX: {symbol}")
-                            except Exception as e:
-                                logger.error(f"❌ FALLÓ EJECUCIÓN BINGX: {e}")
-
-                        # 3. Notificar
-                        emoji = "🟢" if direction == "LONG" else "🔴"
-                        msg = f"{emoji} <b>NUEVA OPERACIÓN</b>\n<b>Par:</b> {symbol}\n<b>Dirección:</b> {direction}\n<b>Precio:</b> {price}\n<b>TP:</b> {tp:.4f}\n<b>SL:</b> {sl:.4f}"
-                        self._notify(msg)
+                            # Intentamos ejecutar y capturamos el resultado real
+                            success = self.trader.execute_trade(symbol, direction, price, tp, tp, sl)
+                            if success:
+                                logger.info(f"✅ ORDEN CONFIRMADA EN BINGX: {symbol}")
+                            else:
+                                logger.error(f"❌ BINGX RECHAZÓ LA ORDEN: {symbol} (Verifica API Keys)")
 
                 except Exception as e:
-                    logger.error(f"Error procesando {symbol}: {e}")
-                
-                await asyncio.sleep(1) # Pequeña pausa entre monedas
-
+                    logger.error(f"Error en {symbol}: {e}")
+                await asyncio.sleep(1)
             await asyncio.sleep(self.interval)
 
 if __name__ == "__main__":
