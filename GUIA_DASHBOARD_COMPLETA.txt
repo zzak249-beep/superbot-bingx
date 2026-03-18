@@ -1,0 +1,454 @@
+================================================================================
+📊 DASHBOARD PROFESIONAL - GUIA COMPLETA
+================================================================================
+
+¿QUE ES EL DASHBOARD?
+═════════════════════
+
+Página HTML que muestra en TIEMPO REAL:
+   ✅ Capital actual vs inicial
+   ✅ Ganancia total (PnL)
+   ✅ Win rate %
+   ✅ Total de trades
+   ✅ Señales LONG/SHORT
+   ✅ Historial de todas las operaciones
+   ✅ Estadísticas detalladas
+
+TODO se actualiza AUTOMATICAMENTE conforme el bot trabaja
+
+================================================================================
+CARACTERISTICAS
+================================================================================
+
+✅ DISEÑO PROFESIONAL
+   • Interface moderna y colorida
+   • Colores verde (#00ff88) para ganancias
+   • Colores rojos (#ff4466) para pérdidas
+   • Responsive (funciona en móvil)
+
+✅ DATOS EN TIEMPO REAL
+   • Se actualiza cada 5 minutos
+   • Todas las señales registradas
+   • PnL calculado automáticamente
+   • Win rate en vivo
+
+✅ HISTORIAL COMPLETO
+   • Últimas 20 operaciones
+   • ID, símbolo, dirección, precio, estado
+   • PnL por operación
+   • Timestamps
+
+✅ ESTADISTICAS
+   • Trades ganadores/perdedores
+   • Promedio PnL por trade
+   • Trades pendientes
+   • Capital inicial vs actual
+
+================================================================================
+ARCHIVOS NECESARIOS
+================================================================================
+
+1. main_dashboard.py
+   → Bot mejorado que registra automáticamente
+   → Genera dashboard.html en vivo
+
+2. dashboard.py
+   → Versión standalone (opcional)
+   → Para crear dashboard manualmente
+
+================================================================================
+INSTALACION EN RAILWAY
+================================================================================
+
+OPCION A: REEMPLAZAR main.py CON main_dashboard.py
+───────────────────────────────────────────────────
+
+1. Ve a railway.app → Tu proyecto
+
+2. Click "Code" o "Files"
+
+3. Abre main.py
+
+4. Selecciona TODO (Ctrl+A) → Elimina
+
+5. Copia TODO de main_dashboard.py → Pega
+
+6. Click "Save"
+
+7. Railway redeploya (30-60s)
+
+8. El bot está corriendo + generando dashboard
+
+OPCION B: MANTENER AMBOS
+────────────────────────
+
+Si quieres tener:
+   • main.py = Bot actual
+   • main_dashboard.py = Bot con dashboard
+
+1. En Railway, crea un nuevo servicio:
+   Click "+"  → "Service"
+   Nombre: "bot-dashboard"
+   Repo: tu repo GitHub
+   Root: /
+   Command: python main_dashboard.py
+
+2. Configura variables igual que bot principal
+
+3. Deploy
+
+Resultado: 2 bots corriendo (análisis duplicado pero stats independientes)
+
+================================================================================
+COMO USAR EL DASHBOARD
+================================================================================
+
+PASO 1: BOT CORRIENDO
+──────────────────
+
+El bot genera automáticamente dashboard.html
+
+PASO 2: DESCARGAR dashboard.html
+────────────────────────────────
+
+1. Railway → Files
+2. Busca "dashboard.html"
+3. Click "Download" (icono ↓)
+
+O accede directamente:
+   1. Railway → tu servicio
+   2. Click "View Logs"
+   3. Busca menciones de "dashboard"
+   4. Puede haber un link directo
+
+PASO 3: ABRIR EN NAVEGADOR
+──────────────────────────
+
+1. Guarda el archivo en tu computadora
+2. Haz doble click en dashboard.html
+3. Se abre en navegador
+4. ¡Listo! Ves todas tus estadísticas
+
+PASO 4: ACTUALIZAR DATOS
+────────────────────────
+
+El dashboard se regenera cada iteración del bot
+
+Para ver datos nuevos:
+   1. Recarga la página (F5 o Ctrl+Shift+R)
+   2. O descarga el archivo HTML nuevamente
+
+================================================================================
+QUE VES EN EL DASHBOARD
+================================================================================
+
+SECCION 1: METRICAS PRINCIPALES
+────────────────────────────────
+
+💰 Capital Actual: $1,250
+   Inicial: $1,000
+
+📈 Ganancia Total: +$250
+   ROI: +25%
+
+🎯 Win Rate: 65%
+   Ganancias: 13 | Pérdidas: 7
+
+📊 Trades: 20
+   Pendientes: 3
+
+🟢 LONG Signals: 12 (8 hoy)
+
+🔴 SHORT Signals: 8 (3 hoy)
+
+SECCION 2: TABLA DE HISTORIAL
+──────────────────────────────
+
+Últimas 20 operaciones:
+
+#ID | Símbolo | Dirección | Entry | Status | PnL | %
+─────────────────────────────────────────────────────
+#1  | BTC     | 🟢 LONG   | 45000 | OPEN   | -   | -
+#2  | ETH     | 🔴 SHORT  | 2500  | CLOSED | +50 | +2%
+#3  | SOL     | 🟢 LONG   | 100   | CLOSED | +25 | +25%
+
+SECCION 3: ESTADISTICAS
+────────────────────────
+
+Trades Ganadores: 13
+Trades Perdedores: 7
+Trades Pendientes: 3
+Promedio PnL/Trade: +$18.75
+
+================================================================================
+EJEMPLOS DE COMO SE VE
+================================================================================
+
+EJEMPLO 1: BOT GANANDO
+──────────────────────
+
+💰 Capital Actual: $1,500 (+$500)
+📈 Ganancia: +$500 (+50%)
+🎯 Win Rate: 72% (18/25)
+📊 Trades: 25 total
+
+🟢 LONG: 15 | 🔴 SHORT: 10
+
+⬆️ VERDE = TODO VA BIEN
+
+EJEMPLO 2: BOT NEUTRAL
+───────────────────────
+
+💰 Capital Actual: $1,020 (+$20)
+📈 Ganancia: +$20 (+2%)
+🎯 Win Rate: 48% (12/25)
+📊 Trades: 25 total
+
+🟢 LONG: 15 | 🔴 SHORT: 10
+
+⚫ NEUTRO = EQUILIBRIO
+
+EJEMPLO 3: BOT EN PÉRDIDA
+─────────────────────────
+
+💰 Capital Actual: $850 (-$150)
+📈 Ganancia: -$150 (-15%)
+🎯 Win Rate: 35% (7/20)
+📊 Trades: 20 total
+
+🟢 LONG: 12 | 🔴 SHORT: 8
+
+🔴 ROJO = AJUSTAR PARAMETROS
+
+================================================================================
+ARCHIVOS GENERADOS
+================================================================================
+
+El bot crea/actualiza automáticamente:
+
+1. bot_stats.json
+   - Archivo de datos con todas las estadísticas
+   - Se actualiza en cada trade
+   - Puedes consultar manualmente
+
+2. dashboard.html
+   - Página HTML visual
+   - Se genera cada iteración
+   - La ves en el navegador
+
+3. bot.log
+   - Logs detallados de todas las acciones
+   - Debug y troubleshooting
+   - Consultable en Railway
+
+================================================================================
+INTERPRETATION DE DATOS
+================================================================================
+
+CAPITAL ACTUAL vs INICIAL
+──────────────────────────
+
+Capital Inicial: $1,000
+Capital Actual: $1,250
+
+Significa: Tienes +$250 en ganancias
+           ROI: +25%
+
+Si fuera:
+Capital Actual: $850
+Significa: Tienes -$150 en pérdidas
+          ROI: -15%
+
+WIN RATE
+─────────
+
+Win Rate: 65% (26/40)
+
+Significa: De 40 trades:
+   • 26 fueron ganadores (65%)
+   • 14 fueron perdedores (35%)
+
+Meta: > 50% (más ganancias que pérdidas)
+Bueno: > 60%
+Excelente: > 70%
+
+PnL (Profit & Loss)
+────────────────────
+
+PnL Total: +$500 en 25 trades
+Promedio: +$20 por trade
+
+Si es NEGATIVO:
+PnL Total: -$100 en 25 trades
+Promedio: -$4 por trade
+
+INTERPRETACION:
+   • Positivo = Bot rentable ✅
+   • Negativo = Ajustar parámetros ❌
+   • Pequeño = Esperar más tiempo
+
+TRADES PENDIENTES
+──────────────────
+
+Trades Totales: 25
+Pendientes: 3
+
+Significa:
+   • 25 trades abiertos/cerrados en historial
+   • 3 de esos están aún ABIERTOS (esperando TP o SL)
+   • 22 están CERRADOS (concretados)
+
+================================================================================
+MONITOREO DIARIO
+================================================================================
+
+MAÑANA AL DESPERTAR:
+────────────────────
+
+1. Descarga dashboard.html desde Railway
+2. Abre en navegador
+3. Verifica:
+   ✅ Capital aumentó o bajó?
+   ✅ Win rate > 50%?
+   ✅ Cuántos trades nuevos?
+   ✅ Alguno en rojo?
+
+CADA 2-3 DIAS:
+───────────────
+
+1. Analiza tendencias:
+   • Win rate está subiendo?
+   • PnL acumulado positivo?
+   • Qué pares generan más ganancias?
+
+2. Si todo bien:
+   • Aumenta capital
+   • Espera más resultados
+
+3. Si hay problemas:
+   • Revisa parámetros
+   • Aumenta CHECK_INTERVAL (más selectivo)
+   • Reduce MAX_POSITION_SIZE (menos riesgo)
+
+DESPUES DE 7 DIAS:
+───────────────────
+
+Tendrás datos suficientes para:
+   • Evaluar rentabilidad real
+   • Confirmar que funciona
+   • Escalar o ajustar
+   • Tomar decisión de inversión
+
+================================================================================
+PROBLEMAS Y SOLUCIONES
+================================================================================
+
+PROBLEMA: No veo dashboard.html
+─────────────────────────────────
+
+Solución:
+1. Verifica que main_dashboard.py esté corriendo
+2. Ve a Railway → Deploy Logs
+3. Busca: "Dashboard guardado"
+4. Espera 1-2 ciclos (180-360 segundos)
+5. Recarga Railway Files
+
+PROBLEMA: Los datos no se actualizan
+──────────────────────────────────────
+
+Solución:
+1. Recarga la página (F5)
+2. Limpia cache (Ctrl+Shift+Supr)
+3. Descarga dashboard.html nuevamente
+4. Abre en navegador fresco
+
+PROBLEMA: Los trades no aparecen
+──────────────────────────────────
+
+Solución:
+1. Verifica que el bot esté corriendo (status = Active)
+2. Busca en logs: "LONG SIGNAL" o "SHORT SIGNAL"
+3. Si hay signals: bot está funcionando
+4. Dashboard se actualiza cada 180s
+5. Espera próximo ciclo
+
+PROBLEMA: Win rate muy bajo (< 30%)
+─────────────────────────────────────
+
+Posibles causas:
+   • CHECK_INTERVAL muy bajo (60s)
+   • MAX_POSITION_SIZE muy alto (riesgo)
+   • Condiciones de mercado adversas
+
+Soluciones:
+   1. Aumenta CHECK_INTERVAL = 300 (5 min)
+   2. Reduce MAX_POSITION_SIZE = 50
+   3. Espera 7 más días
+   4. Recalibra si persiste
+
+================================================================================
+RECOMENDACIONES
+================================================================================
+
+✅ CHECKLIST DIARIA:
+
+□ Bot corriendo (status = Active)
+□ Descargo dashboard.html
+□ Verifico capital (aumenta?)
+□ Verifico win rate (> 50%?)
+□ Cuento trades nuevos
+□ Anoto en archivo personal
+
+✅ CHECKLIST SEMANAL:
+
+□ 7 días de datos acumulados
+□ Analizo tendencias
+□ Calculo ROI real
+□ Decido si escalar o ajustar
+□ Backupeo bot_stats.json
+
+✅ METAS:
+
+Semana 1: > 50% win rate
+Semana 2: > 55% win rate
+Semana 3: > 60% win rate
+Mes 1: ROI > +10%
+Mes 2: ROI > +20%
+Mes 3: ROI > +30%+
+
+================================================================================
+EXPORTAR Y COMPARTIR
+================================================================================
+
+Para compartir resultados:
+
+1. Descarga dashboard.html
+2. Renombra: dashboard_2026-03-18.html
+3. Comparte el archivo
+
+O toma screenshot de la página
+
+O exporta datos:
+   • Railway → Files → bot_stats.json
+   • Descarga
+   • Comparte con quien quieras mostrar
+
+================================================================================
+¡LISTO!
+================================================================================
+
+Ahora tienes:
+✅ Bot analizando en tiempo real
+✅ Dashboard mostrand estadísticas
+✅ Historial de todas las operaciones
+✅ Rentabilidad visible
+✅ Control total de tu estrategia
+
+PROXIMO PASO:
+   1. Implementa main_dashboard.py en Railway
+   2. Espera 1-2 ciclos
+   3. Descarga dashboard.html
+   4. Abre en navegador
+   5. ¡Monitorea tus ganancias!
+
+================================================================================
