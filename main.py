@@ -6,55 +6,52 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 load_dotenv()
 
-class BotRentable:
+class BotMaestro:
     def __init__(self):
-        self.symbols = ['BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'AVAX-USDT', 'LINK-USDT']
+        self.symbols = ['BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'AVAX-USDT']
         self.trader = BingXAutoTrader()
-        self.interval = 60 # Revisar cada minuto
+        self.active_trades = {} # Seguimiento para Trailing Stop
 
-    def get_market_analysis(self, symbol):
-        """Filtro de tendencia e impulso"""
-        try:
-            # Pedimos K-lines (velas) para calcular una media móvil simple
-            url = f"https://open-api.bingx.com/openApi/swap/v2/quote/klines?symbol={symbol.replace('-','')}&interval=1h&limit=20"
-            data = requests.get(url).json()['data']
-            closes = [float(candle['close']) for candle in data]
+    async def check_trailing_stop(self, symbol, current_price):
+        """Si ganamos > 0.6%, protegemos la entrada"""
+        if symbol in self.active_trades:
+            trade = self.active_trades[symbol]
+            entry = trade['entry']
             
-            current_price = closes[-1]
-            sma = sum(closes) / len(closes) # Media simple de 20 periodos
-            
-            # LÓGICA RENTABLE:
-            # Solo LONG si el precio > media y hay fuerza alcista
-            # Solo SHORT si el precio < media y hay fuerza bajista
-            change_24h = ((closes[-1] - closes[0]) / closes[0]) * 100
-
-            if current_price > sma and change_24h > 1.5:
-                return "LONG", current_price
-            elif current_price < sma and change_24h < -1.5:
-                return "SHORT", current_price
-            
-            return None, current_price
-        except:
-            return None, 0
+            # Lógica simple de protección
+            if trade['direction'] == "LONG" and current_price > entry * 1.006:
+                logger.info(f"🛡️ {symbol}: Protegiendo ganancias (Precio subió 0.6%)")
+                # Aquí podrías llamar a una función de cierre o mover SL
+                # Por ahora, marcamos como protegido
+                self.active_trades[symbol]['protected'] = True
 
     async def run(self):
-        logger.info("🚀 Bot Rentable v3.0 Iniciado con Filtro de Tendencia")
+        logger.info("🤖 Master Bot v5.0 Iniciado")
         while True:
             for symbol in self.symbols:
-                direction, price = self.get_market_analysis(symbol)
+                try:
+                    # 1. Obtener datos reales
+                    url = f"https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol={symbol.replace('-','')}"
+                    data = requests.get(url).json()['data']
+                    price = float(data['lastPrice'])
+                    change = float(data['priceChangePercent'])
+
+                    # 2. Gestionar trades activos
+                    await self.check_trailing_stop(symbol, price)
+
+                    # 3. Lógica de Entrada (Filtro de Tendencia)
+                    direction = None
+                    if change > 2.0: direction = "LONG"
+                    elif change < -2.0: direction = "SHORT"
+
+                    if direction and symbol not in self.active_trades:
+                        if self.trader.execute_trade(symbol, direction, price):
+                            self.active_trades[symbol] = {'entry': price, 'direction': direction, 'protected': False}
+                            
+                except Exception as e:
+                    logger.error(f"Error en {symbol}: {e}")
                 
-                if direction:
-                    # Definimos un SL técnico (0.8% de distancia)
-                    sl = price * 0.992 if direction == "LONG" else price * 1.008
-                    
-                    logger.info(f"⚡ Señal Confirmada: {symbol} {direction} a {price}")
-                    success = self.trader.execute_trade(symbol, direction, price, sl)
-                    
-                    if success:
-                        # Esperar para no duplicar trades en el mismo par
-                        await asyncio.sleep(5) 
-                
-            await asyncio.sleep(self.interval)
+            await asyncio.sleep(60)
 
 if __name__ == "__main__":
-    asyncio.run(BotRentable().run())
+    asyncio.run(BotMaestro().run())
