@@ -47,6 +47,7 @@ MAX_OPEN_TRADES      = get_env_value('MAX_OPEN_TRADES',         '5',    'int')
 CHECK_INTERVAL       = get_env_value('CHECK_INTERVAL',          '60',   'int')
 MIN_VOLUME_USD       = get_env_value('MIN_VOLUME_24H',          '500000','float')
 MAX_SYMBOLS_TO_ANALYZE = get_env_value('MAX_SYMBOLS_TO_ANALYZE','100',  'int')
+MIN_TRADE_USDT       = get_env_value('MIN_TRADE_USDT',          '7',    'float')  # Mínimo $7 USDT por trade
 
 BASE_URL = "https://open-api.bingx.com"
 
@@ -397,14 +398,28 @@ class TradingBot:
             return False
         
         try:
-            quantity = self._round_quantity(MAX_POSITION_SIZE / price, price)
+            # Calcular capital: usar el mayor entre MAX_POSITION_SIZE y MIN_TRADE_USDT
+            capital = max(MAX_POSITION_SIZE, MIN_TRADE_USDT)
+            quantity = self._round_quantity(capital / price, price)
+            
+            # Verificar valor mínimo USDT tras el redondeo
+            trade_value = quantity * price
+            if trade_value < MIN_TRADE_USDT:
+                # Forzar cantidad mínima hacia arriba
+                quantity = self._round_quantity((MIN_TRADE_USDT / price) * 1.05, price)
+                trade_value = quantity * price
+            
+            # Si sigue siendo menor al mínimo, rechazar el trade
+            if trade_value < MIN_TRADE_USDT:
+                logger.warning(f"   ❌ {symbol} RECHAZADO: valor ${trade_value:.4f} < mínimo ${MIN_TRADE_USDT} USDT")
+                return False
             
             tp_price = price * (1 + TAKE_PROFIT_PCT / 100) if direction == 'LONG' else price * (1 - TAKE_PROFIT_PCT / 100)
             sl_price = price * (1 - STOP_LOSS_PCT  / 100) if direction == 'LONG' else price * (1 + STOP_LOSS_PCT  / 100)
             
             logger.info(f"\n🔄 Abriendo {direction} {symbol}:")
             logger.info(f"   Precio:    ${price:.6f}")
-            logger.info(f"   Cantidad:  {quantity}")
+            logger.info(f"   Cantidad:  {quantity} (${trade_value:.2f} USDT)")
             logger.info(f"   TP:        ${tp_price:.6f} (+{TAKE_PROFIT_PCT}%)")
             logger.info(f"   SL:        ${sl_price:.6f} (-{STOP_LOSS_PCT}%)")
             
@@ -460,7 +475,7 @@ class TradingBot:
                 f"💰 Entry:  ${price:.4f}\n"
                 f"{tp_icon} TP: ${tp_price:.4f} (+{TAKE_PROFIT_PCT}%)\n"
                 f"{sl_icon} SL: ${sl_price:.4f} (-{STOP_LOSS_PCT}%)\n"
-                f"📦 Qty: {quantity} | 📊 ${MAX_POSITION_SIZE} / {LEVERAGE}x"
+                f"📦 Qty: {quantity} (${trade_value:.2f} USDT) | {LEVERAGE}x"
             )
             return True
         
