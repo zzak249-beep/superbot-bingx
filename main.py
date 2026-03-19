@@ -20,11 +20,14 @@ from urllib.parse import urlencode
 # ============================================================================
 
 def get_env_value(key, default, value_type='str'):
-    """Obtener valor de entorno limpiando comillas"""
+    """Obtener valor de entorno limpiando comillas y espacios"""
     value = os.getenv(key, str(default))
-    # Limpiar comillas
+    
+    # Limpiar comillas y espacios
     if isinstance(value, str):
-        value = value.strip('"').strip("'")
+        value = value.strip()  # Quitar espacios
+        value = value.strip('"').strip("'")  # Quitar comillas
+        value = value.strip()  # Quitar espacios de nuevo
     
     # Convertir tipo
     if value_type == 'int':
@@ -120,12 +123,28 @@ class TradingBot:
     
     def _verify_credentials(self):
         """Verificar credenciales"""
-        if AUTO_TRADING and (not BINGX_API_KEY or not BINGX_API_SECRET):
-            logger.error("❌ Credenciales faltantes")
-            logger.warning("⚠️ AUTO-TRADING DESACTIVADO")
-            globals()['AUTO_TRADING'] = False
+        if AUTO_TRADING:
+            # Limpiar API keys
+            global BINGX_API_KEY, BINGX_API_SECRET
+            BINGX_API_KEY = BINGX_API_KEY.strip()
+            BINGX_API_SECRET = BINGX_API_SECRET.strip()
+            
+            if not BINGX_API_KEY or not BINGX_API_SECRET:
+                logger.error("❌ Credenciales faltantes")
+                logger.warning("⚠️ AUTO-TRADING DESACTIVADO")
+                globals()['AUTO_TRADING'] = False
+            elif len(BINGX_API_KEY) < 10 or len(BINGX_API_SECRET) < 10:
+                logger.error(f"❌ API keys sospechosas - muy cortas")
+                logger.error(f"   API Key length: {len(BINGX_API_KEY)}")
+                logger.error(f"   Secret length: {len(BINGX_API_SECRET)}")
+                logger.warning("⚠️ AUTO-TRADING DESACTIVADO")
+                globals()['AUTO_TRADING'] = False
+            else:
+                logger.info("✅ Credenciales verificadas")
+                logger.info(f"   API Key: {BINGX_API_KEY[:10]}...")
+                logger.info(f"   Secret: {'*' * len(BINGX_API_SECRET)}")
         else:
-            logger.info("✅ Credenciales verificadas")
+            logger.info("⚪ Modo solo señales - No se requieren credenciales")
     
     def _get_top_symbols(self):
         """Obtener SOLO CRIPTOMONEDAS de BingX"""
@@ -243,13 +262,18 @@ class TradingBot:
         ]
     
     def _sign_request(self, params):
-        """Firmar request"""
-        query_string = urlencode(sorted(params.items()))
+        """Firmar request - Compatible con BingX"""
+        # BingX requiere parámetros ordenados alfabéticamente
+        sorted_params = sorted(params.items())
+        query_string = urlencode(sorted_params)
+        
+        # Crear firma HMAC SHA256
         signature = hmac.new(
-            BINGX_API_SECRET.encode(),
-            query_string.encode(),
+            BINGX_API_SECRET.encode('utf-8'),
+            query_string.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
+        
         return signature
     
     def get_ticker(self, symbol):
@@ -406,7 +430,12 @@ class TradingBot:
             params['signature'] = self._sign_request(params)
             
             url = f"{BASE_URL}/openApi/swap/v2/trade/order"
-            headers = {'X-BX-APIKEY': BINGX_API_KEY}
+            headers = {
+                'X-BX-APIKEY': BINGX_API_KEY,
+                'Content-Type': 'application/x-www-form-urlencoded'
+            }
+            
+            logger.debug(f"   🔑 Parámetros: {params}")
             
             response = requests.post(url, params=params, headers=headers, timeout=10)
             
@@ -463,9 +492,24 @@ class TradingBot:
                     
                     return True
                 else:
-                    logger.error(f"❌ Error BingX: {data.get('msg')}")
+                    error_msg = data.get('msg', 'Unknown error')
+                    error_code = data.get('code', 'Unknown')
+                    logger.error(f"❌ Error BingX al abrir posición:")
+                    logger.error(f"   Code: {error_code}")
+                    logger.error(f"   Message: {error_msg}")
+                    logger.error(f"   Symbol: {symbol}")
+                    logger.error(f"   Direction: {direction}")
+                    logger.error(f"   Quantity: {quantity}")
+                    
+                    # Si es error de firma, dar más info
+                    if 'signature' in error_msg.lower():
+                        logger.error(f"   ⚠️ ERROR DE FIRMA - Verifica:")
+                        logger.error(f"      1. API Key correcta (sin espacios)")
+                        logger.error(f"      2. API Secret correcta (sin espacios)")
+                        logger.error(f"      3. Permisos de Futures habilitados")
             else:
                 logger.error(f"❌ HTTP Error: {response.status_code}")
+                logger.error(f"   Response: {response.text}")
         
         except Exception as e:
             logger.error(f"❌ Error abriendo trade: {e}")
