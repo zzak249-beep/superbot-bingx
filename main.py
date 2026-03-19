@@ -413,36 +413,47 @@ class TradingBot:
 
     def _calc_quantity(self, symbol, price):
         """
-        Calcular cantidad correcta garantizando mínimo MIN_TRADE_USDT.
-        Respeta el step size y precisión del contrato.
+        Calcular cantidad garantizando minimo MIN_TRADE_USDT.
+        Capital base = MAX_POSITION_SIZE (nunca menos que MIN_TRADE_USDT).
+        Respeta step size y precision del contrato BingX.
         """
-        info     = self._get_contract_info(symbol)
-        step     = info['qty_step']   # unidades mínimas por orden
-        prec     = info['qty_prec']   # decimales permitidos
-
-        # Capital objetivo: el mayor entre lo configurado y el mínimo
-        capital  = max(MAX_POSITION_SIZE, MIN_TRADE_USDT)
-
-        # Cantidad bruta
-        raw_qty  = capital / price
-
-        # Ajustar al step size (redondear HACIA ARRIBA al step más cercano)
         import math
-        stepped  = math.ceil(raw_qty / step) * step
 
-        # Redondear a la precisión permitida
+        info = self._get_contract_info(symbol)
+        step = info['qty_step']
+        prec = info['qty_prec']
+
+        # Capital: siempre el mayor entre lo configurado y el minimo absoluto
+        capital = MAX_POSITION_SIZE
+        if capital < MIN_TRADE_USDT:
+            logger.warning(
+                f"   MAX_POSITION_SIZE=${capital} < MIN_TRADE_USDT=${MIN_TRADE_USDT} "
+                f"-> forzando capital a ${MIN_TRADE_USDT}"
+            )
+            capital = MIN_TRADE_USDT
+
+        # Cantidad bruta en unidades del activo
+        raw_qty = capital / price
+
+        # Ajustar HACIA ARRIBA al step size del contrato
+        if step > 0:
+            stepped = math.ceil(raw_qty / step) * step
+        else:
+            stepped = raw_qty
+
+        # Aplicar precision decimal permitida
         quantity = round(stepped, prec)
 
-        # Verificar valor resultante
-        value    = quantity * price
-
-        # Si el valor sigue siendo menor al mínimo, subir un step más
-        while value < MIN_TRADE_USDT and step > 0:
+        # Doble verificacion: nunca quedar por debajo del minimo USDT
+        value = quantity * price
+        iterations = 0
+        while value < MIN_TRADE_USDT and step > 0 and iterations < 1000:
             quantity += step
             quantity  = round(quantity, prec)
             value     = quantity * price
+            iterations += 1
 
-        return quantity, value
+        return quantity, round(value, 4)
 
     def open_trade(self, symbol, direction, price):
         """Abrir posición en BingX con TP y SL - mínimo MIN_TRADE_USDT garantizado"""
