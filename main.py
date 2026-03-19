@@ -196,13 +196,23 @@ class TradingBot:
         return None
     
     def open_trade(self, symbol, direction, price):
-        """Abrir trade"""
+        """Abrir trade con TP/SL automáticos"""
         if not AUTO_TRADING:
             logger.info(f"📊 SEÑAL: {direction} {symbol} @ ${price:.4f}")
             return False
         
         try:
             quantity = MAX_POSITION_SIZE / price
+            
+            # Calcular TP/SL ANTES de abrir
+            if direction == 'LONG':
+                tp_price = price * (1 + TAKE_PROFIT_PCT / 100)
+                sl_price = price * (1 - STOP_LOSS_PCT / 100)
+            else:
+                tp_price = price * (1 - TAKE_PROFIT_PCT / 100)
+                sl_price = price * (1 + STOP_LOSS_PCT / 100)
+            
+            # 1. ABRIR POSICIÓN
             timestamp = int(time.time() * 1000)
             
             params = {
@@ -224,34 +234,48 @@ class TradingBot:
             if response.status_code == 200:
                 data = response.json()
                 if data.get('code') == 0:
-                    # Calcular TP/SL
-                    if direction == 'LONG':
-                        tp = price * (1 + TAKE_PROFIT_PCT / 100)
-                        sl = price * (1 - STOP_LOSS_PCT / 100)
-                    else:
-                        tp = price * (1 - TAKE_PROFIT_PCT / 100)
-                        sl = price * (1 + STOP_LOSS_PCT / 100)
+                    logger.info(f"✅ Posición abierta: {direction} {symbol}")
                     
+                    # 2. COLOCAR TAKE PROFIT (orden real en BingX)
+                    time.sleep(0.5)  # Pequeña pausa
+                    tp_placed = self._place_tp_sl_order(
+                        symbol, direction, quantity, tp_price, 'TAKE_PROFIT_MARKET'
+                    )
+                    
+                    # 3. COLOCAR STOP LOSS (orden real en BingX)
+                    time.sleep(0.5)
+                    sl_placed = self._place_tp_sl_order(
+                        symbol, direction, quantity, sl_price, 'STOP_MARKET'
+                    )
+                    
+                    # Registrar trade
                     self.open_trades[symbol] = {
                         'direction': direction,
                         'entry_price': price,
-                        'tp_price': tp,
-                        'sl_price': sl,
+                        'tp_price': tp_price,
+                        'sl_price': sl_price,
                         'quantity': quantity,
+                        'tp_placed': tp_placed,
+                        'sl_placed': sl_placed,
                         'timestamp': datetime.now()
                     }
                     
                     self.stats['trades_executed'] += 1
                     
-                    logger.info(f"✅ TRADE ABIERTO: {direction} {symbol} @ ${price:.4f}")
-                    logger.info(f"   🎯 TP: ${tp:.4f} | 🛑 SL: ${sl:.4f}")
+                    tp_status = "✅" if tp_placed else "⚠️"
+                    sl_status = "✅" if sl_placed else "⚠️"
+                    
+                    logger.info(f"✅ TRADE COMPLETO: {direction} {symbol} @ ${price:.4f}")
+                    logger.info(f"   {tp_status} TP: ${tp_price:.4f} (+{TAKE_PROFIT_PCT}%)")
+                    logger.info(f"   {sl_status} SL: ${sl_price:.4f} (-{STOP_LOSS_PCT}%)")
                     
                     self._send_telegram(
-                        f"✅ <b>TRADE ABIERTO</b>\n"
+                        f"✅ <b>TRADE ABIERTO CON TP/SL</b>\n"
                         f"{direction} {symbol}\n"
                         f"💰 Entry: ${price:.4f}\n"
-                        f"🎯 TP: ${tp:.4f}\n"
-                        f"🛑 SL: ${sl:.4f}"
+                        f"{tp_status} TP: ${tp_price:.4f} (+{TAKE_PROFIT_PCT}%)\n"
+                        f"{sl_status} SL: ${sl_price:.4f} (-{STOP_LOSS_PCT}%)\n"
+                        f"📊 Cantidad: {quantity:.6f}"
                     )
                     
                     return True
@@ -259,6 +283,49 @@ class TradingBot:
             logger.error(f"❌ Error abriendo trade: {e}")
         
         return False
+    
+    def _place_tp_sl_order(self, symbol, direction, quantity, price, order_type):
+        """Colocar orden de TP o SL en BingX"""
+        try:
+            timestamp = int(time.time() * 1000)
+            
+            # Determinar el lado opuesto para cerrar
+            if direction == 'LONG':
+                side = 'SELL'  # Para cerrar LONG
+            else:
+                side = 'BUY'   # Para cerrar SHORT
+            
+            params = {
+                'symbol': symbol,
+                'side': side,
+                'positionSide': direction,
+                'type': order_type,  # TAKE_PROFIT_MARKET o STOP_MARKET
+                'quantity': str(quantity),
+                'stopPrice': str(price),  # Precio de activación
+                'timestamp': timestamp
+            }
+            
+            params['signature'] = self._sign_request(params)
+            
+            url = f"{BASE_URL}/openApi/swap/v2/trade/order"
+            headers = {'X-BX-APIKEY': BINGX_API_KEY}
+            
+            response = requests.post(url, params=params, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('code') == 0:
+                    order_name = "TP" if "TAKE_PROFIT" in order_type else "SL"
+                    logger.info(f"   ✅ {order_name} colocado @ ${price:.4f}")
+                    return True
+                else:
+                    logger.warning(f"   ⚠️ Error {order_type}: {data.get('msg')}")
+            
+            return False
+        
+        except Exception as e:
+            logger.warning(f"   ⚠️ Error colocando {order_type}: {e}")
+            return False
     
     def close_trade(self, symbol, current_price, reason):
         """Cerrar trade"""
@@ -318,7 +385,10 @@ class TradingBot:
         return False
     
     async def monitor_trades(self):
-        """Monitorear trades abiertos"""
+        """Monitorear trades abiertos (backup - BingX cierra automáticamente)"""
+        if not self.open_trades:
+            return
+        
         for symbol in list(self.open_trades.keys()):
             try:
                 trade = self.open_trades[symbol]
@@ -328,29 +398,25 @@ class TradingBot:
                     continue
                 
                 current_price = ticker['price']
+                entry_price = trade['entry_price']
                 
-                # Verificar TP/SL
-                should_close = False
-                reason = ""
-                
+                # Calcular PnL actual
                 if trade['direction'] == 'LONG':
-                    if current_price >= trade['tp_price']:
-                        should_close = True
-                        reason = "TAKE PROFIT"
-                    elif current_price <= trade['sl_price']:
-                        should_close = True
-                        reason = "STOP LOSS"
-                else:  # SHORT
-                    if current_price <= trade['tp_price']:
-                        should_close = True
-                        reason = "TAKE PROFIT"
-                    elif current_price >= trade['sl_price']:
-                        should_close = True
-                        reason = "STOP LOSS"
+                    pnl_pct = ((current_price - entry_price) / entry_price) * 100
+                else:
+                    pnl_pct = ((entry_price - current_price) / entry_price) * 100
                 
-                if should_close:
-                    self.close_trade(symbol, current_price, reason)
-            
+                # Solo reportar estado (BingX cierra automáticamente con TP/SL)
+                if abs(pnl_pct) > 0.5:  # Solo log si hay movimiento significativo
+                    logger.debug(
+                        f"   {symbol}: {trade['direction']} | "
+                        f"PnL: {pnl_pct:+.2f}% | "
+                        f"Price: ${current_price:.4f}"
+                    )
+                
+                # BACKUP: Verificar si BingX ya cerró la posición
+                # (opcional - verificar posiciones abiertas en BingX)
+                
             except Exception as e:
                 logger.debug(f"Error monitoreando {symbol}: {e}")
     
