@@ -131,6 +131,7 @@ class TradingBot:
         logger.info(f"📊 Max Trades: {MAX_OPEN_TRADES}")
         logger.info(f"🔍 Max Símbolos: {MAX_SYMBOLS_TO_ANALYZE}")
         logger.info(f"💵 Volumen mín: ${MIN_VOLUME_USD:,.0f}")
+        logger.info(f"💲 Mínimo por trade: ${MIN_TRADE_USDT} USDT  ← FORZADO")
         logger.info("=" * 80)
         
         self.symbols = []
@@ -382,44 +383,87 @@ class TradingBot:
     # TRADING
     # -------------------------------------------------------------------------
     
-    def _round_quantity(self, quantity, price):
-        """Redondear cantidad según precio"""
-        if price > 10000:   return round(quantity, 6)
-        elif price > 1000:  return round(quantity, 5)
-        elif price > 100:   return round(quantity, 4)
-        elif price > 10:    return round(quantity, 3)
-        elif price > 1:     return round(quantity, 2)
-        else:               return round(quantity, 1)
-    
+    # Cache de precisión de símbolos para no llamar a BingX cada vez
+    _contract_info_cache = {}
+
+    def _get_contract_info(self, symbol):
+        """Obtener precisión mínima del contrato desde BingX (con cache)"""
+        if symbol in self._contract_info_cache:
+            return self._contract_info_cache[symbol]
+        try:
+            url = f"{BASE_URL}/openApi/swap/v2/quote/contracts"
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('code') == 0:
+                    for contract in data.get('data', []):
+                        sym = contract.get('symbol', '')
+                        info = {
+                            'qty_step':  float(contract.get('tradeMinQuantity', 1)),
+                            'qty_prec':  int(contract.get('quantityPrecision', 2)),
+                        }
+                        self._contract_info_cache[sym] = info
+        except Exception as e:
+            logger.debug(f"Error obteniendo contratos: {e}")
+
+        # Si no encontró el símbolo, devolver valores por defecto seguros
+        default = {'qty_step': 1.0, 'qty_prec': 2}
+        self._contract_info_cache[symbol] = default
+        return default
+
+    def _calc_quantity(self, symbol, price):
+        """
+        Calcular cantidad correcta garantizando mínimo MIN_TRADE_USDT.
+        Respeta el step size y precisión del contrato.
+        """
+        info     = self._get_contract_info(symbol)
+        step     = info['qty_step']   # unidades mínimas por orden
+        prec     = info['qty_prec']   # decimales permitidos
+
+        # Capital objetivo: el mayor entre lo configurado y el mínimo
+        capital  = max(MAX_POSITION_SIZE, MIN_TRADE_USDT)
+
+        # Cantidad bruta
+        raw_qty  = capital / price
+
+        # Ajustar al step size (redondear HACIA ARRIBA al step más cercano)
+        import math
+        stepped  = math.ceil(raw_qty / step) * step
+
+        # Redondear a la precisión permitida
+        quantity = round(stepped, prec)
+
+        # Verificar valor resultante
+        value    = quantity * price
+
+        # Si el valor sigue siendo menor al mínimo, subir un step más
+        while value < MIN_TRADE_USDT and step > 0:
+            quantity += step
+            quantity  = round(quantity, prec)
+            value     = quantity * price
+
+        return quantity, value
+
     def open_trade(self, symbol, direction, price):
-        """Abrir posición en BingX con TP y SL"""
+        """Abrir posición en BingX con TP y SL - mínimo MIN_TRADE_USDT garantizado"""
         if not AUTO_TRADING:
             logger.info(f"📊 SEÑAL ({direction}): {symbol} @ ${price:.4f} [auto-trading OFF]")
             return False
-        
+
         try:
-            # Calcular capital: usar el mayor entre MAX_POSITION_SIZE y MIN_TRADE_USDT
-            capital = max(MAX_POSITION_SIZE, MIN_TRADE_USDT)
-            quantity = self._round_quantity(capital / price, price)
-            
-            # Verificar valor mínimo USDT tras el redondeo
-            trade_value = quantity * price
+            quantity, trade_value = self._calc_quantity(symbol, price)
+
+            # Rechazo explícito si no llega al mínimo
             if trade_value < MIN_TRADE_USDT:
-                # Forzar cantidad mínima hacia arriba
-                quantity = self._round_quantity((MIN_TRADE_USDT / price) * 1.05, price)
-                trade_value = quantity * price
-            
-            # Si sigue siendo menor al mínimo, rechazar el trade
-            if trade_value < MIN_TRADE_USDT:
-                logger.warning(f"   ❌ {symbol} RECHAZADO: valor ${trade_value:.4f} < mínimo ${MIN_TRADE_USDT} USDT")
+                logger.warning(f"   ❌ {symbol} RECHAZADO: ${trade_value:.4f} < mínimo ${MIN_TRADE_USDT} USDT")
                 return False
-            
+
             tp_price = price * (1 + TAKE_PROFIT_PCT / 100) if direction == 'LONG' else price * (1 - TAKE_PROFIT_PCT / 100)
             sl_price = price * (1 - STOP_LOSS_PCT  / 100) if direction == 'LONG' else price * (1 + STOP_LOSS_PCT  / 100)
-            
+
             logger.info(f"\n🔄 Abriendo {direction} {symbol}:")
             logger.info(f"   Precio:    ${price:.6f}")
-            logger.info(f"   Cantidad:  {quantity} (${trade_value:.2f} USDT)")
+            logger.info(f"   Cantidad:  {quantity} (${trade_value:.2f} USDT)  ← mín ${MIN_TRADE_USDT}")
             logger.info(f"   TP:        ${tp_price:.6f} (+{TAKE_PROFIT_PCT}%)")
             logger.info(f"   SL:        ${sl_price:.6f} (-{STOP_LOSS_PCT}%)")
             
