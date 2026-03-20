@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BOT LONGS PROFESIONAL v3.1.0
+BOT LONGS PROFESIONAL v3.2.0
 ════════════════════════════════════════════════
 FIXES CRÍTICOS respecto a v3.0.2:
 
@@ -69,7 +69,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# FIX v3.1: fees reales BingX
+# FIX v3.2: fees reales BingX
 COMISION_MAKER  = 0.0002   # 0.02%
 COMISION_TAKER  = 0.0005   # 0.05%
 COMISION_ACTUAL = COMISION_MAKER if USE_LIMIT_ORDERS else COMISION_TAKER
@@ -153,7 +153,7 @@ class LongBot:
         fee_lbl = f"LÍMITE maker {COMISION_MAKER*100:.2f}%" if USE_LIMIT_ORDERS \
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
         log.info("=" * 65)
-        log.info("  BOT LONGS PROFESIONAL v3.1.0")
+        log.info("  BOT LONGS PROFESIONAL v3.2.0")
         log.info("  SOLO LONGS | Fees reales | Limit orders | Cooldown | Filtros")
         log.info("=" * 65)
         log.info(f"  Modo:        {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
@@ -178,7 +178,7 @@ class LongBot:
         self._get_symbols()
 
         self._tg(
-            f"<b>📈 Bot LONGS v3.1.0 iniciado</b>\n"
+            f"<b>📈 Bot LONGS v3.2.0 iniciado</b>\n"
             f"Capital: ${POSITION_SIZE} x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}%\n"
             f"Fee: {fee_lbl} | Score≥{MIN_SCORE} | TP mín:{TP_MIN_RENTABLE}%\n"
             f"Filtros: BTC bear, cooldown 15min, hora liquidez"
@@ -285,7 +285,7 @@ class LongBot:
         except: pass
 
     # ---------------------------------------------------------------- sizing
-    # FIX v3.1: usa usdt_amount, usa ctval, sin cap hardcodeado de 10 USDT
+    # FIX v3.2: usa usdt_amount, usa ctval, sin cap hardcodeado de 10 USDT
 
     def _qty_contratos(self, symbol, price, usdt_amount=None):
         if usdt_amount is None:
@@ -328,7 +328,7 @@ class LongBot:
         if symbol in self.open_trades: return None
         if not self._cooldown_ok(symbol): return None
         if not self._hora_ok(): return None
-        # FIX v3.1: bloquear LONG si BTC está cayendo fuerte
+        # FIX v3.2: bloquear LONG si BTC está cayendo fuerte
         if self._btc_change_1h <= -BTC_BEAR_BLOCK: return None
 
         closes, highs, lows, volumes, opens = self._klines(symbol, '5m', 60)
@@ -430,7 +430,7 @@ class LongBot:
         Entrada LONG (BUY):
         - LIMIT: precio por DEBAJO del mercado → espera en libro → maker 0.02%
         - Fallback MARKET con quantity (contratos)
-        FIX v3.1: LIMIT usa quantity (contratos), NO quoteOrderQty
+        FIX v3.2: LIMIT usa quantity (contratos), NO quoteOrderQty
         """
         qty_c, _ = self._qty_contratos(symbol, price, usdt_qty)
 
@@ -466,7 +466,7 @@ class LongBot:
 
     def _cond_order(self, symbol, qty_c, stop_price, otype):
         """
-        FIX v3.1: TP como TAKE_PROFIT (límite/maker 0.02%) con fallback a mercado.
+        FIX v3.2: TP como TAKE_PROFIT (límite/maker 0.02%) con fallback a mercado.
                   SL como STOP_MARKET (taker, garantiza ejecución).
         """
         if not qty_c or qty_c <= 0:
@@ -540,6 +540,47 @@ class LongBot:
 
     # ---------------------------------------------------------------- lifecycle
 
+    def _esperar_posicion(self, symbol, timeout=30):
+        """
+        FIX v3.2: Espera hasta que BingX confirme la posición abierta.
+        Devuelve (qty_real, entry_real) o (None, None) si timeout.
+        Sin esto, el TP/SL se coloca antes de que exista la posición → BingX lo rechaza.
+        """
+        log.info(f"  Esperando confirmación de posición {symbol} (max {timeout}s)...")
+        for i in range(timeout):
+            try:
+                d = bingx_request('GET', '/openApi/swap/v2/user/positions',
+                                  {'symbol': symbol}).json()
+                if d.get('code') == 0:
+                    for p in (d.get('data') or []):
+                        amt = float(p.get('positionAmt', 0) or 0)
+                        if amt > 0:  # LONG = positivo
+                            entry_real = float(p.get('avgPrice', 0) or
+                                               p.get('entryPrice', 0) or 0)
+                            qty_real   = abs(amt)
+                            log.info(f"  ✅ Posición confirmada: qty={qty_real} entry=${entry_real:.6f} ({i+1}s)")
+                            return qty_real, entry_real
+            except Exception as e:
+                log.debug(f"  _esperar_posicion {symbol}: {e}")
+            time.sleep(1)
+        log.warning(f"  ⏱ Timeout {timeout}s — posición no apareció en BingX")
+        return None, None
+
+    def _cancelar_ordenes_abiertas(self, symbol):
+        """Cancela todas las órdenes pendientes de un símbolo (ej: LIMIT no ejecutada)."""
+        try:
+            d = bingx_request('GET', '/openApi/swap/v2/trade/openOrders',
+                              {'symbol': symbol}).json()
+            if d.get('code') == 0:
+                for o in (d.get('data', {}).get('orders') or []):
+                    oid = o.get('orderId', '')
+                    if oid:
+                        bingx_request('DELETE', '/openApi/swap/v2/trade/order',
+                                      {'symbol': symbol, 'orderId': str(oid)})
+                        log.info(f"  🗑 Orden {oid} cancelada")
+        except Exception as e:
+            log.debug(f"  _cancelar_ordenes {symbol}: {e}")
+
     def open_trade(self, symbol, sig):
         if not AUTO_TRADING:
             log.info(f"  [SEÑAL] LONG {symbol} score:{sig['score']:.0f}"); return False
@@ -577,21 +618,62 @@ class LongBot:
             self._tg(f"⚠️ LONG {symbol} abierto SIN TP/SL — qty_c=0. Fijar manual.")
             return True
 
-        time.sleep(0.5)
-        tp_ok = self._cond_order(symbol, qty_c, tp_price, 'TAKE_PROFIT_MARKET')
+        # FIX v3.2: esperar confirmación de posición antes de colocar TP/SL
+        # Con LIMIT la posición no es inmediata — BingX rechaza TP/SL sin posición
+        qty_real, entry_real = self._esperar_posicion(symbol, timeout=30)
+
+        if qty_real is None:
+            # LIMIT no se ejecutó en 30s → cancelar y entrar a MARKET
+            log.warning(f"  LIMIT no ejecutada en 30s → cancelando, entrando a MERCADO")
+            self._cancelar_ordenes_abiertas(symbol)
+            time.sleep(0.5)
+            d_mkt = bingx_request('POST', '/openApi/swap/v2/trade/order', {
+                'symbol':symbol,'side':'BUY','positionSide':'LONG',
+                'type':'MARKET','quantity':str(qty_c),
+            }).json()
+            if d_mkt.get('code') == 0:
+                log.info(f"  Fallback MERCADO OK")
+                qty_real, entry_real = self._esperar_posicion(symbol, timeout=15)
+            if qty_real is None:
+                log.error(f"  No se pudo confirmar posición {symbol} — abortando TP/SL")
+                self._tg(f"⚠️ LONG {symbol} abierto SIN TP/SL — posición no confirmada. Fijar manual.")
+                self.open_trades[symbol] = {
+                    'entry':price,'qty_c':qty_c,'usdt_qty':usdt_qty,
+                    'tp':tp_price,'sl':sl_price,'tp_pct':sig['tp_pct'],'sl_pct':sig['sl_pct'],
+                    'highest':price,'order_id':oid,'tp_ok':False,'sl_ok':False,
+                    'opened_at':datetime.now(),'score':sig['score'],
+                }
+                return True
+
+        # Recalcular TP/SL con precio de entrada REAL de BingX
+        if entry_real and entry_real > 0:
+            tp_price = entry_real * (1 + sig['tp_pct'] / 100)
+            sl_price = entry_real * (1 - sig['sl_pct'] / 100)
+            log.info(f"  Entry real BingX: ${entry_real:.6f} | TP:${tp_price:.6f} SL:${sl_price:.6f}")
+
+        qty_para_tpsl = qty_real if qty_real else qty_c
+
+        tp_ok = self._cond_order(symbol, qty_para_tpsl, tp_price, 'TAKE_PROFIT_MARKET')
         time.sleep(0.3)
-        sl_ok = self._cond_order(symbol, qty_c, sl_price, 'STOP_MARKET')
+        sl_ok = self._cond_order(symbol, qty_para_tpsl, sl_price, 'STOP_MARKET')
 
         if not tp_ok or not sl_ok:
-            log.warning(f"  TP:{tp_ok} SL:{sl_ok} — reintentando en 2s")
-            time.sleep(2)
-            if not tp_ok: tp_ok = self._cond_order(symbol, qty_c, tp_price, 'TAKE_PROFIT_MARKET')
-            if not sl_ok: sl_ok = self._cond_order(symbol, qty_c, sl_price, 'STOP_MARKET')
+            log.warning(f"  TP:{tp_ok} SL:{sl_ok} — reintentando en 3s")
+            time.sleep(3)
+            if not tp_ok: tp_ok = self._cond_order(symbol, qty_para_tpsl, tp_price, 'TAKE_PROFIT_MARKET')
+            if not sl_ok: sl_ok = self._cond_order(symbol, qty_para_tpsl, sl_price, 'STOP_MARKET')
+            if not tp_ok or not sl_ok:
+                log.warning(f"  TP:{tp_ok} SL:{sl_ok} — tercer intento en 5s")
+                time.sleep(5)
+                if not tp_ok: tp_ok = self._cond_order(symbol, qty_para_tpsl, tp_price, 'TAKE_PROFIT_MARKET')
+                if not sl_ok: sl_ok = self._cond_order(symbol, qty_para_tpsl, sl_price, 'STOP_MARKET')
 
+        entry_final = entry_real if (entry_real and entry_real > 0) else price
+        qty_final   = qty_real   if qty_real  else qty_c
         self.open_trades[symbol] = {
-            'entry':price,'qty_c':qty_c,'usdt_qty':usdt_qty,
+            'entry':entry_final,'qty_c':qty_final,'usdt_qty':usdt_qty,
             'tp':tp_price,'sl':sl_price,'tp_pct':sig['tp_pct'],'sl_pct':sig['sl_pct'],
-            'highest':price,'order_id':oid,'tp_ok':tp_ok,'sl_ok':sl_ok,
+            'highest':entry_final,'order_id':oid,'tp_ok':tp_ok,'sl_ok':sl_ok,
             'opened_at':datetime.now(),'score':sig['score'],
         }
         self.stats['exec'] += 1
@@ -724,7 +806,7 @@ class LongBot:
     # ---------------------------------------------------------------- loop
 
     async def run(self):
-        log.info("\n▶  Bot LONGS v3.1.0 arrancado\n")
+        log.info("\n▶  Bot LONGS v3.2.0 arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
