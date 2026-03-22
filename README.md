@@ -1,225 +1,94 @@
-# 🤖 Bot de Trading Multi-Par Ultra-Optimizado v4
+# 🤖 Bot FUSION v1.0.0
+## Trend Magic + RMI Trend Sniper + EMA
 
-Bot automatizado que analiza 50+ pares de criptomonedas simultáneamente usando indicadores probados de TradingView. 
+### Estrategia
+Combina dos estrategias de TradingView:
+1. **Trend Magic** (CCI + ATR) → detecta tendencia principal
+2. **RMI Trend Sniper** (RSI + MFI) → detecta momentum
+3. **EMA 9/21/50** → confirma dirección
+4. **Bollinger Bands** → detecta sobreextensión
+5. **Volumen** → confirma la señal
 
-**Combina:**
-- Linear Regression Channel (tendencia)
-- Volatility Stop (ATR dinámico)
-- ADX, EMAs, RSI, MACD, Bollinger Bands
-- PDH/PDL (niveles de liquidez)
-- Volumen para confirmación
+### Señales
+- **LONG**: Trend Magic alcista + RMI cruza arriba de 66 + EMA alcista
+- **SHORT**: Trend Magic bajista + RMI cruza abajo de 30 + EMA bajista
 
-**Resultados:**
-- ✅ Win Rate: 55-65%
-- ✅ Retorno esperado: 10-20% mensual (perfil moderado)
-- ✅ Capital mínimo: $500
-- ✅ Totalmente automatizado 24/7
+---
 
-## ⚡ Inicio Rápido (10 minutos)
+## 🚀 Deploy en Railway
 
-### 1. Obtén credenciales
-- **BingX**: https://bingx.com → Account → API Management
-- **Telegram**: Busca @BotFather en Telegram, crea bot
-- **GitHub**: https://github.com (crea cuenta)
+### PASO 1 — Sube a GitHub
+1. Crea repositorio nuevo en GitHub
+2. Sube estos archivos: `main.py`, `requirements.txt`, `Procfile`
 
-### 2. Descarga archivos
-Todos estos archivos están listos en `/outputs`:
-```
-main.py, strategy.py, bingx_client.py, telegram_notifier.py,
-monitor_pairs.py, requirements.txt, Dockerfile, railway.json,
-.env.example, .gitignore
-```
+### PASO 2 — Conecta Railway
+1. Ve a [railway.app](https://railway.app)
+2. New Project → Deploy from GitHub
+3. Selecciona tu repositorio
 
-### 3. Crea archivo `.env`
-Copia `.env.example` a `.env` y reemplaza con tus credenciales:
+### PASO 3 — Variables de entorno
+En Railway → Variables → Raw Editor, pega:
+
 ```
 BINGX_API_KEY=tu_key
 BINGX_API_SECRET=tu_secret
 TELEGRAM_BOT_TOKEN=tu_token
 TELEGRAM_CHAT_ID=tu_chat_id
-SYMBOLS=BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,XRP-USDT,ADA-USDT,AVAX-USDT,MATIC-USDT,LINK-USDT,DOT-USDT
-TIMEFRAME=15m
-MAX_POSITION_SIZE=100
-MAX_POSITIONS=3
+AUTO_TRADING_ENABLED=true
+MAX_POSITION_SIZE=7
+MIN_TRADE_USDT=5
+LEVERAGE=3
+MAX_OPEN_TRADES=3
+TAKE_PROFIT_PCT=2.0
+STOP_LOSS_PCT=1.0
+TRAILING_STOP_ENABLED=true
+ENABLE_LONGS=true
+ENABLE_SHORTS=true
+MIN_SCORE=70
+MIN_VOLUME_24H=500000
+MAX_SYMBOLS_TO_ANALYZE=60
+BTC_FILTER_PCT=2.0
+CHECK_INTERVAL=120
+USE_LIMIT_ORDERS=true
+CCI_LENGTH=20
+ATR_LENGTH=5
+ATR_MULTIPLIER=1.0
+RMI_LENGTH=14
+RMI_POSITIVE=66
+RMI_NEGATIVE=30
 ```
-
-### 4. Prueba localmente (opcional)
-```bash
-pip install -r requirements.txt
-python monitor_pairs.py
-```
-
-### 5. Despliega en Railway
-1. Sube a GitHub
-2. Ve a https://railway.app
-3. "New Project" → "Deploy from GitHub"
-4. Selecciona tu repo
-5. Añade variables de entorno
-6. Deploy
-
-**¡Listo!** El bot está corriendo 24/7
-
-## 📊 Parámetros
-
-| Parámetro | Valor | Descripción |
-|-----------|-------|-------------|
-| SYMBOLS | 10 pares | Qué analizar |
-| TIMEFRAME | 15m | Marco temporal |
-| MAX_POSITIONS | 3 | Máximo simultáneas |
-| MAX_POSITION_SIZE | 100 USDT | Tamaño por posición |
-| LINREG_LENGTH | 50 | Período regresión lineal |
-| ADX_THRESHOLD | 25 | Fuerza mínima tendencia |
-| RISK_REWARD | 2.5 | Ratio riesgo/beneficio |
-
-## 🎯 Cómo Funciona
-
-El bot genera señal **LONG** cuando:
-- ✅ Precio cruza arriba de PDH (resistencia rota)
-- ✅ Régimen bullish (EMA Fast > EMA Slow)
-- ✅ ADX > 25 (tendencia fuerte)
-- ✅ MACD bullish
-- ✅ RSI 40-70 (alcista)
-- ✅ Volumen alto
-- ✅ Volatility Stop alcista
-
-**TODOS** los criterios deben cumplirse → **Señales de alta calidad**
-
-## 📈 Perfiles de Configuración
-
-### 🟢 Conservador
-```
-SYMBOLS=BTC-USDT,ETH-USDT,SOL-USDT
-TIMEFRAME=1h
-MAX_POSITION_SIZE=50
-MAX_POSITIONS=2
-```
-→ Capital: $500-1000 | Retorno: 5-10% mensual
-
-### 🟡 Moderado (RECOMENDADO)
-```
-SYMBOLS=BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,XRP-USDT,ADA-USDT,AVAX-USDT,MATIC-USDT,LINK-USDT,DOT-USDT
-TIMEFRAME=15m
-MAX_POSITION_SIZE=100
-MAX_POSITIONS=3
-```
-→ Capital: $1500-3000 | Retorno: 10-20% mensual
-
-### 🔴 Agresivo
-```
-SYMBOLS=BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,XRP-USDT,ADA-USDT,DOGE-USDT,AVAX-USDT,DOT-USDT,MATIC-USDT,LINK-USDT,UNI-USDT,ATOM-USDT,ARB-USDT,OP-USDT
-TIMEFRAME=5m
-MAX_POSITION_SIZE=150
-MAX_POSITIONS=5
-```
-→ Capital: $3000+ | Retorno: 20-40% mensual
-
-## 🛠️ Scripts Útiles
-
-### Monitor en tiempo real
-```bash
-python monitor_pairs.py
-```
-Analiza todos los pares y muestra:
-- Tabla con pares + señales
-- Confianza de cada señal
-- Indicadores individuales
-
-### Ejecutar bot localmente
-```bash
-python main.py
-```
-(Requiere .env configurado)
-
-## 📊 Indicadores Utilizados
-
-| Indicador | Período | Uso |
-|-----------|---------|-----|
-| Linear Regression | 50 | Tendencia principal |
-| Volatility Stop | 14 ATR | Confirmación dinámica |
-| ADX | 14 | Fuerza tendencia |
-| EMA Fast | 20 | Cruce rápido |
-| EMA Slow | 50 | Cruce lento |
-| EMA Trend | 200 | Régimen mercado |
-| RSI | 14 | Momentum |
-| MACD | 12/26/9 | Momentum |
-| Bollinger Bands | 20/2 | Extensión |
-| Volumen | 20 SMA | Confirmación |
-
-## ⚠️ Gestión de Riesgo
-
-- **Riesgo por trade**: 2% del capital
-- **Stop Loss**: Banda inferior LinReg
-- **Take Profit**: 2.5x el riesgo
-- **Máx diarios**: Configurable
-
-Ejemplo con $1000:
-- Riesgo: $20 por trade
-- Pérdida máxima: -$20
-- Ganancia si ganas: +$50
-- Break-even con 40% win rate
-
-## 📱 Notificaciones Telegram
-
-Recibes alertas de:
-- ✅ Entrada LONG/SHORT (con confianza)
-- 🔒 Cierre de posición (con PnL)
-- ⚠️ Errores
-- 🤖 Estado del bot
-
-## 🔒 Seguridad
-
-- ✅ API Keys en `.env` (nunca en GitHub)
-- ✅ Usa permisos mínimos en BingX
-- ✅ Habilita IP whitelist si es posible
-- ✅ Comienza con capital pequeño
-
-## 🆘 Troubleshooting
-
-| Problema | Solución |
-|----------|----------|
-| No recibo notificaciones | Verifica Chat ID + inicia chat con bot |
-| Sin señales generadas | El bot es muy selectivo. Usa monitor_pairs.py para diagnosticar |
-| Error API BingX | Verifica API Key/Secret + espera 5 min después de crear |
-| Bot no inicia | Revisa logs en Railway |
-
-## 📚 Documentación
-
-- **INSTRUCCIONES_COMPLETAS.txt** - Guía paso a paso
-- **.env.example** - Template con explicaciones
-- **Codigo comentado** - Entiende cada indicador
-
-## 💡 Próximos Pasos
-
-1. Prueba con $100-500 primero
-2. Observa 1-2 semanas
-3. Revisa PnL y adjust configuración
-4. Si win rate > 60%, aumenta capital
-5. Considera pasar a perfil Agresivo
-
-## ⚖️ Disclaimer
-
-⚠️ **El trading de criptomonedas conlleva riesgos significativos**
-
-- Puedes perder TODO tu capital
-- El rendimiento pasado no garantiza futuro
-- Este bot es para fines educativos
-- Usa dinero que puedas permitirte perder
-- No somos asesores financieros
-
-## 📄 Licencia
-
-MIT - Libre para usar, modificar y distribuir
-
-## 🚀 Empezar Ahora
-
-1. Descarga los 11 archivos de `/outputs`
-2. Configura `.env`
-3. Sube a GitHub
-4. Despliega en Railway
-5. ¡A tradear!
 
 ---
 
-**Bot desarrollado con indicadores probados de TradingView**
+## ⚙️ Configuración BingX API
+1. BingX → Perfil → Gestión de API
+2. Permisos: ✅ Leer + ✅ Trading con Futuros Perpetuo
+3. Sin restricciones de IP
 
-Más información: Ver INSTRUCCIONES_COMPLETAS.txt
+## 📱 Configuración Telegram
+1. Busca @BotFather en Telegram
+2. /newbot → copia el token
+3. Busca @userinfobot → obtén tu chat_id
+
+---
+
+## 📊 Parámetros recomendados con $60-100 USDT
+
+| Parámetro | Valor | Por qué |
+|---|---|---|
+| MAX_POSITION_SIZE | 7 | ~10% del capital |
+| LEVERAGE | 3 | Sin riesgo de liquidación |
+| MAX_OPEN_TRADES | 3 | Máximo $21 comprometido |
+| MIN_SCORE | 70 | Balance entre señales y calidad |
+| TP_PCT | 2.0 | RR 2:1 con SL de 1% |
+
+---
+
+## 🔍 Cómo leer los logs
+```
+★ 📈 LONG BTC-USDT score:85    → señal detectada
+TrendMagic_BULL(35) | RMI_BUY(72)(40) | EMA_BULL+(20)  → razones
+ENTRADA LÍMITE OK 5.0 contratos @ $1.234 maker  → orden ejecutada
+TP ✅ @ $1.259  SL ✅ @ $1.221  → protecciones activas
+✅ TAKE PROFIT BTC-USDT PnL:+$0.42  → ganancia
+```
