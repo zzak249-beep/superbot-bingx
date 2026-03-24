@@ -1,23 +1,38 @@
 #!/usr/bin/env python3
 """
-BOT SHORTS PROFESIONAL v2.4
-════════════════════════════════════════════════
-FIX CRÍTICO v2.3:
-  1. _qty_contratos() ahora recibe usdt_amount como parámetro.
-     Antes: siempre usaba POSITION_SIZE global (70 USDT) aunque la
-     entrada real era de 8 USDT → contratos 8.75x mayores → BingX
-     rechazaba TP/SL silenciosamente porque la qty > posición real.
-     Ahora: usa el usdt_qty real de la entrada.
+BOT SHORTS PROFESIONAL v3.0
+════════════════════════════════════════════════════════════════
+NOVEDADES v3.0 — Integración de filosofías avanzadas:
 
-  2. Eliminado el cap hardcodeado min(POSITION_SIZE, 8.0) en open_trade.
-     Antes: ignoraba MAX_POSITION_SIZE del .env → entraba con $8 siempre.
-     Ahora: usa POSITION_SIZE directamente (respeta el .env).
+  1. MOVING AVERAGE ENVELOPES (MAE) como filtro de contexto:
+     - Banda +2% / -2% sobre MA20 (configurable MAE_PCT)
+     - Modo RANGO: señal SHORT cuando precio cierra BAJO la banda +2%
+     - Modo TENDENCIA ALCISTA: precio sobre banda → sólo retrocesos
+     - Filtra entradas en momento equivocado del ciclo
 
-  3. _place_short_entry y open_trade pasan usdt_qty a _qty_contratos.
+  2. PATRONES CHARTISTAS (detección automática):
+     - Head & Shoulders         → SHORT potente
+     - Double Top               → SHORT confirmado
+     - Rising Wedge             → SHORT en ruptura
+     - Bearish Flag             → SHORT en continuación
+     - Breakdown de soporte     → SHORT momentum
 
-FIX CRÍTICO v2.2 (anterior):
-  _cond_order() usa quantity en contratos para TP/SL.
-  BingX NO soporta quoteOrderQty en STOP_MARKET ni TAKE_PROFIT_MARKET.
+  3. LÓGICA DE CONTEXTO (Range vs Trend):
+     - detect_market_regime() clasifica el mercado
+     - En RANGO: MAE como zonas de reversión (sell extremos +2%)
+     - En TENDENCIA: MAE como filtro (no luchar contra impulso)
+
+  4. SCORING MEJORADO:
+     - Patrones chartistas añaden 25-40 puntos al score
+     - MAE en posición extrema añade 20-30 puntos
+     - Régimen de mercado penaliza/bonifica señales
+
+  HERENCIA v2.4:
+  - FIX qty_contratos usa usdt_amount real (no POSITION_SIZE global)
+  - TP como orden LÍMITE (maker 0.02%), SL como STOP_MARKET (taker)
+  - Trailing stop, cooldown 15min, filtro BTC alcista
+  - Retry API, Telegram HTML, sync BingX posiciones
+════════════════════════════════════════════════════════════════
 """
 
 import os, asyncio, logging, requests, hmac, hashlib, time, sys, math, re
@@ -55,10 +70,17 @@ MAX_TRADES    = clean('MAX_OPEN_TRADES',         '2',   'int')
 INTERVAL      = clean('CHECK_INTERVAL',         '120',  'int')
 MIN_VOLUME    = clean('MIN_VOLUME_24H',       '50000',  'float')
 MAX_SYMBOLS   = clean('MAX_SYMBOLS_TO_ANALYZE', '90',   'int')
-MIN_SCORE     = clean('MIN_SCORE',              '75',   'float')
+MIN_SCORE     = clean('MIN_SCORE',              '72',   'float')  # bajado 3pts porque patrones son más selectivos
 TRAILING      = clean('TRAILING_STOP_ENABLED', 'true',  'bool')
 USE_LIMIT_ORDERS   = clean('USE_LIMIT_ORDERS',      'true', 'bool')
 BTC_BULL_BLOCK_PCT = clean('BTC_BULL_BLOCK_PCT',    '1.5',  'float')
+
+# ── NUEVOS parámetros v3.0 ───────────────────────────────────────
+MAE_PERIOD    = clean('MAE_PERIOD',     '20',  'int')    # MA base de envelopes
+MAE_PCT       = clean('MAE_PCT',        '2.0', 'float')  # banda ±2%
+MAE_EXTREME   = clean('MAE_EXTREME',    '1.8', 'float')  # % sobre banda para "extremo"
+PATTERN_SCORE = clean('PATTERN_SCORE', 'true', 'bool')   # activar/desactivar bonus patrones
+REGIME_FILTER = clean('REGIME_FILTER', 'true', 'bool')   # activar filtro régimen mercado
 
 LIMIT_OFFSET_PCT = 0.05
 SKIP_HOURS_UTC   = {0, 1}
@@ -101,7 +123,7 @@ def bingx_request(method, endpoint, params, retries=2):
                 raise
 
 # ============================================================================
-# INDICADORES
+# INDICADORES BASE
 # ============================================================================
 
 def calc_ema(prices, period):
@@ -110,6 +132,10 @@ def calc_ema(prices, period):
     k, e = 2 / (period + 1), prices[0]
     for p in prices[1:]: e = p * k + e * (1 - k)
     return e
+
+def calc_sma(prices, period):
+    if len(prices) < period: return sum(prices) / len(prices)
+    return sum(prices[-period:]) / period
 
 def calc_rsi(prices, period=14):
     if len(prices) < period + 1: return 50.0
@@ -145,6 +171,361 @@ def vol_spike(volumes):
     return (volumes[-1] / avg) if avg > 0 else 1.0
 
 # ============================================================================
+# MOVING AVERAGE ENVELOPES — nuevo módulo v3.0
+# ============================================================================
+
+def calc_mae(prices, period=20, pct=2.0):
+    """
+    Moving Average Envelopes.
+    Retorna: (upper_band, ma, lower_band, position)
+    position: >1.0 = sobre banda superior (extremo alcista)
+              <-1.0 = bajo banda inferior (extremo bajista)
+              0..1 = dentro del rango, lado superior
+              -1..0 = dentro del rango, lado inferior
+    """
+    if len(prices) < period:
+        ma = sum(prices) / len(prices)
+    else:
+        ma = calc_sma(prices, period)
+    
+    factor = pct / 100.0
+    upper = ma * (1 + factor)
+    lower = ma * (1 - factor)
+    price = prices[-1]
+    
+    band_width = upper - lower
+    if band_width > 0:
+        # normalizado: 0 = en lower, 1 = en upper, >1 = encima upper, <0 = debajo lower
+        position = (price - lower) / band_width
+    else:
+        position = 0.5
+    
+    return upper, ma, lower, position
+
+def mae_regime_score(prices, period=20, pct=2.0):
+    """
+    Evalúa si el precio está en zona de SHORT según MAE.
+    
+    Filosofía (imagen 2):
+    - Mercado RANGO: precio cierra POR DEBAJO de banda +2% → SHORT (reversión a media)
+    - Mercado TENDENCIA: precio por encima de banda = impulso, NO luchar
+    
+    Retorna: (puntos, descripción, régimen)
+    """
+    upper, ma, lower, pos = calc_mae(prices, period, pct)
+    price = prices[-1]
+    
+    # Detectar régimen: pendiente de la MA
+    if len(prices) >= period + 5:
+        ma_old = calc_sma(prices[:-5], period)
+        ma_slope_pct = (ma - ma_old) / ma_old * 100 if ma_old > 0 else 0
+    else:
+        ma_slope_pct = 0
+    
+    is_uptrend   = ma_slope_pct >  0.5   # MA sube > 0.5% en 5 velas
+    is_downtrend = ma_slope_pct < -0.3   # MA baja > 0.3% en 5 velas
+    is_ranging   = not is_uptrend and not is_downtrend
+    
+    score = 0
+    desc  = ""
+    
+    if is_ranging:
+        regime = "RANGO"
+        if pos >= 0.95:          # precio tocando o sobre banda superior → extremo, reversión
+            score = 30; desc = f"MAE_TOP_RANGO(30) pos:{pos:.2f}"
+        elif pos >= 0.80:
+            score = 20; desc = f"MAE_ALTO_RANGO(20) pos:{pos:.2f}"
+        elif pos >= 0.60:
+            score = 8;  desc = f"MAE_MEDIO+(8) pos:{pos:.2f}"
+        elif pos <= 0.30:
+            score = -15; desc = f"MAE_BAJO(-15) pos:{pos:.2f}"
+        else:
+            score = 0;   desc = f"MAE_NEUTRAL(0) pos:{pos:.2f}"
+    
+    elif is_downtrend:
+        regime = "BAJISTA"
+        # En downtrend cualquier rebote a la banda media/superior es buena entrada short
+        if pos >= 0.70:
+            score = 25; desc = f"MAE_REBOTE_BAJISTA(25) pos:{pos:.2f}"
+        elif pos >= 0.50:
+            score = 15; desc = f"MAE_MEDIO_BAJISTA(15) pos:{pos:.2f}"
+        else:
+            score = 5;  desc = f"MAE_BAJISTA_OK(5) pos:{pos:.2f}"
+    
+    else:  # UPTREND
+        regime = "ALCISTA"
+        # En uptrend fuerte NO entrar short (precio sobre banda = impulso)
+        if pos > 1.05:
+            score = -25; desc = f"MAE_IMPULSO_ALCISTA(-25) pos:{pos:.2f}"
+        elif pos > 0.90:
+            score = -12; desc = f"MAE_ALCISTA_FUERTE(-12) pos:{pos:.2f}"
+        elif pos < 0.40:
+            # Retroceso en uptrend (precio vuelve a MA o below) → posible short de corta duración
+            score = 10; desc = f"MAE_RETROCESO_ALCISTA(10) pos:{pos:.2f}"
+        else:
+            score = -5; desc = f"MAE_ALCISTA(-5) pos:{pos:.2f}"
+    
+    return score, desc, regime, pos, upper, ma, lower
+
+# ============================================================================
+# DETECCIÓN DE PATRONES CHARTISTAS — nuevo módulo v3.0
+# ============================================================================
+
+def find_pivots(prices, window=3):
+    """Detecta máximos y mínimos locales con ventana configurable."""
+    highs, lows = [], []
+    for i in range(window, len(prices) - window):
+        if all(prices[i] >= prices[i-j] and prices[i] >= prices[i+j] for j in range(1, window+1)):
+            highs.append((i, prices[i]))
+        if all(prices[i] <= prices[i-j] and prices[i] <= prices[i+j] for j in range(1, window+1)):
+            lows.append((i, prices[i]))
+    return highs, lows
+
+def detect_double_top(closes, highs_list, tolerance=0.015):
+    """
+    Double Top: dos máximos similares con valle en medio.
+    Señal SHORT: precio rompe el cuello (valley).
+    """
+    if len(highs_list) < 2: return False, 0, ""
+    
+    h1_idx, h1_val = highs_list[-2]
+    h2_idx, h2_val = highs_list[-1]
+    
+    # Los dos máximos deben ser similares (dentro del tolerance)
+    diff = abs(h1_val - h2_val) / max(h1_val, h2_val)
+    if diff > tolerance: return False, 0, ""
+    
+    # Debe haber un valle significativo entre ellos
+    valley_prices = closes[h1_idx:h2_idx]
+    if not valley_prices: return False, 0, ""
+    valley = min(valley_prices)
+    
+    # El valle debe ser al menos 1% menor que los máximos
+    neck_drop = (max(h1_val, h2_val) - valley) / max(h1_val, h2_val)
+    if neck_drop < 0.01: return False, 0, ""
+    
+    # Precio actual cerca del segundo máximo o justo rompiendo el cuello
+    cur = closes[-1]
+    near_top  = cur >= h2_val * 0.985
+    at_neck   = cur <= valley * 1.005 and cur >= valley * 0.98
+    
+    if near_top:
+        score = 35
+        desc  = f"DoubleTop_TOP({score})"
+        return True, score, desc
+    if at_neck:
+        score = 40
+        desc  = f"DoubleTop_NECK({score})"
+        return True, score, desc
+    
+    return False, 0, ""
+
+def detect_head_shoulders(closes, highs_list, tolerance=0.02):
+    """
+    Head & Shoulders: hombro izq < cabeza > hombro der, precio en neckline.
+    Señal SHORT: clásica inversión.
+    """
+    if len(highs_list) < 3: return False, 0, ""
+    
+    ls_idx, ls_val = highs_list[-3]
+    h_idx,  h_val  = highs_list[-2]
+    rs_idx, rs_val = highs_list[-1]
+    
+    # Cabeza debe ser el mayor de los tres
+    if not (h_val > ls_val and h_val > rs_val): return False, 0, ""
+    
+    # Hombros deben ser similares en altura (±2%)
+    shoulder_diff = abs(ls_val - rs_val) / max(ls_val, rs_val)
+    if shoulder_diff > tolerance: return False, 0, ""
+    
+    # Precio actual por debajo del hombro derecho → breakout del neckline
+    cur = closes[-1]
+    if cur <= rs_val * 0.995:
+        score = 38
+        desc  = f"H&S_BREAK({score})"
+        return True, score, desc
+    
+    # Precio cerca del hombro derecho → entrada anticipada
+    if cur >= rs_val * 0.99:
+        score = 28
+        desc  = f"H&S_SHOULDER({score})"
+        return True, score, desc
+    
+    return False, 0, ""
+
+def detect_rising_wedge(closes, highs_list, lows_list, min_points=3):
+    """
+    Rising Wedge: máximos y mínimos subiendo pero convergiendo.
+    Señal SHORT: ruptura bajista inminente.
+    """
+    if len(highs_list) < min_points or len(lows_list) < min_points:
+        return False, 0, ""
+    
+    recent_highs = highs_list[-min_points:]
+    recent_lows  = lows_list[-min_points:]
+    
+    # Pendiente de máximos y mínimos
+    def slope(points):
+        if len(points) < 2: return 0
+        x1, y1 = points[0]
+        x2, y2 = points[-1]
+        return (y2 - y1) / (x2 - x1) if x2 != x1 else 0
+    
+    s_h = slope(recent_highs)
+    s_l = slope(recent_lows)
+    
+    # Ambas pendientes positivas (precio subiendo)
+    if s_h <= 0 or s_l <= 0: return False, 0, ""
+    
+    # Mínimos suben más rápido que máximos → convergencia (cuña)
+    if not (s_l > s_h * 0.7): return False, 0, ""
+    
+    # Precio cerca del vértice de la cuña (extremo superior)
+    cur = closes[-1]
+    last_high = recent_highs[-1][1]
+    last_low  = recent_lows[-1][1]
+    range_sz  = last_high - last_low
+    
+    if range_sz > 0:
+        pos_in_wedge = (cur - last_low) / range_sz
+        if pos_in_wedge >= 0.75:  # precio en la parte alta de la cuña
+            score = 30
+            desc  = f"RisingWedge_TOP({score})"
+            return True, score, desc
+    
+    return False, 0, ""
+
+def detect_bearish_flag(closes, volumes, highs_list):
+    """
+    Bearish Flag: caída fuerte (mástil) seguida de consolidación lateral/ligero alza.
+    Señal SHORT: continuación bajista.
+    """
+    if len(closes) < 20: return False, 0, ""
+    
+    # Detectar mástil: caída > 3% en las últimas 5-8 velas
+    mast_start = -12
+    mast_end   = -6
+    
+    mast_change = (closes[mast_end] - closes[mast_start]) / closes[mast_start] * 100
+    if mast_change > -2.5: return False, 0, ""  # no hay mástil bajista
+    
+    # Consolidación: las últimas 5 velas en rango estrecho (<1.5%)
+    flag_prices = closes[-5:]
+    flag_range  = (max(flag_prices) - min(flag_prices)) / min(flag_prices) * 100
+    if flag_range > 2.0: return False, 0, ""  # no es consolidación
+    
+    # Volumen: debe haber bajado durante la bandera vs el mástil
+    if len(volumes) >= 10:
+        vol_mast = sum(volumes[-10:-5]) / 5
+        vol_flag = sum(volumes[-5:]) / 5
+        vol_ok   = vol_flag < vol_mast  # volumen decrece en flag
+    else:
+        vol_ok = True
+    
+    if vol_ok:
+        score = 32
+        desc  = f"BearishFlag({score})"
+        return True, score, desc
+    
+    # Sin confirmación de volumen, señal más débil
+    score = 18
+    desc  = f"BearishFlag_noVol({score})"
+    return True, score, desc
+
+def detect_support_breakdown(closes, lows_list, tolerance=0.008):
+    """
+    Ruptura de soporte: precio rompe nivel horizontal de soporte con fuerza.
+    Señal SHORT: continuación bajista tras ruptura.
+    """
+    if len(lows_list) < 2 or len(closes) < 5: return False, 0, ""
+    
+    # Soporte: mínimo reciente que fue testeado al menos 2 veces
+    recent_lows_vals = [v for _, v in lows_list[-6:]]
+    if len(recent_lows_vals) < 2: return False, 0, ""
+    
+    # Agrupar mínimos similares (±0.8%) para encontrar zona de soporte
+    support_level = None
+    for i, low in enumerate(recent_lows_vals):
+        touches = sum(1 for l in recent_lows_vals if abs(l - low) / low < tolerance)
+        if touches >= 2:
+            support_level = low; break
+    
+    if not support_level: return False, 0, ""
+    
+    cur = closes[-1]
+    # Precio rompió el soporte (>0.5% por debajo)
+    if cur < support_level * (1 - tolerance):
+        score = 28
+        desc  = f"SupportBreak({score})"
+        return True, score, desc
+    
+    return False, 0, ""
+
+def scan_patterns(closes, highs_raw, lows_raw, volumes):
+    """
+    Ejecuta todos los detectores de patrones y suma scores.
+    Retorna: (total_score, lista_patrones_detectados)
+    """
+    if not closes or len(closes) < 20:
+        return 0, []
+    
+    highs_list, lows_list = find_pivots(closes, window=3)
+    
+    patterns = []
+    total    = 0
+    
+    # Double Top
+    ok, sc, dsc = detect_double_top(closes, highs_list)
+    if ok: patterns.append(dsc); total += sc
+    
+    # Head & Shoulders
+    ok, sc, dsc = detect_head_shoulders(closes, highs_list)
+    if ok: patterns.append(dsc); total += sc
+    
+    # Rising Wedge
+    ok, sc, dsc = detect_rising_wedge(closes, highs_list, lows_list)
+    if ok: patterns.append(dsc); total += sc
+    
+    # Bearish Flag
+    ok, sc, dsc = detect_bearish_flag(closes, volumes, highs_list)
+    if ok: patterns.append(dsc); total += sc
+    
+    # Support Breakdown
+    ok, sc, dsc = detect_support_breakdown(closes, lows_list)
+    if ok: patterns.append(dsc); total += sc
+    
+    return total, patterns
+
+# ============================================================================
+# DETECTOR DE RÉGIMEN DE MERCADO
+# ============================================================================
+
+def detect_market_regime(closes, period=20):
+    """
+    Clasifica el mercado en: TREND_UP, TREND_DOWN, RANGING
+    Basado en pendiente MA + ADX simplificado (ratio ATR/precio).
+    """
+    if len(closes) < period + 5:
+        return "UNKNOWN"
+    
+    ma_now  = calc_sma(closes, period)
+    ma_old  = calc_sma(closes[:-5], period)
+    
+    slope_pct = (ma_now - ma_old) / ma_old * 100 if ma_old > 0 else 0
+    
+    # Calcular "trending strength" como desviación de precio respecto a MA
+    deviations = [abs(c - ma_now) / ma_now * 100 for c in closes[-period:]]
+    avg_dev = sum(deviations) / len(deviations)
+    
+    # Alto avg_dev + slope = tendencia; bajo avg_dev = rango
+    if slope_pct > 0.6 and avg_dev > 0.8:
+        return "TREND_UP"
+    elif slope_pct < -0.4 and avg_dev > 0.6:
+        return "TREND_DOWN"
+    else:
+        return "RANGING"
+
+# ============================================================================
 # BOT
 # ============================================================================
 
@@ -153,18 +534,20 @@ class ShortBot:
     def __init__(self):
         fee_lbl = f"LÍMITE maker {COMISION_MAKER*100:.2f}%" if USE_LIMIT_ORDERS \
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
-        log.info("=" * 65)
-        log.info("  BOT SHORTS PROFESIONAL v2.4")
-        log.info("  FIX v2.4: fees reales 0.02/0.05%, entrada MAKER, TP límite")
-        log.info("  FIX v2.2: TP/SL siempre en contratos")
-        log.info("=" * 65)
+        log.info("=" * 70)
+        log.info("  BOT SHORTS PROFESIONAL v3.0")
+        log.info("  NUEVO: MA Envelopes + Patrones Chartistas + Régimen Mercado")
+        log.info("  FIX v2.4: fees reales 0.02/0.05%, TP maker, qty real")
+        log.info("=" * 70)
         log.info(f"  Modo:      {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
         log.info(f"  Capital:   ${POSITION_SIZE} USDT | Leverage: {LEVERAGE}x")
         log.info(f"  TP/SL:     {TP_PCT}% / {SL_PCT}%  RR:{TP_PCT/SL_PCT:.1f}:1")
         log.info(f"  TP mín:    {TP_MIN_RENTABLE}% (cubre comisiones)")
         log.info(f"  Órdenes:   {fee_lbl}")
+        log.info(f"  MAE:       MA{MAE_PERIOD} ±{MAE_PCT}% (filtro contexto)")
+        log.info(f"  Patrones:  {'ON' if PATTERN_SCORE else 'OFF'} | Régimen: {'ON' if REGIME_FILTER else 'OFF'}")
         log.info(f"  BTC filtro:{BTC_BULL_BLOCK_PCT}% | Cooldown:15min")
-        log.info("=" * 65)
+        log.info("=" * 70)
 
         self.symbols         = []
         self.open_trades     = {}
@@ -178,8 +561,8 @@ class ShortBot:
         self._load_contracts()
         self._get_symbols()
         self._tg(
-            f"<b>🔴 Bot SHORTS v2.4 iniciado</b>\n"
-            f"FIX: qty_c ahora coincide con entrada real\n"
+            f"<b>🔴 Bot SHORTS v3.0 iniciado</b>\n"
+            f"NUEVO: MAE ±{MAE_PCT}% + Patrones Chartistas\n"
             f"Capital: ${POSITION_SIZE} x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}%\n"
             f"Fee: {fee_lbl} | Score≥{MIN_SCORE}"
         )
@@ -254,7 +637,8 @@ class ShortBot:
 
     # ---------------------------------------------------------------- datos
 
-    def _klines(self, symbol, interval='5m', limit=60):
+    def _klines(self, symbol, interval='5m', limit=80):
+        """Aumentado a 80 velas para dar más datos a los detectores de patrones."""
         try:
             d = requests.get(f"{BASE_URL}/openApi/swap/v3/quote/klines",
                 params={'symbol':symbol,'interval':interval,'limit':limit}, timeout=10).json()
@@ -285,14 +669,8 @@ class ShortBot:
         except: pass
 
     # ---------------------------------------------------------------- sizing
-    # FIX v2.3: acepta usdt_amount para calcular qty correcta según entrada real
 
     def _qty_contratos(self, symbol, price, usdt_amount=None):
-        """
-        Calcula cantidad en contratos basada en usdt_amount.
-        FIX v2.3: usa usdt_amount en lugar de POSITION_SIZE global,
-        así qty_c coincide con la entrada real y BingX acepta el TP/SL.
-        """
         if usdt_amount is None:
             usdt_amount = POSITION_SIZE
 
@@ -310,7 +688,6 @@ class ShortBot:
         while val < MIN_TRADE and i < 500:
             qty += step; qty = round(qty, prec); val = qty * ppc; i += 1
 
-        # Cap: nunca más de usdt_amount * 1.3
         if val > usdt_amount * 1.3:
             qty = round(math.floor((usdt_amount * 1.3 / ppc) / step) * step, prec)
             val = qty * ppc
@@ -318,7 +695,7 @@ class ShortBot:
         log.info(f"    qty_contratos: {qty} × ${ppc:.6f} = ${val:.2f} USDT")
         return qty, round(val, 4)
 
-    # ---------------------------------------------------------------- análisis
+    # ---------------------------------------------------------------- análisis principal
 
     def _cooldown_ok(self, symbol):
         ts = self._cooldowns.get(symbol)
@@ -332,8 +709,8 @@ class ShortBot:
         if not self._hora_ok(): return None
         if self._btc_change_1h >= BTC_BULL_BLOCK_PCT: return None
 
-        closes, highs, lows, volumes, opens = self._klines(symbol, '5m', 60)
-        if not closes or len(closes) < 26: return None
+        closes, highs, lows, volumes, opens = self._klines(symbol, '5m', 80)
+        if not closes or len(closes) < 30: return None
 
         ticker = self._ticker(symbol)
         if not ticker or ticker['price'] <= 0: return None
@@ -341,6 +718,7 @@ class ShortBot:
         price  = ticker['price']
         change = ticker['change']
 
+        # ── Indicadores base ────────────────────────────────────────
         ema9  = calc_ema(closes, 9)
         ema21 = calc_ema(closes, 21)
         ema50 = calc_ema(closes, min(50, len(closes)))
@@ -351,8 +729,6 @@ class ShortBot:
         atr   = calc_atr(highs, lows, closes, 14)
         vs    = vol_spike(volumes)
 
-        if not (ema9 < ema21 < ema50): return None
-
         ema_gap  = abs(ema9 - ema21) / ema21 * 100 if ema21 > 0 else 0
         trend_5  = (closes[-1] - closes[-6])  / closes[-6]  * 100 if len(closes) >= 6  else 0
         trend_10 = (closes[-1] - closes[-11]) / closes[-11] * 100 if len(closes) >= 11 else 0
@@ -361,12 +737,42 @@ class ShortBot:
         red_candles  = sum(1 for i in range(-4, 0) if opens and closes[i] < opens[i]) if opens else 0
         atr_pct      = (atr / price * 100) if price > 0 else 0
 
+        # ── Moving Average Envelopes ─────────────────────────────────
+        mae_score, mae_desc, mae_regime, mae_pos, mae_upper, mae_ma, mae_lower = \
+            mae_regime_score(closes, MAE_PERIOD, MAE_PCT)
+
+        # ── Régimen de mercado ───────────────────────────────────────
+        regime = detect_market_regime(closes, MAE_PERIOD)
+
+        # ── Patrones chartistas ──────────────────────────────────────
+        pattern_total = 0
+        pattern_list  = []
+        if PATTERN_SCORE:
+            pattern_total, pattern_list = scan_patterns(closes, highs, lows, volumes)
+
+        # ── Filtro de régimen ────────────────────────────────────────
+        # En mercado alcista sin patrones de reversión → skip
+        if REGIME_FILTER and regime == "TREND_UP" and not pattern_list:
+            if self._btc_change_1h < 0:  # al menos BTC bajando un poco
+                pass  # permitir si contexto general bajista
+            else:
+                return None
+
+        # ── EMA alignment (condición base) ───────────────────────────
+        if not (ema9 < ema21 < ema50):
+            # Con patrón fuerte, relajamos el filtro EMA
+            if not pattern_list or pattern_total < 30:
+                return None
+
+        # ── Scoring ─────────────────────────────────────────────────
         score_min = MIN_SCORE + (10 if self._btc_change_1h > 0.5 else 0)
         ss, sr = 0, []
 
+        # EMA
         p = min(35, 28 + int(ema_gap * 4)) if ema_gap > 1.5 else min(28, 20 + int(ema_gap * 5))
-        ss += p; sr.append(f"EMA-({p})")
+        ss += p; sr.append(f"EMA({p})")
 
+        # RSI
         rsi_max = max(rsi, rsi_r)
         if   rsi_max > 82: ss += 38; sr.append(f"RSI{rsi_max:.0f}(38)")
         elif rsi_max > 76: ss += 30; sr.append(f"RSI{rsi_max:.0f}(30)")
@@ -374,17 +780,20 @@ class ShortBot:
         elif rsi_max > 65: ss += 10; sr.append(f"RSI{rsi_max:.0f}(10)")
         else:              ss -= 20; sr.append(f"RSI{rsi_max:.0f}(-20)")
 
+        # MACD
         if ml < sg and hist < 0:
             p = 22 if abs(hist) > abs(ml) * 0.35 else 15
             ss += p; sr.append(f"MACD-({p})")
         elif ml > 0 and hist > 0:
             ss -= 15; sr.append("MACD+(-15)")
 
+        # Bollinger Bands
         if   bb_pos >= 0.95: ss += 25; sr.append("BB_top(25)")
         elif bb_pos >= 0.85: ss += 17; sr.append("BB_high(17)")
         elif bb_pos >= 0.70: ss += 8;  sr.append("BB_mid+(8)")
         elif bb_pos <  0.40: ss -= 12; sr.append("BB_low(-12)")
 
+        # Volumen
         if vs >= 2.0 and trend_5 < -0.3:
             p = min(18, int(vs*8)); ss += p; sr.append(f"VolVenta{vs:.1f}x({p})")
         elif vs >= 1.5:
@@ -392,39 +801,64 @@ class ShortBot:
         elif vs < 1.2:
             ss -= 8; sr.append("VolBajo(-8)")
 
+        # Tendencia corta
         if trend_5 < -1.5 and trend_10 < -2.5: ss += 20; sr.append("Bajada--(20)")
         elif trend_5 < -0.8:                    ss += 12; sr.append("Bajada-(12)")
         elif trend_5 > 1.0:                     ss -= 15; sr.append("Subida(-15)")
 
+        # Cambio 24h
         if   change > 6.0: p = min(15, int(change*2));   ss += p; sr.append(f"24h+{change:.1f}%({p})")
         elif change > 3.0: p = min(10, int(change*1.5)); ss += p; sr.append(f"24h+{change:.1f}%({p})")
         elif change < -4.0: ss -= 12; sr.append(f"24h{change:.1f}%(-12)")
 
+        # Otros
         if near_high:        ss += 12; sr.append("NearHigh(12)")
         if red_candles >= 3: ss += 10; sr.append(f"Rojas{red_candles}(10)")
         if atr_pct < 0.3:    ss -= 10; sr.append("ATRbajo(-10)")
         elif atr_pct > 1.5:  ss += 8;  sr.append(f"ATR{atr_pct:.1f}%(8)")
 
+        # ── MAE score (nuevo v3.0) ───────────────────────────────────
+        if mae_score != 0:
+            ss += mae_score; sr.append(mae_desc)
+
+        # ── Régimen bonus/penalización (nuevo v3.0) ──────────────────
+        if regime == "TREND_DOWN":
+            ss += 10; sr.append("RegimeBajista(+10)")
+        elif regime == "RANGING":
+            ss += 5;  sr.append("RegimeRango(+5)")
+        elif regime == "TREND_UP":
+            ss -= 10; sr.append("RegimeAlcista(-10)")
+
+        # ── Patrones chartistas (nuevo v3.0) ─────────────────────────
+        if pattern_total > 0:
+            ss += pattern_total
+            for p_name in pattern_list:
+                sr.append(p_name)
+
+        # ── TP dinámico ──────────────────────────────────────────────
         tp_dyn = max(TP_PCT, TP_MIN_RENTABLE, min(TP_PCT*2.5, atr_pct*2.0))
+        
+        # Con patrón fuerte, permitir TP más ambicioso
+        if pattern_total >= 30:
+            tp_dyn = max(tp_dyn, TP_PCT * 1.5)
 
         if ss >= score_min:
-            return {'price':price,'change':change,'score':ss,'reasons':' | '.join(sr),
-                    'rsi':rsi,'vol':vs,'tp_pct':tp_dyn,'sl_pct':SL_PCT,
-                    'bb_pos':round(bb_pos*100,1),'atr_pct':round(atr_pct,2),'score_min':score_min}
+            return {
+                'price':price,'change':change,'score':ss,'reasons':' | '.join(sr),
+                'rsi':rsi,'vol':vs,'tp_pct':tp_dyn,'sl_pct':SL_PCT,
+                'bb_pos':round(bb_pos*100,1),'atr_pct':round(atr_pct,2),
+                'score_min':score_min,'regime':regime,'mae_regime':mae_regime,
+                'mae_pos':round(mae_pos*100,1),'patterns':pattern_list,
+            }
         return None
 
     # ---------------------------------------------------------------- órdenes
 
     def _place_short_entry(self, symbol, usdt_qty, price):
-        """
-        Entrada: intenta LÍMITE (maker), fallback MERCADO quoteOrderQty, fallback contratos.
-        FIX v2.3: pasa usdt_qty a _qty_contratos para que qty_c coincida con la entrada.
-        """
-        # FIX v2.3: usa usdt_qty real, NO POSITION_SIZE global
         qty_c, _ = self._qty_contratos(symbol, price, usdt_qty)
 
         if USE_LIMIT_ORDERS:
-            limit_price = round(price * (1 + LIMIT_OFFSET_PCT / 100), 8)  # SHORT=SELL: precio ENCIMA del mercado → espera en libro → MAKER fee
+            limit_price = round(price * (1 + LIMIT_OFFSET_PCT / 100), 8)
             d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
                 'symbol':symbol,'side':'SELL','positionSide':'SHORT',
                 'type':'LIMIT','price':str(limit_price),
@@ -435,7 +869,6 @@ class ShortBot:
                 return d.get('data',{}).get('orderId','OK'), qty_c
             log.warning(f"  Límite falló [{d.get('code')}] — fallback mercado")
 
-        # Mercado con quoteOrderQty
         d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
             'symbol':symbol,'side':'SELL','positionSide':'SHORT',
             'type':'MARKET','quoteOrderQty':str(round(usdt_qty,2)),
@@ -444,7 +877,6 @@ class ShortBot:
             log.info(f"  ENTRADA MERCADO OK ${usdt_qty}")
             return d.get('data',{}).get('orderId','OK'), qty_c
 
-        # Fallback contratos
         log.warning(f"  quoteOrderQty falló [{d.get('code')}] — fallback contratos")
         if not qty_c: return None, None
         d2 = bingx_request('POST', '/openApi/swap/v2/trade/order', {
@@ -457,11 +889,6 @@ class ShortBot:
         return None, None
 
     def _cond_order(self, symbol, qty_c, stop_price, otype):
-        """
-        FIX v2.4: TP usa TAKE_PROFIT (límite) → maker fee 0.02%.
-                  SL usa STOP_MARKET          → taker fee 0.05% (garantiza ejecución).
-        FIX v2.2: quantity en contratos siempre (BingX ignora quoteOrderQty en TP/SL).
-        """
         if not qty_c or qty_c <= 0:
             log.error(f"  {otype} cancelado: qty_c inválido ({qty_c})")
             return False
@@ -470,26 +897,17 @@ class ShortBot:
             lbl   = "TP" if is_tp else "SL"
 
             if is_tp:
-                # TP como límite: espera en libro → maker fee 0.02%
                 params = {
-                    'symbol':      symbol,
-                    'side':        'BUY',
-                    'positionSide':'SHORT',
-                    'type':        'TAKE_PROFIT',      # límite (maker)
-                    'quantity':    str(qty_c),
-                    'price':       str(round(stop_price, 8)),
-                    'stopPrice':   str(round(stop_price, 8)),
-                    'timeInForce': 'GTC',
+                    'symbol':symbol,'side':'BUY','positionSide':'SHORT',
+                    'type':'TAKE_PROFIT','quantity':str(qty_c),
+                    'price':str(round(stop_price, 8)),
+                    'stopPrice':str(round(stop_price, 8)),'timeInForce':'GTC',
                 }
             else:
-                # SL sigue como STOP_MARKET → garantiza ejecución aunque sea taker
                 params = {
-                    'symbol':      symbol,
-                    'side':        'BUY',
-                    'positionSide':'SHORT',
-                    'type':        'STOP_MARKET',
-                    'quantity':    str(qty_c),
-                    'stopPrice':   str(round(stop_price, 8)),
+                    'symbol':symbol,'side':'BUY','positionSide':'SHORT',
+                    'type':'STOP_MARKET','quantity':str(qty_c),
+                    'stopPrice':str(round(stop_price, 8)),
                 }
 
             d  = bingx_request('POST', '/openApi/swap/v2/trade/order', params).json()
@@ -498,7 +916,6 @@ class ShortBot:
             if ok:
                 log.info(f"  {lbl} ✅ fijado @ ${stop_price:.6f} (qty={qty_c}, {fee_lbl})")
             else:
-                # TP límite fallback a TAKE_PROFIT_MARKET si BingX rechaza
                 if is_tp:
                     log.warning(f"  TP límite rechazado [{d.get('code')}] — fallback TAKE_PROFIT_MARKET")
                     params2 = {
@@ -508,19 +925,16 @@ class ShortBot:
                     }
                     d2 = bingx_request('POST', '/openApi/swap/v2/trade/order', params2).json()
                     ok = d2.get('code') == 0
-                    if ok:
-                        log.info(f"  TP ✅ (fallback mercado) @ ${stop_price:.6f}")
-                    else:
-                        log.error(f"  TP ❌ ERROR [{d2.get('code')}]: {d2.get('msg')}")
+                    if ok:  log.info(f"  TP ✅ (fallback mercado) @ ${stop_price:.6f}")
+                    else:   log.error(f"  TP ❌ [{d2.get('code')}]: {d2.get('msg')}")
                 else:
-                    log.error(f"  {lbl} ❌ ERROR [{d.get('code')}]: {d.get('msg')}")
+                    log.error(f"  {lbl} ❌ [{d.get('code')}]: {d.get('msg')}")
             return ok
         except Exception as e:
             log.error(f"  {otype} excepción: {e}")
             return False
 
     def _close_short(self, symbol, t):
-        """Cierre: usa contratos si los tenemos, quoteOrderQty como fallback."""
         qty_c = t.get('qty_c', 0)
         usdt  = t.get('usdt_qty', POSITION_SIZE)
         if qty_c and qty_c > 0:
@@ -546,24 +960,27 @@ class ShortBot:
 
     def open_trade(self, symbol, sig):
         if not AUTO_TRADING:
-            log.info(f"  [SEÑAL] SHORT {symbol} score:{sig['score']:.0f}")
+            log.info(f"  [SEÑAL] SHORT {symbol} score:{sig['score']:.0f} régimen:{sig['regime']}")
+            if sig['patterns']:
+                log.info(f"  Patrones: {', '.join(sig['patterns'])}")
             return False
         if symbol in self.open_trades: return False
 
         tiene, dir_bx = self._tiene_posicion(symbol)
         if tiene: log.info(f"  {symbol} ya tiene {dir_bx} — skip"); return False
 
-        price = sig['price']
-
-        # FIX v2.3: eliminado min(POSITION_SIZE, 8.0) que ignoraba el .env
-        # Ahora respeta MAX_POSITION_SIZE correctamente
+        price    = sig['price']
         usdt_qty = round(max(POSITION_SIZE, MIN_TRADE), 2)
 
         tp_price = price * (1 - sig['tp_pct'] / 100)
         sl_price = price * (1 + sig['sl_pct'] / 100)
 
+        patterns_str = f"Patrones: {', '.join(sig['patterns'])}" if sig['patterns'] else "Sin patrón chartista"
+
         log.info(f"\n  ➤ SHORT {symbol}")
-        log.info(f"  Score:{sig['score']:.0f}/{sig['score_min']:.0f} | RSI:{sig['rsi']:.0f} | BB:{sig['bb_pos']}%")
+        log.info(f"  Score:{sig['score']:.0f}/{sig['score_min']:.0f} | RSI:{sig['rsi']:.0f} | "
+                 f"BB:{sig['bb_pos']}% | Régimen:{sig['regime']} MAE:{sig['mae_regime']}")
+        log.info(f"  MAE pos:{sig['mae_pos']}% | {patterns_str}")
         log.info(f"  {sig['reasons']}")
         log.info(f"  Entry:${price:.6f} | Capital:${usdt_qty} | TP:{sig['tp_pct']:.2f}% SL:{sig['sl_pct']:.1f}%")
 
@@ -571,8 +988,6 @@ class ShortBot:
         if not oid:
             log.error(f"  No se pudo abrir {symbol}"); return False
 
-        # Si no se obtuvo qty_c de la entrada, recalcular con usdt_qty real
-        # FIX v2.3: siempre pasar usdt_qty, nunca usar POSITION_SIZE global aquí
         if not qty_c:
             qty_c, _ = self._qty_contratos(symbol, price, usdt_qty)
 
@@ -583,6 +998,7 @@ class ShortBot:
                 'tp':tp_price,'sl':sl_price,'tp_pct':sig['tp_pct'],'sl_pct':sig['sl_pct'],
                 'lowest':price,'order_id':oid,'tp_ok':False,'sl_ok':False,
                 'opened_at':datetime.now(),'score':sig['score'],
+                'patterns':sig['patterns'],'regime':sig['regime'],
             }
             self._tg(f"⚠️ SHORT {symbol} abierto SIN TP/SL — qty_c=0. Fijar manual.")
             return True
@@ -593,7 +1009,7 @@ class ShortBot:
         sl_ok = self._cond_order(symbol, qty_c, sl_price, 'STOP_MARKET')
 
         if not tp_ok or not sl_ok:
-            log.warning(f"  TP:{tp_ok} SL:{sl_ok} — intentando de nuevo en 2s")
+            log.warning(f"  TP:{tp_ok} SL:{sl_ok} — reintentando en 2s")
             time.sleep(2)
             if not tp_ok:
                 tp_ok = self._cond_order(symbol, qty_c, tp_price, 'TAKE_PROFIT_MARKET')
@@ -605,11 +1021,13 @@ class ShortBot:
             'tp':tp_price,'sl':sl_price,'tp_pct':sig['tp_pct'],'sl_pct':sig['sl_pct'],
             'lowest':price,'order_id':oid,'tp_ok':tp_ok,'sl_ok':sl_ok,
             'opened_at':datetime.now(),'score':sig['score'],
+            'patterns':sig['patterns'],'regime':sig['regime'],
         }
         self.stats['exec'] += 1
 
-        status_tp = "✅" if tp_ok else "❌ FIJARLO MANUAL"
-        status_sl = "✅" if sl_ok else "❌ FIJARLO MANUAL"
+        status_tp = "✅" if tp_ok else "❌ FIJAR MANUAL"
+        status_sl = "✅" if sl_ok else "❌ FIJAR MANUAL"
+        pat_str   = f"\nPatrones: {', '.join(sig['patterns'])}" if sig['patterns'] else ""
         self._tg(
             f"<b>🔴 SHORT ABIERTO</b>\n<b>{symbol}</b> | Score:{sig['score']:.0f}/100\n"
             f"Entrada: ${price:.6f}\n"
@@ -617,6 +1035,8 @@ class ShortBot:
             f"{status_sl} SL: ${sl_price:.6f} (+{sig['sl_pct']:.1f}%)\n"
             f"Capital: ${usdt_qty} x{LEVERAGE} = ${usdt_qty*LEVERAGE:.1f} USDT\n"
             f"Contratos: {qty_c} | RSI:{sig['rsi']:.0f} BB:{sig['bb_pos']}%\n"
+            f"Régimen: {sig['regime']} | MAE: {sig['mae_regime']} pos:{sig['mae_pos']}%"
+            f"{pat_str}\n"
             f"{sig['reasons']}"
         )
         return True
@@ -717,7 +1137,7 @@ class ShortBot:
         total = self.stats['wins'] + self.stats['losses']
         wr    = self.stats['wins'] / total * 100 if total else 0
         pos_txt = "".join(
-            f"  {sym}: {(t['entry']-( self._ticker(sym) or {'price':t['entry']})['price'])/t['entry']*100:+.2f}%\n"
+            f"  {sym}: {(t['entry']-(self._ticker(sym) or {'price':t['entry']})['price'])/t['entry']*100:+.2f}%\n"
             for sym, t in self.open_trades.items()
         )
         self._tg(
@@ -738,7 +1158,7 @@ class ShortBot:
     # ---------------------------------------------------------------- loop
 
     async def run(self):
-        log.info("\n▶  Bot SHORT v2.4 arrancado\n")
+        log.info("\n▶  Bot SHORT v3.0 arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
@@ -753,12 +1173,12 @@ class ShortBot:
                 btc_st = "⚠️ BLOQUEADO" if self._btc_change_1h >= BTC_BULL_BLOCK_PCT else "OK"
                 hora_st = "🌙 HORA BAJA" if not self._hora_ok() else "☀️"
 
-                log.info(f"\n{'='*65}")
+                log.info(f"\n{'='*70}")
                 log.info(f"  #{iteration} {datetime.now().strftime('%H:%M:%S')} | "
                          f"Abiertos:{len(self.open_trades)}/{MAX_TRADES} | "
                          f"PnL:${self.stats['pnl']:+.3f} | WR:{wr:.1f}%")
                 log.info(f"  BTC 1h:{self._btc_change_1h:+.2f}% {btc_st} | {hora_st}")
-                log.info(f"{'='*65}\n")
+                log.info(f"{'='*70}\n")
 
                 await self.monitor_trades()
                 self._reporte_horario()
@@ -770,7 +1190,9 @@ class ShortBot:
                         sig = self.analyze(sym)
                         if sig:
                             found += 1
-                            log.info(f"  ★ {sym} score:{sig['score']:.0f} RSI:{sig['rsi']:.0f}")
+                            pat_str = f" [{','.join(sig['patterns'])}]" if sig['patterns'] else ""
+                            log.info(f"  ★ {sym} score:{sig['score']:.0f} RSI:{sig['rsi']:.0f} "
+                                     f"régimen:{sig['regime']}{pat_str}")
                             self.open_trade(sym, sig)
                         await asyncio.sleep(0.12)
                         if (i+1) % 25 == 0:
