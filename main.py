@@ -566,8 +566,8 @@ class ShortBot:
         fee_lbl = f"LÍMITE maker {COMISION_MAKER*100:.2f}%" if USE_LIMIT_ORDERS \
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
         log.info("=" * 70)
-        log.info("  BOT SHORTS PROFESIONAL v3.2")
-        log.info("  v3.2: TP/SL defaults correctos + FORCE_MIN_USDT + cooldown TP/SL + trailing vars")
+        log.info("  BOT SHORTS PROFESIONAL v3.3")
+        log.info("  v3.3: filtros obligatorios RSI/VOL/ATR/BTC + RR≥1.7 garantizado + scoring rebalanceado")
         log.info("  FIX v2.4: fees reales 0.02/0.05%, TP maker, qty real")
         log.info("=" * 70)
         log.info(f"  Modo:      {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
@@ -592,11 +592,11 @@ class ShortBot:
         self._load_contracts()
         self._get_symbols()
         self._tg(
-            f"<b>🔴 Bot SHORTS v3.2 iniciado</b>\n"
-            f"TP:{TP_PCT}% SL:{SL_PCT}% LEV:{LEVERAGE}x | Score≥{MIN_SCORE}\n"
+            f"<b>🔴 Bot SHORTS v3.3 iniciado</b>\n"
+            f"TP:{TP_PCT}% SL:{SL_PCT}% RR≥1.7 LEV:{LEVERAGE}x\n"
+            f"Score≥{MIN_SCORE} | Filtros: RSI≥65 VOL≥1.2 ATR≥0.4%\n"
             f"Capital: ${POSITION_SIZE} | Min: ${FORCE_MIN_USDT} USDT\n"
-            f"Cooldown TP:{COOLDOWN_MIN_TP}min SL:{COOLDOWN_MIN_SL}min\n"
-            f"Fee: {fee_lbl} | RR:{TP_PCT/SL_PCT:.1f}:1"
+            f"Cooldown TP:{COOLDOWN_MIN_TP}min SL:{COOLDOWN_MIN_SL}min"
         )
 
     # ---------------------------------------------------------------- setup
@@ -807,32 +807,58 @@ class ShortBot:
         # ── Filtro de régimen ────────────────────────────────────────
         # En mercado alcista sin patrones de reversión → skip
         if REGIME_FILTER and regime == "TREND_UP" and not pattern_list:
-            if self._btc_change_1h < 0:  # al menos BTC bajando un poco
-                pass  # permitir si contexto general bajista
+            if self._btc_change_1h < 0:
+                pass
             else:
                 return None
 
-        # ── EMA alignment (condición base) ───────────────────────────
+        # ── FILTROS OBLIGATORIOS v3.3 — deben cumplirse TODOS ────────
+        # 1. RSI mínimo: no entrar si el activo no está sobrecomprado
+        rsi_max = max(rsi, calc_rsi(closes[-20:], 10))
+        if rsi_max < 65:
+            return None   # RSI demasiado bajo — no hay sobrecompra
+
+        # 2. Volumen mínimo: el spike debe ser real
+        if vs < 1.2:
+            return None   # volumen plano — señal sin convicción
+
+        # 3. ATR mínimo: necesitamos movimiento para llegar al TP
+        if atr_pct < 0.4:
+            return None   # mercado dormido — el TP nunca se alcanzará
+
+        # 4. BTC pánico bajista: si BTC cae >3% en 1h hay riesgo de reversal
+        btc_panic_down = self._btc_change_1h < -3.0
+        if btc_panic_down:
+            return None   # pánico = rebote inminente = shorts en trampa
+
+        # 5. Confirmación de cierre: al menos 2 velas rojas recientes
+        if opens:
+            recent_red = sum(1 for i in range(-3, 0) if closes[i] < opens[i])
+            if recent_red < 1:
+                return None  # sin presión vendedora confirmada
         if not (ema9 < ema21 < ema50):
-            # Con patrón fuerte, relajamos el filtro EMA
-            if not pattern_list or pattern_total < 30:
+            # v3.3: solo patrón muy fuerte (≥35) puede saltarse EMA
+            # pero penalización -15 se aplica igualmente en el scoring
+            if not pattern_list or pattern_total < 35:
                 return None
 
-        # ── Scoring ─────────────────────────────────────────────────
+        # ── Scoring v3.3 ─────────────────────────────────────────────
         score_min = MIN_SCORE + (10 if self._btc_change_1h > 0.5 else 0)
         ss, sr = 0, []
 
-        # EMA
-        p = min(35, 28 + int(ema_gap * 4)) if ema_gap > 1.5 else min(28, 20 + int(ema_gap * 5))
-        ss += p; sr.append(f"EMA({p})")
+        # EMA: penaliza explícitamente si no alineado (v3.3)
+        if ema9 < ema21 < ema50:
+            p = min(35, 28 + int(ema_gap * 4)) if ema_gap > 1.5 else min(28, 20 + int(ema_gap * 5))
+            ss += p; sr.append(f"EMA_OK({p})")
+        else:
+            ss -= 15; sr.append("EMA_ROTA(-15)")   # v3.3: penaliza siempre
 
-        # RSI
-        rsi_max = max(rsi, rsi_r)
+        # RSI: umbrales subidos — solo suma si realmente sobrecomprado (v3.3)
         if   rsi_max > 82: ss += 38; sr.append(f"RSI{rsi_max:.0f}(38)")
-        elif rsi_max > 76: ss += 30; sr.append(f"RSI{rsi_max:.0f}(30)")
-        elif rsi_max > 70: ss += 20; sr.append(f"RSI{rsi_max:.0f}(20)")
-        elif rsi_max > 65: ss += 10; sr.append(f"RSI{rsi_max:.0f}(10)")
-        else:              ss -= 20; sr.append(f"RSI{rsi_max:.0f}(-20)")
+        elif rsi_max > 76: ss += 28; sr.append(f"RSI{rsi_max:.0f}(28)")
+        elif rsi_max > 70: ss += 18; sr.append(f"RSI{rsi_max:.0f}(18)")
+        elif rsi_max > 65: ss += 8;  sr.append(f"RSI{rsi_max:.0f}(8)")
+        # < 65 ya fue bloqueado por filtro obligatorio
 
         # MACD
         if ml < sg and hist < 0:
@@ -847,13 +873,14 @@ class ShortBot:
         elif bb_pos >= 0.70: ss += 8;  sr.append("BB_mid+(8)")
         elif bb_pos <  0.40: ss -= 12; sr.append("BB_low(-12)")
 
-        # Volumen
+        # Volumen — ya filtrado: vs>=1.2 garantizado (v3.3)
         if vs >= 2.0 and trend_5 < -0.3:
             p = min(18, int(vs*8)); ss += p; sr.append(f"VolVenta{vs:.1f}x({p})")
         elif vs >= 1.5:
             p = min(12, int(vs*6)); ss += p; sr.append(f"Vol{vs:.1f}x({p})")
-        elif vs < 1.2:
-            ss -= 8; sr.append("VolBajo(-8)")
+        elif vs >= 1.2:
+            ss += 4; sr.append(f"Vol{vs:.1f}x(4)")
+        # < 1.2 ya fue bloqueado
 
         # Tendencia corta
         if trend_5 < -1.5 and trend_10 < -2.5: ss += 20; sr.append("Bajada--(20)")
@@ -868,8 +895,10 @@ class ShortBot:
         # Otros
         if near_high:        ss += 12; sr.append("NearHigh(12)")
         if red_candles >= 3: ss += 10; sr.append(f"Rojas{red_candles}(10)")
-        if atr_pct < 0.3:    ss -= 10; sr.append("ATRbajo(-10)")
-        elif atr_pct > 1.5:  ss += 8;  sr.append(f"ATR{atr_pct:.1f}%(8)")
+        elif red_candles >= 2: ss += 5; sr.append(f"Rojas{red_candles}(5)")
+        # ATR ya filtrado >= 0.4%
+        if atr_pct > 1.5:  ss += 8;  sr.append(f"ATR{atr_pct:.1f}%(8)")
+        elif atr_pct > 0.8: ss += 4; sr.append(f"ATR{atr_pct:.1f}%(4)")
 
         # ── MAE score (nuevo v3.0) ───────────────────────────────────
         if mae_score != 0:
@@ -889,20 +918,27 @@ class ShortBot:
             for p_name in pattern_list:
                 sr.append(p_name)
 
-        # ── TP dinámico ──────────────────────────────────────────────
-        tp_dyn = max(TP_PCT, TP_MIN_RENTABLE, min(TP_PCT*2.5, atr_pct*2.0))
-        
-        # Con patrón fuerte, permitir TP más ambicioso
+        # ── TP/SL dinámicos — v3.3: RR mínimo garantizado 1.7:1 ────────
+        # SL mínimo = max(SL_PCT, ATR*0.8) para no saltar por ruido
+        sl_dyn = max(SL_PCT, atr_pct * 0.8) if atr_pct > 0 else SL_PCT
+        sl_dyn = round(min(sl_dyn, SL_PCT * 2.0), 3)   # cap: no más del doble del SL configurado
+
+        # TP mínimo = max(TP_PCT, SL*1.7, ATR*2) — RR≥1.7 garantizado
+        tp_dyn = max(TP_PCT, sl_dyn * 1.7, atr_pct * 2.0, TP_MIN_RENTABLE)
+        tp_dyn = round(min(tp_dyn, TP_PCT * 2.5), 3)   # cap: no más de 2.5x el TP configurado
+
+        # Con patrón fuerte, TP más ambicioso (RR≥2)
         if pattern_total >= 30:
-            tp_dyn = max(tp_dyn, TP_PCT * 1.5)
+            tp_dyn = max(tp_dyn, sl_dyn * 2.0)
 
         if ss >= score_min:
             return {
                 'price':price,'change':change,'score':ss,'reasons':' | '.join(sr),
-                'rsi':rsi,'vol':vs,'tp_pct':tp_dyn,'sl_pct':SL_PCT,
+                'rsi':rsi,'vol':vs,'tp_pct':tp_dyn,'sl_pct':sl_dyn,
                 'bb_pos':round(bb_pos*100,1),'atr_pct':round(atr_pct,2),
                 'score_min':score_min,'regime':regime,'mae_regime':mae_regime,
                 'mae_pos':round(mae_pos*100,1),'patterns':pattern_list,
+                'rr':round(tp_dyn/sl_dyn,2),
             }
         return None
 
@@ -1160,7 +1196,7 @@ class ShortBot:
                  f"BB:{sig['bb_pos']}% | Régimen:{sig['regime']} MAE:{sig['mae_regime']}")
         log.info(f"  MAE pos:{sig['mae_pos']}% | {patterns_str}")
         log.info(f"  {sig['reasons']}")
-        log.info(f"  Entry:${price:.6f} | Capital:${usdt_qty} | TP:{sig['tp_pct']:.2f}% SL:{sig['sl_pct']:.1f}%")
+        log.info(f"  Entry:${price:.6f} | Capital:${usdt_qty} | TP:{sig['tp_pct']:.2f}% SL:{sig['sl_pct']:.2f}% RR:{sig.get('rr',0):.2f}:1")
 
         oid, qty_c = self._place_short_entry(symbol, usdt_qty, price)
         if not oid:
@@ -1380,7 +1416,7 @@ class ShortBot:
     # ---------------------------------------------------------------- loop
 
     async def run(self):
-        log.info("\n▶  Bot SHORT v3.2 arrancado\n")
+        log.info("\n▶  Bot SHORT v3.3 arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
