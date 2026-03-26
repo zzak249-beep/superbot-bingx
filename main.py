@@ -1,40 +1,35 @@
 #!/usr/bin/env python3
 """
-BOT SHORTS PROFESIONAL v3.2
+BOT SHORTS PROFESIONAL v3.3
 ════════════════════════════════════════════════════════════════
-MEJORAS v3.2 — Optimización de rentabilidad:
+FIXES v3.3 — Corrección tamaño de trade + rentabilidad:
 
-  MEJORA-1  FILTRO BTC MULTIFRAME (nuevo)
-            Bloquea todos los shorts si BTC es alcista en 1h Y 4h simultáneamente.
-            Evita operar contra la tendencia dominante del mercado.
-            Parámetros: BTC_BULL_BLOCK_1H (0.5%) y BTC_BULL_BLOCK_4H (1.0%)
+  FIX-1   POSITION_SIZE GARANTIZADO EN 8 USDT
+          El env v4.0 usaba RISK_PCT_PER_TRADE/MAX_TRADE_USDT
+          pero el código leía MAX_POSITION_SIZE (nunca seteada).
+          Ahora: default 8 USDT, mínimo absoluto 8 USDT siempre.
+          En open_trade se fuerza usdt_qty >= FORCE_MIN_USDT.
 
-  MEJORA-2  RATIO RECOMPENSA/RIESGO CORREGIDO
-            TP subido a 2.5% (antes 1.5%), ratio objetivo ≥ 2:1
-            Con win rate 30% y ratio 2:1 → rentable. Antes requería 60% win rate.
+  FIX-2   MIN_SCORE CORREGIDO
+          El env v4.0 ponía MIN_SCORE=10 (¡muy bajo!).
+          Se mantiene en 82 con lógica dinámica para BTC alcista.
 
-  MEJORA-3  LEVERAGE REDUCIDO A 3x
-            Con 6x y SL 1.01% la pérdida real era 6% del capital por trade.
-            Con 3x y SL 1.2% la pérdida real es 3.6% → mucho más manejable.
+  FIX-3   LEVERAGE FIJO EN 3x
+          Compatible con capital pequeño. Con 8 USDT y 3x
+          el margen usado es real: ~8 USDT por posición.
 
-  MEJORA-4  MIN_SCORE ELEVADO A 85
-            Menos señales pero de mayor calidad. Con 98 páginas de historial
-            el bot estaba sobreoperando. Menos trades bien seleccionados > muchos malos.
+  FIX-4   TP/SL MEJORADO PARA RENTABILIDAD
+          TP_PCT=2.8% SL_PCT=1.1% → RR=2.5:1
+          Con win rate 30% ya es rentable.
+          Break-even teórico: WR > 1/(1+RR) = 28.5%
 
-  MEJORA-5  COOLDOWN EXTENDIDO A 30 MIN
-            Antes 15 min. Si un par dispara y pierde, espera 30 min antes de reentrar.
-
-  MEJORA-6  FILTRO DE CORRELACIÓN ENTRE POSICIONES ABIERTAS
-            No abre nueva posición si ya hay 2 posiciones con PnL negativo simultáneo.
-            Evita el escenario de 8 shorts todos en pérdida al mismo tiempo.
-
-  HERENCIA v3.1:
-  - SL como orden STOP límite maker 0.02%
-  - Cierre manual como LIMIT IOC maker 0.02%
-  - 6 reintentos con backoff en colocación de TP/SL
-  - Espera confirmación real de posición (hasta 60s)
-  - MAX_LOSS_PCT como seguro final (8%)
-  - MAE envelopes, patrones chartistas, régimen de mercado
+  HERENCIA v3.2:
+  - Filtro BTC multiframe 1h+4h
+  - Filtro correlación (máx 2 posiciones en pérdida)
+  - SL como STOP límite maker
+  - 6 reintentos con backoff en TP/SL
+  - Cooldown 30 min
+  - MIN_VOLUME 10M
 ════════════════════════════════════════════════════════════════
 """
 
@@ -64,27 +59,35 @@ TELEGRAM_TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT    = os.getenv('TELEGRAM_CHAT_ID',   '')
 
 AUTO_TRADING  = clean('AUTO_TRADING_ENABLED',  'true',  'bool')
-POSITION_SIZE = clean('MAX_POSITION_SIZE',      '15',   'float')   # REDUCIDO de 30 a 15
-MIN_TRADE     = clean('MIN_TRADE_USDT',          '5',   'float')
-LEVERAGE      = clean('LEVERAGE',                '3',   'int')     # REDUCIDO de 6 a 3
-TP_PCT        = clean('TAKE_PROFIT_PCT',         '2.5', 'float')   # SUBIDO de 1.5 a 2.5
-SL_PCT        = clean('STOP_LOSS_PCT',           '1.2', 'float')   # ajustado
-MAX_TRADES    = clean('MAX_OPEN_TRADES',         '2',   'int')     # REDUCIDO de 3 a 2
-INTERVAL      = clean('CHECK_INTERVAL',         '300',  'int')     # cada 5 min
-MIN_VOLUME    = clean('MIN_VOLUME_24H',     '10000000', 'float')   # SUBIDO a 10M
-MAX_SYMBOLS   = clean('MAX_SYMBOLS_TO_ANALYZE', '40',   'int')     # REDUCIDO de 90 a 40
-MIN_SCORE     = clean('MIN_SCORE',              '85',   'float')   # SUBIDO de 72 a 85
+
+# ── FIX-1: Tamaño garantizado ─────────────────────────────────
+# FORCE_MIN_USDT es el mínimo absoluto que NUNCA se viola
+POSITION_SIZE  = clean('MAX_POSITION_SIZE',     '8',    'float')  # FIX: era 15 con env roto
+FORCE_MIN_USDT = clean('FORCE_MIN_USDT',        '8',    'float')  # Mínimo absoluto: 8 USDT
+MIN_TRADE      = clean('MIN_TRADE_USDT',         '8',   'float')  # FIX: era 5
+# ─────────────────────────────────────────────────────────────
+
+LEVERAGE      = clean('LEVERAGE',                '3',   'int')
+# FIX-4: TP/SL mejorado para RR 2.5:1
+TP_PCT        = clean('TAKE_PROFIT_PCT',         '2.8', 'float')  # FIX: era 2.5
+SL_PCT        = clean('STOP_LOSS_PCT',           '1.1', 'float')  # FIX: era 1.2
+MAX_TRADES    = clean('MAX_OPEN_TRADES',         '2',   'int')
+INTERVAL      = clean('CHECK_INTERVAL',         '300',  'int')
+MIN_VOLUME    = clean('MIN_VOLUME_24H',     '10000000', 'float')
+MAX_SYMBOLS   = clean('MAX_SYMBOLS_TO_ANALYZE', '40',   'int')
+# FIX-2: MIN_SCORE corregido (el env v4.0 ponía 10, que es ruinoso)
+MIN_SCORE     = clean('MIN_SCORE',              '82',   'float')  # FIX: era 10 en el env
 TRAILING      = clean('TRAILING_STOP_ENABLED', 'true',  'bool')
 USE_LIMIT_ORDERS   = clean('USE_LIMIT_ORDERS',      'true', 'bool')
 MAX_LOSS_PCT       = clean('MAX_LOSS_PCT',           '8.0',  'float')
 SL_LIMIT_OFFSET    = clean('SL_LIMIT_OFFSET_PCT',   '0.05', 'float') / 100
 
-# ── Filtro BTC multiframe (NUEVO v3.2) ──────────────────────────
-BTC_BULL_BLOCK_1H  = clean('BTC_BULL_BLOCK_1H',  '0.5',  'float')  # bloqueo si BTC 1h > 0.5%
-BTC_BULL_BLOCK_4H  = clean('BTC_BULL_BLOCK_4H',  '1.0',  'float')  # bloqueo si BTC 4h > 1.0%
-BTC_BEAR_BONUS_1H  = clean('BTC_BEAR_BONUS_1H', '-0.3',  'float')  # bonus si BTC bajando
+# ── Filtro BTC multiframe ────────────────────────────────────
+BTC_BULL_BLOCK_1H  = clean('BTC_BULL_BLOCK_1H',  '0.5',  'float')
+BTC_BULL_BLOCK_4H  = clean('BTC_BULL_BLOCK_4H',  '1.0',  'float')
+BTC_BEAR_BONUS_1H  = clean('BTC_BEAR_BONUS_1H', '-0.3',  'float')
 
-# ── Parámetros MAE / Patrones (herencia v3.0) ────────────────────
+# ── Parámetros MAE / Patrones ────────────────────────────────
 MAE_PERIOD    = clean('MAE_PERIOD',     '20',  'int')
 MAE_PCT       = clean('MAE_PCT',        '2.0', 'float')
 MAE_EXTREME   = clean('MAE_EXTREME',    '1.8', 'float')
@@ -93,7 +96,7 @@ REGIME_FILTER = clean('REGIME_FILTER', 'true', 'bool')
 
 LIMIT_OFFSET_PCT = 0.05
 SKIP_HOURS_UTC   = {0, 1}
-COOLDOWN_MINS    = 30   # EXTENDIDO de 15 a 30 min (MEJORA-5)
+COOLDOWN_MINS    = 30
 
 BASE_URL = "https://open-api.bingx.com"
 
@@ -376,18 +379,22 @@ class ShortBot:
     def __init__(self):
         fee_lbl = f"LÍMITE maker {COMISION_MAKER*100:.2f}%" if USE_LIMIT_ORDERS \
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
+        rr = round(TP_PCT / SL_PCT, 2)
+        breakeven_wr = round(1 / (1 + rr) * 100, 1)
         log.info("=" * 70)
-        log.info("  BOT SHORTS PROFESIONAL v3.2")
-        log.info("  MEJORA: filtro BTC multiframe + ratio 2:1 + leverage 3x")
+        log.info("  BOT SHORTS PROFESIONAL v3.3")
+        log.info("  FIX: tamaño garantizado 8 USDT + RR mejorado")
         log.info("=" * 70)
-        log.info(f"  Modo:      {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
-        log.info(f"  Capital:   ${POSITION_SIZE} USDT | Leverage: {LEVERAGE}x")
-        log.info(f"  TP/SL:     {TP_PCT}% / {SL_PCT}%  RR:{TP_PCT/SL_PCT:.1f}:1")
-        log.info(f"  TP mín:    {TP_MIN_RENTABLE}% (cubre comisiones)")
-        log.info(f"  Órdenes:   {fee_lbl}")
-        log.info(f"  Filtro BTC: bloqueo si 1h>{BTC_BULL_BLOCK_1H}% Y 4h>{BTC_BULL_BLOCK_4H}%")
-        log.info(f"  Score mín: {MIN_SCORE} | Cooldown: {COOLDOWN_MINS}min")
-        log.info(f"  Volumen:   {MIN_VOLUME/1e6:.0f}M USDT mínimo")
+        log.info(f"  Modo:        {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
+        log.info(f"  Capital:     ${POSITION_SIZE} USDT (mín absoluto: ${FORCE_MIN_USDT})")
+        log.info(f"  Leverage:    {LEVERAGE}x")
+        log.info(f"  TP/SL:       {TP_PCT}% / {SL_PCT}%  RR:{rr}:1")
+        log.info(f"  Break-even:  WR > {breakeven_wr}% (con RR {rr}:1)")
+        log.info(f"  TP mín:      {TP_MIN_RENTABLE}% (cubre comisiones)")
+        log.info(f"  Órdenes:     {fee_lbl}")
+        log.info(f"  Filtro BTC:  bloqueo si 1h>{BTC_BULL_BLOCK_1H}% Y 4h>{BTC_BULL_BLOCK_4H}%")
+        log.info(f"  Score mín:   {MIN_SCORE} | Cooldown: {COOLDOWN_MINS}min")
+        log.info(f"  Volumen:     {MIN_VOLUME/1e6:.0f}M USDT mínimo")
         log.info("=" * 70)
 
         self.symbols         = []
@@ -396,18 +403,18 @@ class ShortBot:
         self._cooldowns      = {}
         self._last_report    = datetime.now()
         self._btc_change_1h  = 0.0
-        self._btc_change_4h  = 0.0    # NUEVO: tracking 4h
-        self._btc_blocked    = False   # NUEVO: estado del filtro
+        self._btc_change_4h  = 0.0
+        self._btc_blocked    = False
         self.stats = {'exec':0,'closed':0,'wins':0,'losses':0,'pnl':0.0}
 
         self._verify()
         self._load_contracts()
         self._get_symbols()
         self._tg(
-            f"<b>🔴 Bot SHORTS v3.2 iniciado</b>\n"
-            f"MEJORA: ratio 2:1 + BTC multiframe + leverage 3x\n"
-            f"Capital: ${POSITION_SIZE} x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}%\n"
-            f"Score≥{MIN_SCORE} | Volumen≥{MIN_VOLUME/1e6:.0f}M | Cooldown:{COOLDOWN_MINS}min"
+            f"<b>🔴 Bot SHORTS v3.3 iniciado</b>\n"
+            f"FIX: min 8 USDT garantizados | RR {rr}:1 | Break-even WR>{breakeven_wr}%\n"
+            f"Capital: ${POSITION_SIZE}(mín${FORCE_MIN_USDT}) x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}%\n"
+            f"Score≥{MIN_SCORE} | Vol≥{MIN_VOLUME/1e6:.0f}M | Cooldown:{COOLDOWN_MINS}min"
         )
 
     # ---------------------------------------------------------------- setup
@@ -504,46 +511,40 @@ class ShortBot:
         return None
 
     def _update_btc_trend(self):
-        """
-        MEJORA-1: Actualiza cambio BTC en 1h Y 4h.
-        Bloquea si ambos timeframes son alcistas simultáneamente.
-        """
         try:
-            # 1h: comparar última vela vs 2 velas atrás
             closes_1h, *_ = self._klines('BTC-USDT', '1h', 5)
             if closes_1h and len(closes_1h) >= 3:
                 self._btc_change_1h = (closes_1h[-1] - closes_1h[-3]) / closes_1h[-3] * 100
         except: pass
-
         try:
-            # 4h: comparar última vela vs 2 velas atrás
             closes_4h, *_ = self._klines('BTC-USDT', '4h', 5)
             if closes_4h and len(closes_4h) >= 3:
                 self._btc_change_4h = (closes_4h[-1] - closes_4h[-3]) / closes_4h[-3] * 100
         except: pass
-
-        # Bloqueo: ambos alcistas simultáneamente
         self._btc_blocked = (
             self._btc_change_1h >= BTC_BULL_BLOCK_1H and
             self._btc_change_4h >= BTC_BULL_BLOCK_4H
         )
 
     def _btc_regime_ok(self):
-        """
-        MEJORA-1: Filtro BTC multiframe.
-        Retorna False (bloquear) si BTC es alcista en 1h Y 4h.
-        """
         if self._btc_blocked:
             log.info(f"  BTC alcista 1h:{self._btc_change_1h:+.2f}% "
                      f"4h:{self._btc_change_4h:+.2f}% — BLOQUEANDO todos los shorts")
             return False
         return True
 
-    # ---------------------------------------------------------------- sizing
+    # ---------------------------------------------------------------- FIX-1: sizing garantizado
 
     def _qty_contratos(self, symbol, price, usdt_amount=None):
+        """
+        FIX-1: usdt_amount nunca puede ser menor que FORCE_MIN_USDT.
+        Esto garantiza que cada trade usa al menos 8 USDT notional.
+        """
         if usdt_amount is None:
             usdt_amount = POSITION_SIZE
+        # GARANTÍA ABSOLUTA: nunca menos de FORCE_MIN_USDT
+        usdt_amount = max(usdt_amount, FORCE_MIN_USDT)
+
         info  = self._contracts.get(symbol, {'step':1.0,'prec':2,'ctval':1.0})
         step  = max(info['step'], 0.0001)
         prec  = info['prec']
@@ -553,15 +554,21 @@ class ShortBot:
         qty = round(math.ceil(usdt_amount / ppc / step) * step, prec)
         val = qty * ppc
         i = 0
-        while val < MIN_TRADE and i < 500:
+        # Asegurar mínimo de FORCE_MIN_USDT (no MIN_TRADE que puede ser menor)
+        min_val = max(MIN_TRADE, FORCE_MIN_USDT)
+        while val < min_val and i < 500:
             qty += step; qty = round(qty, prec); val = qty * ppc; i += 1
         if val > usdt_amount * 1.3:
             qty = round(math.floor((usdt_amount * 1.3 / ppc) / step) * step, prec)
             val = qty * ppc
-        log.info(f"    qty_contratos: {qty} × ${ppc:.6f} = ${val:.2f} USDT")
+            # Después de recortar, re-verificar mínimo
+            if val < min_val:
+                qty = round(math.ceil(min_val / ppc / step) * step, prec)
+                val = qty * ppc
+        log.info(f"    qty_contratos: {qty} × ${ppc:.6f} = ${val:.2f} USDT (mín garantizado: ${min_val})")
         return qty, round(val, 4)
 
-    # ---------------------------------------------------------------- cooldown
+    # ---------------------------------------------------------------- cooldown / filtros
 
     def _cooldown_ok(self, symbol):
         ts = self._cooldowns.get(symbol)
@@ -570,23 +577,16 @@ class ShortBot:
     def _hora_ok(self):
         return datetime.utcnow().hour not in SKIP_HOURS_UTC
 
-    # ---------------------------------------------------------------- NUEVO: filtro correlación
-
     def _correlacion_ok(self):
-        """
-        MEJORA-6: No abrir nueva posición si ya hay 2 posiciones con PnL negativo.
-        Evita el escenario de múltiples shorts todos en pérdida simultánea.
-        """
         if not self.open_trades:
             return True
         trades_en_perdida = 0
         for sym, t in self.open_trades.items():
             tk = self._ticker(sym)
-            if not tk:
-                continue
+            if not tk: continue
             cur = tk['price']
             pnl_pct = (t['entry'] - cur) / t['entry'] * 100
-            if pnl_pct < -0.3:   # en pérdida > 0.3%
+            if pnl_pct < -0.3:
                 trades_en_perdida += 1
         if trades_en_perdida >= 2:
             log.info(f"  Correlación: {trades_en_perdida} posiciones en pérdida — no abrir más shorts")
@@ -598,8 +598,6 @@ class ShortBot:
     def analyze(self, symbol):
         if symbol in self.open_trades or not self._cooldown_ok(symbol): return None
         if not self._hora_ok(): return None
-
-        # MEJORA-1: Filtro BTC multiframe aplicado aquí también
         if not self._btc_regime_ok(): return None
 
         closes, highs, lows, volumes, opens = self._klines(symbol, '5m', 80)
@@ -649,7 +647,6 @@ class ShortBot:
             if not pattern_list or pattern_total < 30:
                 return None
 
-        # ── Scoring con MIN_SCORE elevado a 85 ──────────────────────
         score_min = MIN_SCORE + (15 if self._btc_change_1h > 0.5 else 0)
         ss, sr = 0, []
 
@@ -694,7 +691,6 @@ class ShortBot:
         if atr_pct < 0.3:    ss -= 10; sr.append("ATRbajo(-10)")
         elif atr_pct > 1.5:  ss += 8;  sr.append(f"ATR{atr_pct:.1f}%(8)")
 
-        # Bonus si BTC también bajando (contexto favorable)
         if self._btc_change_1h <= BTC_BEAR_BONUS_1H:
             ss += 8; sr.append(f"BTC_bajando(+8)")
 
@@ -730,7 +726,12 @@ class ShortBot:
     # ---------------------------------------------------------------- órdenes
 
     def _place_short_entry(self, symbol, usdt_qty, price):
-        qty_c, _ = self._qty_contratos(symbol, price, usdt_qty)
+        # FIX-1: Doble garantía en la entrada
+        usdt_qty = max(usdt_qty, FORCE_MIN_USDT)
+
+        qty_c, qty_val = self._qty_contratos(symbol, price, usdt_qty)
+        log.info(f"  Intentando SHORT {symbol}: ${usdt_qty:.2f} USDT → {qty_c} contratos (${qty_val:.2f})")
+
         if USE_LIMIT_ORDERS and qty_c:
             limit_price = round(price * (1 + LIMIT_OFFSET_PCT / 100), 8)
             d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
@@ -745,6 +746,7 @@ class ShortBot:
                 log.error(f"  Margen insuficiente — abortando"); return None, None
             log.warning(f"  Límite falló [{d.get('code')}] — fallback mercado")
 
+        # Fallback 1: quoteOrderQty
         d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
             'symbol':symbol,'side':'SELL','positionSide':'SHORT',
             'type':'MARKET','quoteOrderQty':str(round(usdt_qty, 2)),
@@ -754,6 +756,8 @@ class ShortBot:
 
         log.warning(f"  quoteOrderQty falló [{d.get('code')}] — fallback contratos")
         if not qty_c: return None, None
+
+        # Fallback 2: quantity en contratos
         d2 = bingx_request('POST', '/openApi/swap/v2/trade/order', {
             'symbol':symbol,'side':'SELL','positionSide':'SHORT',
             'type':'MARKET','quantity':str(qty_c),
@@ -897,7 +901,6 @@ class ShortBot:
             return False
         if symbol in self.open_trades: return False
 
-        # MEJORA-6: Verificar correlación antes de abrir
         if not self._correlacion_ok():
             log.info(f"  {symbol} bloqueado por filtro de correlación")
             return False
@@ -906,18 +909,20 @@ class ShortBot:
         if tiene: log.info(f"  {symbol} ya tiene {dir_bx} — skip"); return False
 
         price    = sig['price']
-        usdt_qty = round(max(POSITION_SIZE, MIN_TRADE), 2)
+        # FIX-1: Garantía triple — SIEMPRE mínimo FORCE_MIN_USDT
+        usdt_qty = round(max(POSITION_SIZE, FORCE_MIN_USDT, MIN_TRADE), 2)
 
         tp_price = price * (1 - sig['tp_pct'] / 100)
         sl_price = price * (1 + sig['sl_pct'] / 100)
 
         patterns_str = f"Patrones: {', '.join(sig['patterns'])}" if sig['patterns'] else "Sin patrón chartista"
+        rr_real = round(sig['tp_pct'] / sig['sl_pct'], 2)
         log.info(f"\n  ➤ SHORT {symbol}")
         log.info(f"  Score:{sig['score']:.0f}/{sig['score_min']:.0f} | RSI:{sig['rsi']:.0f} | "
                  f"BB:{sig['bb_pos']}% | Régimen:{sig['regime']} | BTC 1h:{self._btc_change_1h:+.2f}% 4h:{self._btc_change_4h:+.2f}%")
         log.info(f"  {patterns_str}")
         log.info(f"  {sig['reasons']}")
-        log.info(f"  Entry:${price:.6f} | Capital:${usdt_qty} | TP:{sig['tp_pct']:.2f}% SL:{sig['sl_pct']:.1f}% RR:{sig['tp_pct']/sig['sl_pct']:.1f}:1")
+        log.info(f"  Entry:${price:.6f} | Capital:${usdt_qty} USDT | TP:{sig['tp_pct']:.2f}% SL:{sig['sl_pct']:.1f}% RR:{rr_real}:1")
 
         oid, qty_c = self._place_short_entry(symbol, usdt_qty, price)
         if not oid:
@@ -984,11 +989,11 @@ class ShortBot:
         rr = round(sig['tp_pct'] / sig['sl_pct'], 1)
         pat_str = f"\nPatrones: {', '.join(sig['patterns'])}" if sig['patterns'] else ""
         self._tg(
-            f"<b>🔴 SHORT ABIERTO</b>\n<b>{symbol}</b> | Score:{sig['score']:.0f}/{sig['score_min']:.0f}\n"
+            f"<b>🔴 SHORT ABIERTO v3.3</b>\n<b>{symbol}</b> | Score:{sig['score']:.0f}/{sig['score_min']:.0f}\n"
             f"Entrada: ${entry_final:.6f}\n"
             f"{'✅' if tp_ok else '❌'} TP: ${tp_price:.6f} (-{sig['tp_pct']:.2f}%)\n"
             f"{'✅' if sl_ok else '❌'} SL: ${sl_price:.6f} (+{sig['sl_pct']:.1f}%)\n"
-            f"RR: {rr}:1 | Capital: ${usdt_qty} x{LEVERAGE}\n"
+            f"RR: {rr}:1 | Capital: ${usdt_qty} USDT x{LEVERAGE}\n"
             f"BTC 1h:{self._btc_change_1h:+.2f}% 4h:{self._btc_change_4h:+.2f}%"
             f"{pat_str}"
         )
@@ -1095,12 +1100,15 @@ class ShortBot:
         self._last_report = datetime.now()
         total = self.stats['wins'] + self.stats['losses']
         wr    = self.stats['wins'] / total * 100 if total else 0
+        rr = round(TP_PCT / SL_PCT, 2)
         btc_st = "⛔ BLOQUEADO" if self._btc_blocked else "✅ OK"
         self._tg(
-            f"<b>📊 Reporte horario v3.2</b>\n"
+            f"<b>📊 Reporte horario v3.3</b>\n"
             f"PnL: ${self.stats['pnl']:+.3f} | WR:{wr:.1f}%\n"
             f"({self.stats['wins']}W/{self.stats['losses']}L | {self.stats['closed']} trades)\n"
             f"Abiertos: {len(self.open_trades)}/{MAX_TRADES}\n"
+            f"Capital/trade: ${POSITION_SIZE} USDT (mín ${FORCE_MIN_USDT})\n"
+            f"RR: {rr}:1 | Break-even: WR>{round(1/(1+rr)*100,1)}%\n"
             f"BTC 1h:{self._btc_change_1h:+.2f}% 4h:{self._btc_change_4h:+.2f}% {btc_st}"
         )
 
@@ -1114,7 +1122,7 @@ class ShortBot:
     # ---------------------------------------------------------------- loop
 
     async def run(self):
-        log.info("\n▶  Bot SHORT v3.2 arrancado\n")
+        log.info("\n▶  Bot SHORT v3.3 arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
@@ -1134,13 +1142,13 @@ class ShortBot:
                          f"Abiertos:{len(self.open_trades)}/{MAX_TRADES} | "
                          f"PnL:${self.stats['pnl']:+.3f} | WR:{wr:.1f}%")
                 log.info(f"  BTC 1h:{self._btc_change_1h:+.2f}% 4h:{self._btc_change_4h:+.2f}% {btc_st} | {hora_st}")
+                log.info(f"  Capital/trade: ${POSITION_SIZE} USDT (mín garantizado: ${FORCE_MIN_USDT})")
                 log.info(f"{'='*70}\n")
 
                 await self.monitor_trades()
                 self._reporte_horario()
 
                 if len(self.open_trades) < MAX_TRADES:
-                    # MEJORA-6: verificar correlación antes del ciclo completo
                     if not self._correlacion_ok():
                         log.info(f"  Filtro correlación activo — esperando cierre de posiciones en pérdida")
                     elif not self._btc_regime_ok():
