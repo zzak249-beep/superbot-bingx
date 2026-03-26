@@ -1,60 +1,61 @@
-# ══════════════════════════════════════════════════════
-# BOT SHORTS v3.3 — Variables Railway (CORREGIDAS)
-# ══════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# BOT SHORTS v3.3.1 — Variables Railway (CAPITAL MÍNIMO 6 USDT)
+# ══════════════════════════════════════════════════════════════
 
-# BingX API
+# ── BingX API ──────────────────────────────────────────────────
 BINGX_API_KEY=tu_api_key
 BINGX_API_SECRET=tu_api_secret
 
-# Telegram
+# ── Telegram ───────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN=tu_token
 TELEGRAM_CHAT_ID=tu_chat_id
 
-# Trading
+# ── Trading ────────────────────────────────────────────────────
 AUTO_TRADING_ENABLED=true
 LEVERAGE=3
 
-# ══ FIX PRINCIPAL: Tamaño de posición ══
-# El env anterior usaba RISK_PCT_PER_TRADE y MAX_TRADE_USDT
-# pero el código lee MAX_POSITION_SIZE y FORCE_MIN_USDT.
-# Con estas variables el bot SIEMPRE apuesta 8 USDT mínimo.
+# ══ TAMAÑO DE POSICIÓN (CORREGIDO) ══
+# Estas variables garantizan que cada trade usa mínimo 8 USDT
+# PERO el bot NO abrirá posiciones si el balance total es < 6 USDT
 MAX_POSITION_SIZE=8
 FORCE_MIN_USDT=8
 MIN_TRADE_USDT=8
+
 MAX_OPEN_TRADES=2
 
-# TP/SL — RR 2.5:1 (break-even con WR > 28.5%)
+# ── TP/SL (RR 2.5:1 → Break-even con WR > 28.5%) ───────────────
 TAKE_PROFIT_PCT=2.8
 STOP_LOSS_PCT=1.1
 
-# Score mínimo — 82 es el balance entre calidad y frecuencia
-# NO bajar de 80. El env anterior tenía MIN_SCORE=10 (ruinoso)
+# ── Score mínimo (NO BAJAR DE 80) ──────────────────────────────
+# El env anterior tenía MIN_SCORE=10 que era ruinoso
 MIN_SCORE=82
 
-# Filtros de mercado
+# ── Filtros de mercado ─────────────────────────────────────────
 MIN_VOLUME_24H=10000000
 MAX_SYMBOLS_TO_ANALYZE=40
 CHECK_INTERVAL=300
 
-# Órdenes maker (menor comisión)
+# ── Órdenes maker (menor comisión) ─────────────────────────────
 USE_LIMIT_ORDERS=true
 
-# Filtro BTC dual timeframe
+# ── Filtro BTC dual timeframe ──────────────────────────────────
+# Bloquea shorts si BTC sube >0.5% en 1h Y >1% en 4h
 BTC_BULL_BLOCK_1H=0.5
 BTC_BULL_BLOCK_4H=1.0
 BTC_BEAR_BONUS_1H=-0.3
 
-# Trailing stop
+# ── Trailing stop ──────────────────────────────────────────────
 TRAILING_STOP_ENABLED=true
 
-# Seguro final
+# ── Seguro final ───────────────────────────────────────────────
 MAX_LOSS_PCT=8.0
 
-# MAE / Patrones
+# ── MAE / Patrones ─────────────────────────────────────────────
 MAE_PERIOD=20
 MAE_PCT=2.0
 PATTERN_SCORE=true
 REGIME_FILTER=true
 
-# SL límite offset (maker)
+# ── SL límite offset (maker) ───────────────────────────────────
 SL_LIMIT_OFFSET_PCT=0.05
