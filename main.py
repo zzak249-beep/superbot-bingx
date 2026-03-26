@@ -1,35 +1,17 @@
 #!/usr/bin/env python3
 """
-BOT SHORTS PROFESIONAL v3.3
+BOT SHORTS PROFESIONAL v3.3.1 — CAPITAL MÍNIMO
 ════════════════════════════════════════════════════════════════
-FIXES v3.3 — Corrección tamaño de trade + rentabilidad:
+NUEVO: Verificación de capital mínimo 6 USDT antes de operar
 
+El bot NO abrirá posiciones si el balance disponible es < 6 USDT.
+Esto evita trades microscópicos que no son rentables.
+
+FIXES v3.3:
   FIX-1   POSITION_SIZE GARANTIZADO EN 8 USDT
-          El env v4.0 usaba RISK_PCT_PER_TRADE/MAX_TRADE_USDT
-          pero el código leía MAX_POSITION_SIZE (nunca seteada).
-          Ahora: default 8 USDT, mínimo absoluto 8 USDT siempre.
-          En open_trade se fuerza usdt_qty >= FORCE_MIN_USDT.
-
   FIX-2   MIN_SCORE CORREGIDO
-          El env v4.0 ponía MIN_SCORE=10 (¡muy bajo!).
-          Se mantiene en 82 con lógica dinámica para BTC alcista.
-
   FIX-3   LEVERAGE FIJO EN 3x
-          Compatible con capital pequeño. Con 8 USDT y 3x
-          el margen usado es real: ~8 USDT por posición.
-
-  FIX-4   TP/SL MEJORADO PARA RENTABILIDAD
-          TP_PCT=2.8% SL_PCT=1.1% → RR=2.5:1
-          Con win rate 30% ya es rentable.
-          Break-even teórico: WR > 1/(1+RR) = 28.5%
-
-  HERENCIA v3.2:
-  - Filtro BTC multiframe 1h+4h
-  - Filtro correlación (máx 2 posiciones en pérdida)
-  - SL como STOP límite maker
-  - 6 reintentos con backoff en TP/SL
-  - Cooldown 30 min
-  - MIN_VOLUME 10M
+  FIX-4   TP/SL MEJORADO PARA RENTABILIDAD (RR=2.5:1)
 ════════════════════════════════════════════════════════════════
 """
 
@@ -60,23 +42,26 @@ TELEGRAM_CHAT    = os.getenv('TELEGRAM_CHAT_ID',   '')
 
 AUTO_TRADING  = clean('AUTO_TRADING_ENABLED',  'true',  'bool')
 
+# ── Capital mínimo requerido ──────────────────────────────────
+MIN_CAPITAL_REQUIRED = 6.0  # USDT — No operar si balance < 6 USDT
+# ─────────────────────────────────────────────────────────────
+
 # ── FIX-1: Tamaño garantizado ─────────────────────────────────
-# FORCE_MIN_USDT es el mínimo absoluto que NUNCA se viola
-POSITION_SIZE  = clean('MAX_POSITION_SIZE',     '8',    'float')  # FIX: era 15 con env roto
-FORCE_MIN_USDT = clean('FORCE_MIN_USDT',        '8',    'float')  # Mínimo absoluto: 8 USDT
-MIN_TRADE      = clean('MIN_TRADE_USDT',         '8',   'float')  # FIX: era 5
+POSITION_SIZE  = clean('MAX_POSITION_SIZE',     '8',    'float')
+FORCE_MIN_USDT = clean('FORCE_MIN_USDT',        '8',    'float')
+MIN_TRADE      = clean('MIN_TRADE_USDT',         '8',   'float')
 # ─────────────────────────────────────────────────────────────
 
 LEVERAGE      = clean('LEVERAGE',                '3',   'int')
 # FIX-4: TP/SL mejorado para RR 2.5:1
-TP_PCT        = clean('TAKE_PROFIT_PCT',         '2.8', 'float')  # FIX: era 2.5
-SL_PCT        = clean('STOP_LOSS_PCT',           '1.1', 'float')  # FIX: era 1.2
+TP_PCT        = clean('TAKE_PROFIT_PCT',         '2.8', 'float')
+SL_PCT        = clean('STOP_LOSS_PCT',           '1.1', 'float')
 MAX_TRADES    = clean('MAX_OPEN_TRADES',         '2',   'int')
 INTERVAL      = clean('CHECK_INTERVAL',         '300',  'int')
 MIN_VOLUME    = clean('MIN_VOLUME_24H',     '10000000', 'float')
 MAX_SYMBOLS   = clean('MAX_SYMBOLS_TO_ANALYZE', '40',   'int')
-# FIX-2: MIN_SCORE corregido (el env v4.0 ponía 10, que es ruinoso)
-MIN_SCORE     = clean('MIN_SCORE',              '82',   'float')  # FIX: era 10 en el env
+# FIX-2: MIN_SCORE corregido
+MIN_SCORE     = clean('MIN_SCORE',              '82',   'float')
 TRAILING      = clean('TRAILING_STOP_ENABLED', 'true',  'bool')
 USE_LIMIT_ORDERS   = clean('USE_LIMIT_ORDERS',      'true', 'bool')
 MAX_LOSS_PCT       = clean('MAX_LOSS_PCT',           '8.0',  'float')
@@ -382,11 +367,12 @@ class ShortBot:
         rr = round(TP_PCT / SL_PCT, 2)
         breakeven_wr = round(1 / (1 + rr) * 100, 1)
         log.info("=" * 70)
-        log.info("  BOT SHORTS PROFESIONAL v3.3")
-        log.info("  FIX: tamaño garantizado 8 USDT + RR mejorado")
+        log.info("  BOT SHORTS PROFESIONAL v3.3.1")
+        log.info("  NUEVO: Capital mínimo $6 USDT requerido")
         log.info("=" * 70)
         log.info(f"  Modo:        {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
-        log.info(f"  Capital:     ${POSITION_SIZE} USDT (mín absoluto: ${FORCE_MIN_USDT})")
+        log.info(f"  Capital mín: ${MIN_CAPITAL_REQUIRED} USDT (no opera si balance < $6)")
+        log.info(f"  Position:    ${POSITION_SIZE} USDT (mín absoluto: ${FORCE_MIN_USDT})")
         log.info(f"  Leverage:    {LEVERAGE}x")
         log.info(f"  TP/SL:       {TP_PCT}% / {SL_PCT}%  RR:{rr}:1")
         log.info(f"  Break-even:  WR > {breakeven_wr}% (con RR {rr}:1)")
@@ -405,15 +391,18 @@ class ShortBot:
         self._btc_change_1h  = 0.0
         self._btc_change_4h  = 0.0
         self._btc_blocked    = False
+        self._last_balance_check = 0
+        self._available_balance  = 0
         self.stats = {'exec':0,'closed':0,'wins':0,'losses':0,'pnl':0.0}
 
         self._verify()
         self._load_contracts()
         self._get_symbols()
         self._tg(
-            f"<b>🔴 Bot SHORTS v3.3 iniciado</b>\n"
-            f"FIX: min 8 USDT garantizados | RR {rr}:1 | Break-even WR>{breakeven_wr}%\n"
-            f"Capital: ${POSITION_SIZE}(mín${FORCE_MIN_USDT}) x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}%\n"
+            f"<b>🔴 Bot SHORTS v3.3.1 iniciado</b>\n"
+            f"NUEVO: Capital mín $6 USDT requerido\n"
+            f"Position: ${POSITION_SIZE}(mín${FORCE_MIN_USDT}) x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}%\n"
+            f"RR {rr}:1 | Break-even WR>{breakeven_wr}%\n"
             f"Score≥{MIN_SCORE} | Vol≥{MIN_VOLUME/1e6:.0f}M | Cooldown:{COOLDOWN_MINS}min"
         )
 
@@ -427,8 +416,15 @@ class ShortBot:
         try:
             d = bingx_request('GET', '/openApi/swap/v2/user/balance', {}).json()
             if d.get('code') == 0:
-                eq = d.get('data',{}).get('equity', d.get('data',{}).get('balance','?'))
-                log.info(f"BingX OK | Balance: ${eq} USDT")
+                data = d.get('data', {})
+                eq = data.get('equity', data.get('balance','?'))
+                available = float(data.get('availableMargin', eq))
+                log.info(f"BingX OK | Balance: ${eq} USDT | Disponible: ${available:.2f} USDT")
+                
+                if available < MIN_CAPITAL_REQUIRED:
+                    log.warning(f"⚠️ CAPITAL INSUFICIENTE: ${available:.2f} USDT")
+                    log.warning(f"⚠️ Se requieren mínimo ${MIN_CAPITAL_REQUIRED} USDT para operar")
+                    log.warning(f"⚠️ Bot en ESPERA hasta que deposites fondos suficientes")
             else:
                 log.error(f"BingX [{d.get('code')}]: {d.get('msg')}"); AUTO_TRADING = False
         except Exception as e:
@@ -533,7 +529,29 @@ class ShortBot:
             return False
         return True
 
-    # ---------------------------------------------------------------- FIX-1: sizing garantizado
+    # ---------------------------------------------------------------- Balance
+
+    def _get_available_balance(self):
+        """Obtiene el balance disponible en USDT y lo cachea por 60s"""
+        now = time.time()
+        if now - self._last_balance_check < 60:
+            return self._available_balance
+        
+        try:
+            d = bingx_request('GET', '/openApi/swap/v2/user/balance', {}).json()
+            if d.get('code') == 0:
+                data = d.get('data', {})
+                # Intentar obtener availableMargin primero, luego equity
+                available = float(data.get('availableMargin', data.get('equity', 0)))
+                self._available_balance = available
+                self._last_balance_check = now
+                return available
+        except Exception as e:
+            log.warning(f"Error obteniendo balance: {e}")
+        
+        return self._available_balance
+
+    # ---------------------------------------------------------------- sizing garantizado
 
     def _qty_contratos(self, symbol, price, usdt_amount=None):
         """
@@ -901,6 +919,15 @@ class ShortBot:
             return False
         if symbol in self.open_trades: return False
 
+        # ══ VERIFICACIÓN CAPITAL MÍNIMO 6 USDT ══
+        available = self._get_available_balance()
+        if available < MIN_CAPITAL_REQUIRED:
+            log.warning(f"  ⚠️  FONDOS INSUFICIENTES: ${available:.2f} USDT disponibles")
+            log.warning(f"  ⚠️  Se requieren mínimo ${MIN_CAPITAL_REQUIRED} USDT para operar")
+            log.warning(f"  ⚠️  Bot en ESPERA hasta que deposites fondos suficientes")
+            return False
+        # ════════════════════════════════════════
+
         if not self._correlacion_ok():
             log.info(f"  {symbol} bloqueado por filtro de correlación")
             return False
@@ -918,6 +945,7 @@ class ShortBot:
         patterns_str = f"Patrones: {', '.join(sig['patterns'])}" if sig['patterns'] else "Sin patrón chartista"
         rr_real = round(sig['tp_pct'] / sig['sl_pct'], 2)
         log.info(f"\n  ➤ SHORT {symbol}")
+        log.info(f"  Balance disponible: ${available:.2f} USDT")
         log.info(f"  Score:{sig['score']:.0f}/{sig['score_min']:.0f} | RSI:{sig['rsi']:.0f} | "
                  f"BB:{sig['bb_pos']}% | Régimen:{sig['regime']} | BTC 1h:{self._btc_change_1h:+.2f}% 4h:{self._btc_change_4h:+.2f}%")
         log.info(f"  {patterns_str}")
@@ -989,7 +1017,8 @@ class ShortBot:
         rr = round(sig['tp_pct'] / sig['sl_pct'], 1)
         pat_str = f"\nPatrones: {', '.join(sig['patterns'])}" if sig['patterns'] else ""
         self._tg(
-            f"<b>🔴 SHORT ABIERTO v3.3</b>\n<b>{symbol}</b> | Score:{sig['score']:.0f}/{sig['score_min']:.0f}\n"
+            f"<b>🔴 SHORT ABIERTO v3.3.1</b>\n<b>{symbol}</b> | Score:{sig['score']:.0f}/{sig['score_min']:.0f}\n"
+            f"Balance: ${available:.2f} USDT\n"
             f"Entrada: ${entry_final:.6f}\n"
             f"{'✅' if tp_ok else '❌'} TP: ${tp_price:.6f} (-{sig['tp_pct']:.2f}%)\n"
             f"{'✅' if sl_ok else '❌'} SL: ${sl_price:.6f} (+{sig['sl_pct']:.1f}%)\n"
@@ -1102,8 +1131,12 @@ class ShortBot:
         wr    = self.stats['wins'] / total * 100 if total else 0
         rr = round(TP_PCT / SL_PCT, 2)
         btc_st = "⛔ BLOQUEADO" if self._btc_blocked else "✅ OK"
+        available = self._get_available_balance()
+        capital_st = "✅ OK" if available >= MIN_CAPITAL_REQUIRED else f"⚠️ INSUFICIENTE (mín ${MIN_CAPITAL_REQUIRED})"
+        
         self._tg(
-            f"<b>📊 Reporte horario v3.3</b>\n"
+            f"<b>📊 Reporte horario v3.3.1</b>\n"
+            f"Balance: ${available:.2f} USDT {capital_st}\n"
             f"PnL: ${self.stats['pnl']:+.3f} | WR:{wr:.1f}%\n"
             f"({self.stats['wins']}W/{self.stats['losses']}L | {self.stats['closed']} trades)\n"
             f"Abiertos: {len(self.open_trades)}/{MAX_TRADES}\n"
@@ -1122,7 +1155,7 @@ class ShortBot:
     # ---------------------------------------------------------------- loop
 
     async def run(self):
-        log.info("\n▶  Bot SHORT v3.3 arrancado\n")
+        log.info("\n▶  Bot SHORT v3.3.1 arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
@@ -1131,15 +1164,18 @@ class ShortBot:
                     self._get_symbols(); last_refresh = time.time()
 
                 self._update_btc_trend()
+                available = self._get_available_balance()
 
                 total = self.stats['wins'] + self.stats['losses']
                 wr    = self.stats['wins'] / total * 100 if total else 0
                 btc_st = "⛔ BLOQUEADO" if self._btc_blocked else "✅ OK"
                 hora_st = "🌙 HORA BAJA" if not self._hora_ok() else "☀️"
+                capital_st = "✅ OK" if available >= MIN_CAPITAL_REQUIRED else "⚠️ FONDOS INSUFICIENTES"
 
                 log.info(f"\n{'='*70}")
                 log.info(f"  #{iteration} {datetime.now().strftime('%H:%M:%S')} | "
-                         f"Abiertos:{len(self.open_trades)}/{MAX_TRADES} | "
+                         f"Balance: ${available:.2f} USDT {capital_st}")
+                log.info(f"  Abiertos:{len(self.open_trades)}/{MAX_TRADES} | "
                          f"PnL:${self.stats['pnl']:+.3f} | WR:{wr:.1f}%")
                 log.info(f"  BTC 1h:{self._btc_change_1h:+.2f}% 4h:{self._btc_change_4h:+.2f}% {btc_st} | {hora_st}")
                 log.info(f"  Capital/trade: ${POSITION_SIZE} USDT (mín garantizado: ${FORCE_MIN_USDT})")
@@ -1149,7 +1185,10 @@ class ShortBot:
                 self._reporte_horario()
 
                 if len(self.open_trades) < MAX_TRADES:
-                    if not self._correlacion_ok():
+                    if available < MIN_CAPITAL_REQUIRED:
+                        log.warning(f"  ⚠️  ESPERANDO FONDOS: Balance ${available:.2f} < ${MIN_CAPITAL_REQUIRED} USDT")
+                        log.warning(f"  ⚠️  Deposita al menos ${MIN_CAPITAL_REQUIRED} USDT para que el bot pueda operar")
+                    elif not self._correlacion_ok():
                         log.info(f"  Filtro correlación activo — esperando cierre de posiciones en pérdida")
                     elif not self._btc_regime_ok():
                         log.info(f"  Filtro BTC multiframe activo — no se analizan señales")
