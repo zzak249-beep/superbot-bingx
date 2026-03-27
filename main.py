@@ -566,8 +566,8 @@ class ShortBot:
         fee_lbl = f"LÍMITE maker {COMISION_MAKER*100:.2f}%" if USE_LIMIT_ORDERS \
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
         log.info("=" * 70)
-        log.info("  BOT SHORTS PROFESIONAL v3.3")
-        log.info("  v3.3: filtros obligatorios RSI/VOL/ATR/BTC + RR≥1.7 garantizado + scoring rebalanceado")
+        log.info("  BOT SHORTS PROFESIONAL v3.4")
+        log.info("  v3.4: FIX DEFINITIVO mínimo 8 USDT — qty_c validado en todos los métodos")
         log.info("  FIX v2.4: fees reales 0.02/0.05%, TP maker, qty real")
         log.info("=" * 70)
         log.info(f"  Modo:      {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
@@ -592,11 +592,10 @@ class ShortBot:
         self._load_contracts()
         self._get_symbols()
         self._tg(
-            f"<b>🔴 Bot SHORTS v3.3 iniciado</b>\n"
+            f"<b>🔴 Bot SHORTS v3.4 iniciado</b>\n"
+            f"FIX: mínimo {FORCE_MIN_USDT} USDT garantizado en todas las órdenes\n"
             f"TP:{TP_PCT}% SL:{SL_PCT}% RR≥1.7 LEV:{LEVERAGE}x\n"
-            f"Score≥{MIN_SCORE} | Filtros: RSI≥65 VOL≥1.2 ATR≥0.4%\n"
-            f"Capital: ${POSITION_SIZE} | Min: ${FORCE_MIN_USDT} USDT\n"
-            f"Cooldown TP:{COOLDOWN_MIN_TP}min SL:{COOLDOWN_MIN_SL}min"
+            f"Score≥{MIN_SCORE} | Capital: ${POSITION_SIZE}"
         )
 
     # ---------------------------------------------------------------- setup
@@ -946,16 +945,33 @@ class ShortBot:
 
     def _place_short_entry(self, symbol, usdt_qty, price):
         """
-        Entrada SHORT maker-first (del FLOOP v4).
-        1. LIMIT qty_c al precio ligeramente por encima → queda en libro → maker 0.02%
-        2. Fallback MARKET quoteOrderQty → taker 0.05%
-        3. Fallback MARKET quantity en contratos → taker 0.05%
+        v3.4 FIX MÍNIMO: garantiza siempre >= FORCE_MIN_USDT en todos los métodos.
+        El bug de 2-3 USDT ocurría porque:
+        - quoteOrderQty usaba usdt_qty sin validar
+        - qty_c podía ser None si _qty_contratos fallaba
+        Ahora: todos los métodos usan qty_c validado o abortan.
         """
-        qty_c, _ = self._qty_contratos(symbol, price, usdt_qty)
+        # Forzar mínimo antes de calcular
+        usdt_qty = max(usdt_qty, FORCE_MIN_USDT, MIN_TRADE)
+        qty_c, qty_val = self._qty_contratos(symbol, price, usdt_qty)
 
-        if USE_LIMIT_ORDERS and qty_c:
-            # SHORT = SELL: ponemos el límite 0.05% POR ENCIMA del mercado
-            # El precio sube esa fracción antes de ejecutarse → queda en libro → maker
+        # Abort si no se pudo calcular cantidad válida
+        if not qty_c or qty_c <= 0:
+            log.error(f"  ENTRADA ABORTADA {symbol}: qty_c inválido tras _qty_contratos")
+            return None, None
+
+        # Verificar que el valor notional supera el mínimo
+        info  = self._contracts.get(symbol, {'ctval': 1.0})
+        ppc   = price * info.get('ctval', 1.0) if info.get('ctval', 1.0) != 1.0 else price
+        valor = qty_c * ppc
+        if valor < FORCE_MIN_USDT:
+            log.error(f"  ENTRADA ABORTADA {symbol}: valor ${valor:.2f} < mínimo ${FORCE_MIN_USDT}")
+            return None, None
+
+        log.info(f"  Intentando SHORT {symbol}: {qty_c} cts = ${valor:.2f} USDT")
+
+        # Método 1: LIMIT qty_c (maker 0.02%)
+        if USE_LIMIT_ORDERS:
             limit_price = round(price * (1 + LIMIT_OFFSET_PCT / 100), 8)
             d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
                 'symbol':symbol,'side':'SELL','positionSide':'SHORT',
@@ -963,31 +979,32 @@ class ShortBot:
                 'quantity':str(qty_c),'timeInForce':'GTC',
             }).json()
             if d.get('code') == 0:
-                log.info(f"  ENTRADA LÍMITE maker OK {qty_c} cts @ ${limit_price:.6f} (0.02%)")
+                log.info(f"  ENTRADA LÍMITE maker OK {qty_c} cts @ ${limit_price:.6f} (${valor:.2f})")
                 return d.get('data',{}).get('orderId','OK'), qty_c
             if 'margin' in str(d.get('msg','')).lower():
                 log.error(f"  Margen insuficiente — abortando"); return None, None
-            log.warning(f"  Límite falló [{d.get('code')}] — fallback mercado")
+            log.warning(f"  Límite falló [{d.get('code')}] — fallback MARKET qty_c")
 
-        # Fallback 1: MARKET con quoteOrderQty
+        # Método 2: MARKET con quantity en contratos (NO quoteOrderQty — más control)
         d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-            'symbol':symbol,'side':'SELL','positionSide':'SHORT',
-            'type':'MARKET','quoteOrderQty':str(round(usdt_qty, 2)),
-        }).json()
-        if d.get('code') == 0:
-            log.info(f"  ENTRADA MARKET taker OK ${usdt_qty} (0.05%)")
-            return d.get('data',{}).get('orderId','OK'), qty_c
-
-        # Fallback 2: MARKET con quantity en contratos
-        log.warning(f"  quoteOrderQty falló [{d.get('code')}] — fallback contratos")
-        if not qty_c: return None, None
-        d2 = bingx_request('POST', '/openApi/swap/v2/trade/order', {
             'symbol':symbol,'side':'SELL','positionSide':'SHORT',
             'type':'MARKET','quantity':str(qty_c),
         }).json()
+        if d.get('code') == 0:
+            log.info(f"  ENTRADA MARKET qty_c OK {qty_c} cts (${valor:.2f})")
+            return d.get('data',{}).get('orderId','OK'), qty_c
+
+        # Método 3: MARKET con quoteOrderQty validado (último recurso)
+        usdt_validado = round(max(valor, FORCE_MIN_USDT), 2)
+        log.warning(f"  qty_c falló [{d.get('code')}] — fallback quoteOrderQty ${usdt_validado}")
+        d2 = bingx_request('POST', '/openApi/swap/v2/trade/order', {
+            'symbol':symbol,'side':'SELL','positionSide':'SHORT',
+            'type':'MARKET','quoteOrderQty':str(usdt_validado),
+        }).json()
         if d2.get('code') == 0:
+            log.info(f"  ENTRADA quoteOrderQty OK ${usdt_validado}")
             return d2.get('data',{}).get('orderId','OK'), qty_c
-        log.error(f"  Todos los métodos fallaron [{d2.get('code')}]: {d2.get('msg')}")
+        log.error(f"  TODOS los métodos fallaron [{d2.get('code')}]: {d2.get('msg')}")
         return None, None
 
     def _esperar_posicion(self, symbol, timeout=60):
@@ -1416,7 +1433,7 @@ class ShortBot:
     # ---------------------------------------------------------------- loop
 
     async def run(self):
-        log.info("\n▶  Bot SHORT v3.3 arrancado\n")
+        log.info("\n▶  Bot SHORT v3.4 arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
