@@ -566,7 +566,7 @@ class ShortBot:
         fee_lbl = f"LÍMITE maker {COMISION_MAKER*100:.2f}%" if USE_LIMIT_ORDERS \
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
         log.info("=" * 70)
-        log.info("  BOT SHORTS PROFESIONAL v3.4")
+        log.info("  BOT SHORTS PROFESIONAL v3.5")
         log.info("  v3.4: FIX DEFINITIVO mínimo 8 USDT — qty_c validado en todos los métodos")
         log.info("  FIX v2.4: fees reales 0.02/0.05%, TP maker, qty real")
         log.info("=" * 70)
@@ -592,7 +592,7 @@ class ShortBot:
         self._load_contracts()
         self._get_symbols()
         self._tg(
-            f"<b>🔴 Bot SHORTS v3.4 iniciado</b>\n"
+            f"<b>🔴 Bot SHORTS v3.5 iniciado</b>\n"
             f"FIX: mínimo {FORCE_MIN_USDT} USDT garantizado en todas las órdenes\n"
             f"TP:{TP_PCT}% SL:{SL_PCT}% RR≥1.7 LEV:{LEVERAGE}x\n"
             f"Score≥{MIN_SCORE} | Capital: ${POSITION_SIZE}"
@@ -702,40 +702,68 @@ class ShortBot:
     # ---------------------------------------------------------------- sizing
 
     def _qty_contratos(self, symbol, price, usdt_amount=None):
-        # v3.2: triple garantía mínimo
+        """
+        v3.5 FIX DEFINITIVO: calcula qty en contratos para que el NOTIONAL sea
+        exactamente usdt_amount USDT, independientemente del modo "Por costo/valor" de BingX.
+
+        BingX `quantity` = número de contratos.
+        Notional = qty × price × contractSize
+        Por tanto: qty = usdt_amount / (price × contractSize)
+
+        NUNCA se usa quoteOrderQty — es ambiguo según el modo de la cuenta.
+        """
         if usdt_amount is None: usdt_amount = POSITION_SIZE
         usdt_amount = max(usdt_amount, FORCE_MIN_USDT, MIN_TRADE)
 
-        info  = self._contracts.get(symbol, {'step':1.0,'prec':2,'ctval':1.0})
-        step  = max(info['step'], 0.0001)
-        prec  = info['prec']
-        ctval = info.get('ctval', 1.0)
-        ppc   = price * ctval if ctval != 1.0 else price
-        if ppc <= 0: return None, 0
+        info  = self._contracts.get(symbol, {'step': 1.0, 'prec': 2, 'ctval': 1.0})
+        step  = max(info.get('step', 1.0), 0.0001)
+        prec  = info.get('prec', 2)
+        ctval = max(info.get('ctval', 1.0), 0.000000001)  # tamaño del contrato
 
-        qty = round(math.ceil(usdt_amount / ppc / step) * step, prec)
-        val = qty * ppc
+        # Precio por contrato = precio del activo × tamaño del contrato
+        ppc = price * ctval
+        if ppc <= 0:
+            log.error(f"  [QTY] {symbol}: precio por contrato inválido (price={price} ctval={ctval})")
+            return None, 0
+
+        # Cantidad de contratos para cubrir usdt_amount de NOTIONAL
+        # (no de margen — el margen depende del leverage que fije el usuario en BingX)
+        qty_raw = usdt_amount / ppc
+        qty = round(math.ceil(qty_raw / step) * step, prec)
+        val = qty * ppc  # notional en USDT
 
         min_val = max(MIN_TRADE, FORCE_MIN_USDT)
         i = 0
-        while val < min_val and i < 100:
-            qty += step; qty = round(qty, prec); val = qty * ppc; i += 1
+        while val < min_val and i < 200:
+            qty += step
+            qty  = round(qty, prec)
+            val  = qty * ppc
+            i   += 1
 
-        # v3.2: rechaza si no se alcanzó el mínimo tras el loop
         if val < min_val:
-            log.error(f"  [QTY] {symbol} no alcanza mínimo: ${val:.2f} < ${min_val}")
+            log.error(f"  [QTY] {symbol}: notional ${val:.4f} < mínimo ${min_val} (step={step}, ppc={ppc:.8f})")
             return None, 0
 
+        # Cap: no exceder 130% del capital objetivo
         if val > usdt_amount * 1.3:
             qty = round(math.floor((usdt_amount * 1.3 / ppc) / step) * step, prec)
             val = qty * ppc
-            # re-chequear tras recorte
-            if val < min_val:
+            if val < min_val:  # si el recorte rompió el mínimo, usar mínimo
                 qty = round(math.ceil(min_val / ppc / step) * step, prec)
                 val = qty * ppc
 
-        log.info(f"  [QTY] {symbol}: {qty} × ${ppc:.6f} = ${val:.2f} USDT ✅")
+        log.info(f"  [QTY] {symbol}: {qty} cts × ${ppc:.6f}/ct = ${val:.2f} USDT notional "
+                 f"(ctval={ctval}, step={step})")
         return qty, round(val, 4)
+
+    def _notional_ok(self, symbol, qty_c, price):
+        """Valida que qty_c contratos = al menos FORCE_MIN_USDT de notional."""
+        info  = self._contracts.get(symbol, {'ctval': 1.0})
+        ctval = max(info.get('ctval', 1.0), 0.000000001)
+        val   = qty_c * price * ctval
+        ok    = val >= FORCE_MIN_USDT
+        log.info(f"  [VAL] {symbol}: {qty_c} cts × ${price:.6f} × {ctval} = ${val:.2f} USDT {'✅' if ok else '❌'}")
+        return ok, round(val, 2)
 
     # ---------------------------------------------------------------- análisis principal
 
@@ -945,66 +973,58 @@ class ShortBot:
 
     def _place_short_entry(self, symbol, usdt_qty, price):
         """
-        v3.4 FIX MÍNIMO: garantiza siempre >= FORCE_MIN_USDT en todos los métodos.
-        El bug de 2-3 USDT ocurría porque:
-        - quoteOrderQty usaba usdt_qty sin validar
-        - qty_c podía ser None si _qty_contratos fallaba
-        Ahora: todos los métodos usan qty_c validado o abortan.
+        v3.5 FIX DEFINITIVO: NUNCA usa quoteOrderQty.
+        quoteOrderQty es ambiguo en BingX — según el modo de cuenta ("Por costo" vs
+        "Por valor") puede ser el margen o el notional, lo que causa trades de 1-2 USDT.
+        Solución: siempre quantity en contratos calculado por _qty_contratos().
         """
-        # Forzar mínimo antes de calcular
         usdt_qty = max(usdt_qty, FORCE_MIN_USDT, MIN_TRADE)
         qty_c, qty_val = self._qty_contratos(symbol, price, usdt_qty)
 
-        # Abort si no se pudo calcular cantidad válida
         if not qty_c or qty_c <= 0:
-            log.error(f"  ENTRADA ABORTADA {symbol}: qty_c inválido tras _qty_contratos")
+            log.error(f"  ENTRADA ABORTADA {symbol}: _qty_contratos devolvió 0")
             return None, None
 
-        # Verificar que el valor notional supera el mínimo
-        info  = self._contracts.get(symbol, {'ctval': 1.0})
-        ppc   = price * info.get('ctval', 1.0) if info.get('ctval', 1.0) != 1.0 else price
-        valor = qty_c * ppc
-        if valor < FORCE_MIN_USDT:
-            log.error(f"  ENTRADA ABORTADA {symbol}: valor ${valor:.2f} < mínimo ${FORCE_MIN_USDT}")
+        # Validar notional antes de enviar
+        notional_ok, notional_val = self._notional_ok(symbol, qty_c, price)
+        if not notional_ok:
+            log.error(f"  ENTRADA ABORTADA {symbol}: notional ${notional_val:.2f} < ${FORCE_MIN_USDT}")
             return None, None
 
-        log.info(f"  Intentando SHORT {symbol}: {qty_c} cts = ${valor:.2f} USDT")
+        log.info(f"  SHORT {symbol}: {qty_c} contratos = ${notional_val:.2f} USDT notional")
 
-        # Método 1: LIMIT qty_c (maker 0.02%)
+        # ── Método 1: LIMIT (maker 0.02%) ─────────────────────────────
         if USE_LIMIT_ORDERS:
             limit_price = round(price * (1 + LIMIT_OFFSET_PCT / 100), 8)
             d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-                'symbol':symbol,'side':'SELL','positionSide':'SHORT',
-                'type':'LIMIT','price':str(limit_price),
-                'quantity':str(qty_c),'timeInForce':'GTC',
+                'symbol':      symbol,
+                'side':        'SELL',
+                'positionSide':'SHORT',
+                'type':        'LIMIT',
+                'price':       str(limit_price),
+                'quantity':    str(qty_c),   # siempre contratos
+                'timeInForce': 'GTC',
             }).json()
             if d.get('code') == 0:
-                log.info(f"  ENTRADA LÍMITE maker OK {qty_c} cts @ ${limit_price:.6f} (${valor:.2f})")
-                return d.get('data',{}).get('orderId','OK'), qty_c
-            if 'margin' in str(d.get('msg','')).lower():
-                log.error(f"  Margen insuficiente — abortando"); return None, None
-            log.warning(f"  Límite falló [{d.get('code')}] — fallback MARKET qty_c")
+                log.info(f"  ✅ LIMIT maker {qty_c} cts @ ${limit_price:.6f} (${notional_val:.2f})")
+                return d.get('data', {}).get('orderId', 'OK'), qty_c
+            if 'margin' in str(d.get('msg', '')).lower():
+                log.error(f"  Margen insuficiente"); return None, None
+            log.warning(f"  LIMIT falló [{d.get('code')}] {d.get('msg','')} — MARKET")
 
-        # Método 2: MARKET con quantity en contratos (NO quoteOrderQty — más control)
+        # ── Método 2: MARKET quantity (taker 0.05%) ────────────────────
         d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-            'symbol':symbol,'side':'SELL','positionSide':'SHORT',
-            'type':'MARKET','quantity':str(qty_c),
+            'symbol':      symbol,
+            'side':        'SELL',
+            'positionSide':'SHORT',
+            'type':        'MARKET',
+            'quantity':    str(qty_c),   # siempre contratos, nunca quoteOrderQty
         }).json()
         if d.get('code') == 0:
-            log.info(f"  ENTRADA MARKET qty_c OK {qty_c} cts (${valor:.2f})")
-            return d.get('data',{}).get('orderId','OK'), qty_c
+            log.info(f"  ✅ MARKET {qty_c} cts (${notional_val:.2f})")
+            return d.get('data', {}).get('orderId', 'OK'), qty_c
 
-        # Método 3: MARKET con quoteOrderQty validado (último recurso)
-        usdt_validado = round(max(valor, FORCE_MIN_USDT), 2)
-        log.warning(f"  qty_c falló [{d.get('code')}] — fallback quoteOrderQty ${usdt_validado}")
-        d2 = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-            'symbol':symbol,'side':'SELL','positionSide':'SHORT',
-            'type':'MARKET','quoteOrderQty':str(usdt_validado),
-        }).json()
-        if d2.get('code') == 0:
-            log.info(f"  ENTRADA quoteOrderQty OK ${usdt_validado}")
-            return d2.get('data',{}).get('orderId','OK'), qty_c
-        log.error(f"  TODOS los métodos fallaron [{d2.get('code')}]: {d2.get('msg')}")
+        log.error(f"  ❌ TODOS FALLARON [{d.get('code')}]: {d.get('msg')}")
         return None, None
 
     def _esperar_posicion(self, symbol, timeout=60):
@@ -1129,46 +1149,38 @@ class ShortBot:
             return False
 
     def _close_short(self, symbol, t):
-        """
-        FIX-2 (FLOOP v4): cierre maker-first.
-        LIMIT IOC 0.05% por encima del mercado → queda en libro → maker 0.02%.
-        Si no llena al instante (IOC) se cancela solo. Fallback a MARKET.
-        """
+        """v3.5: cierre siempre con quantity en contratos. Sin quoteOrderQty."""
         qty_c = t.get('qty_c', 0)
-        usdt  = t.get('usdt_qty', POSITION_SIZE)
+        if not qty_c or qty_c <= 0:
+            log.error(f"  Cierre {symbol}: sin qty_c — no se puede cerrar"); return False
 
-        # Intentar cierre límite IOC (maker)
-        if qty_c and qty_c > 0:
-            cur_price = t.get('entry', 0)
-            try:
-                tk = requests.get(f"{BASE_URL}/openApi/swap/v2/quote/ticker",
-                                  params={'symbol': symbol}, timeout=5).json()
-                if tk.get('code') == 0 and tk.get('data'):
-                    cur_price = float(tk['data'].get('lastPrice', cur_price))
-            except: pass
-            if cur_price > 0:
-                # Para SHORT cerramos comprando: límite 0.05% POR DEBAJO del mercado
-                # → se llena de inmediato como maker si hay vendedores al precio
-                limit_price = round(cur_price * (1 - 0.0005), 8)
-                d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-                    'symbol':symbol,'side':'BUY','positionSide':'SHORT',
-                    'type':'LIMIT','quantity':str(qty_c),
-                    'price':str(limit_price),'timeInForce':'IOC','reduceOnly':'true',
-                }).json()
-                if d.get('code') == 0:
-                    log.info(f"  Cierre límite IOC maker @ ${limit_price:.6f} (0.02%)")
-                    return True
-                log.warning(f"  Cierre límite rechazado [{d.get('code')}] — fallback market")
+        # Intentar límite IOC (maker 0.02%)
+        cur_price = t.get('entry', 0)
+        try:
+            tk = requests.get(f"{BASE_URL}/openApi/swap/v2/quote/ticker",
+                              params={'symbol': symbol}, timeout=5).json()
+            if tk.get('code') == 0 and tk.get('data'):
+                cur_price = float(tk['data'].get('lastPrice', cur_price))
+        except: pass
+        if cur_price > 0:
+            limit_price = round(cur_price * (1 - 0.0005), 8)
+            d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
+                'symbol':symbol,'side':'BUY','positionSide':'SHORT',
+                'type':'LIMIT','quantity':str(qty_c),
+                'price':str(limit_price),'timeInForce':'IOC','reduceOnly':'true',
+            }).json()
+            if d.get('code') == 0:
+                log.info(f"  Cierre LIMIT IOC maker {qty_c} cts @ ${limit_price:.6f}")
+                return True
 
-        # Fallback MARKET
-        if qty_c and qty_c > 0:
-            params = {'symbol':symbol,'side':'BUY','positionSide':'SHORT',
-                      'type':'MARKET','quantity':str(qty_c),'reduceOnly':'true'}
-        else:
-            params = {'symbol':symbol,'side':'BUY','positionSide':'SHORT',
-                      'type':'MARKET','quoteOrderQty':str(round(usdt,2)),'reduceOnly':'true'}
-        ok = bingx_request('POST', '/openApi/swap/v2/trade/order', params).json().get('code') == 0
-        if ok: log.info(f"  Cierre MARKET taker OK (0.05%)")
+        # Fallback MARKET con quantity (nunca quoteOrderQty)
+        d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
+            'symbol':symbol,'side':'BUY','positionSide':'SHORT',
+            'type':'MARKET','quantity':str(qty_c),'reduceOnly':'true',
+        }).json()
+        ok = d.get('code') == 0
+        if ok: log.info(f"  Cierre MARKET {qty_c} cts OK")
+        else:  log.error(f"  Cierre MARKET falló [{d.get('code')}]: {d.get('msg')}")
         return ok
 
     def _tiene_posicion(self, symbol):
@@ -1433,7 +1445,7 @@ class ShortBot:
     # ---------------------------------------------------------------- loop
 
     async def run(self):
-        log.info("\n▶  Bot SHORT v3.4 arrancado\n")
+        log.info("\n▶  Bot SHORT v3.5 arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
