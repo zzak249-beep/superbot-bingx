@@ -1183,6 +1183,21 @@ class ShortBot:
         else:  log.error(f"  Cierre MARKET falló [{d.get('code')}]: {d.get('msg')}")
         return ok
 
+    def _contar_posiciones_reales(self):
+        """v3.5: cuenta posiciones SHORT reales en BingX antes de abrir."""
+        try:
+            d = bingx_request('GET', '/openApi/swap/v2/user/positions', {}).json()
+            if d.get('code') == 0:
+                shorts = sum(
+                    1 for p in (d.get('data') or [])
+                    if float(p.get('positionAmt', 0) or 0) < 0
+                )
+                log.info(f"  [REAL] Posiciones SHORT en BingX: {shorts}/{MAX_TRADES}")
+                return shorts
+        except Exception as e:
+            log.warning(f"  [REAL] Error contando posiciones: {e}")
+        return len(self.open_trades)
+
     def _tiene_posicion(self, symbol):
         try:
             d = bingx_request('GET', '/openApi/swap/v2/user/positions', {'symbol':symbol}).json()
@@ -1470,18 +1485,26 @@ class ShortBot:
                 await self.monitor_trades()
                 self._reporte_horario()
 
-                if len(self.open_trades) < MAX_TRADES:
+                # v3.5 FIX: usar posiciones reales de BingX para evitar exceder MAX_TRADES
+                pos_reales = self._contar_posiciones_reales()
+                slots_libres = MAX_TRADES - max(pos_reales, len(self.open_trades))
+                log.info(f"  Slots libres: {slots_libres} (BingX={pos_reales} local={len(self.open_trades)})")
+
+                if slots_libres > 0:
                     found = 0
                     for i, sym in enumerate(self.symbols):
-                        if len(self.open_trades) >= MAX_TRADES: break
+                        if max(self._contar_posiciones_reales(), len(self.open_trades)) >= MAX_TRADES:
+                            break
                         sig = self.analyze(sym)
                         if sig:
                             found += 1
                             pat_str = f" [{','.join(sig['patterns'])}]" if sig['patterns'] else ""
                             log.info(f"  ★ {sym} score:{sig['score']:.0f} RSI:{sig['rsi']:.0f} "
                                      f"régimen:{sig['regime']}{pat_str}")
-                            self.open_trade(sym, sig)
-                        await asyncio.sleep(0.12)
+                            abierto = self.open_trade(sym, sig)
+                            if abierto:
+                                await asyncio.sleep(3)  # pausa tras apertura
+                        await asyncio.sleep(0.15)
                         if (i+1) % 25 == 0:
                             log.info(f"  ...{i+1}/{len(self.symbols)} analizados")
                     log.info(f"\n  {len(self.symbols)} pares | {found} señales")
