@@ -1,61 +1,21 @@
 #!/usr/bin/env python3
 """
-BOT SHORTS PROFESIONAL v3.1
+BOT SHORTS PROFESIONAL v3.6 — main_shorts.py para Railway/GitHub
 ════════════════════════════════════════════════════════════════
-FIXES v3.1 — Copiados del FLOOP Pro v4 (screenshot: 20 posiciones sin TP/SL):
+PROTECCIONES HARDCODEADAS (igual que main.py de longs):
+  ▸ LEVERAGE máximo: 3x  (aunque .env diga 18x o más)
+  ▸ MAX_TRADES máximo: 3  (aunque .env diga más)
+  ▸ FORCE_MIN_USDT: 8 USDT mínimo por trade
+  ▸ Sin quoteOrderQty — siempre quantity en contratos
+  ▸ _set_leverage() llamado antes de cada apertura
 
-  FIX-1  SL como orden STOP límite → maker 0.02% (antes STOP_MARKET taker)
-         Offset configurable SL_LIMIT_OFFSET_PCT (default 0.05%) coloca el
-         límite ligeramente por encima del trigger → se llena maker al llegar.
-         Fallback a STOP_MARKET si BingX rechaza el STOP límite.
-
-  FIX-2  Cierre manual como LIMIT IOC → maker 0.02% (antes siempre MARKET)
-         Pone un límite 0.05% por encima del mercado con timeInForce=IOC.
-         Si no llena al instante se cancela solo. Fallback a MARKET.
-
-  FIX-3  6 reintentos con backoff (1s,2s,3s,5s,8s,13s) en vez de 1 reintento
-         Cancela las órdenes colgadas del símbolo antes de cada reintento.
-         Si tras los 6 intentos el SL sigue sin colocarse → cierre inmediato
-         y alerta Telegram urgente. NUNCA queda posición sin SL.
-
-  FIX-4  Espera confirmación real de posición (hasta 60s) antes de poner TP/SL
-         Usa qty y precio reales de BingX (no estimados).
-         Si no confirma → cancela y cierra de emergencia.
-
-  FIX-5  MAX_LOSS_PCT como seguro final (default 8%)
-         Si PnL apalancado cae por debajo → cierre de emergencia aunque el SL
-         no se haya disparado. Protege liquidaciones por SL no colocado.
-
-NOVEDADES v3.0 — Integración de filosofías avanzadas:
-
-  1. MOVING AVERAGE ENVELOPES (MAE) como filtro de contexto:
-     - Banda +2% / -2% sobre MA20 (configurable MAE_PCT)
-     - Modo RANGO: señal SHORT cuando precio cierra BAJO la banda +2%
-     - Modo TENDENCIA ALCISTA: precio sobre banda → sólo retrocesos
-     - Filtra entradas en momento equivocado del ciclo
-
-  2. PATRONES CHARTISTAS (detección automática):
-     - Head & Shoulders         → SHORT potente
-     - Double Top               → SHORT confirmado
-     - Rising Wedge             → SHORT en ruptura
-     - Bearish Flag             → SHORT en continuación
-     - Breakdown de soporte     → SHORT momentum
-
-  3. LÓGICA DE CONTEXTO (Range vs Trend):
-     - detect_market_regime() clasifica el mercado
-     - En RANGO: MAE como zonas de reversión (sell extremos +2%)
-     - En TENDENCIA: MAE como filtro (no luchar contra impulso)
-
-  4. SCORING MEJORADO:
-     - Patrones chartistas añaden 25-40 puntos al score
-     - MAE en posición extrema añade 20-30 puntos
-     - Régimen de mercado penaliza/bonifica señales
-
-  HERENCIA v2.4:
-  - FIX qty_contratos usa usdt_amount real (no POSITION_SIZE global)
-  - TP como orden LÍMITE (maker 0.02%), SL como STOP_MARKET (taker)
-  - Trailing stop, cooldown 15min, filtro BTC alcista
-  - Retry API, Telegram HTML, sync BingX posiciones
+FIXES v3.6 (nuevos respecto a v3.5):
+  ▸ Hard cap LEVERAGE ≤ 3x en código (no sobreescribible por .env)
+  ▸ Hard cap MAX_TRADES ≤ 3 en código
+  ▸ _set_leverage() fuerza 3x en BingX antes de cada SHORT
+  ▸ Lock _abriendo — solo un trade a la vez
+  ▸ Conteo posiciones reales en BingX antes de abrir
+  ▸ Pausa 3s tras cada apertura exitosa
 ════════════════════════════════════════════════════════════════
 """
 
@@ -85,33 +45,43 @@ TELEGRAM_TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT    = os.getenv('TELEGRAM_CHAT_ID',   '')
 
 AUTO_TRADING  = clean('AUTO_TRADING_ENABLED',  'true',  'bool')
-POSITION_SIZE = clean('MAX_POSITION_SIZE',      '10',   'float')  # v3.2: subido de 7→10
-MIN_TRADE     = clean('MIN_TRADE_USDT',          '8',   'float')  # v3.2: 8 USDT mínimo real BingX
-LEVERAGE      = clean('LEVERAGE',                '3',   'int')    # v3.2: 3x fijo en default
-TP_PCT        = clean('TAKE_PROFIT_PCT',         '2.5', 'float')  # v3.2: 1.5→2.5 para RR positivo
-SL_PCT        = clean('STOP_LOSS_PCT',           '1.5', 'float')  # v3.2: 1.01→1.5 menos ruido
-MAX_TRADES    = clean('MAX_OPEN_TRADES',         '2',   'int')
-INTERVAL      = clean('CHECK_INTERVAL',          '60',  'int')    # v3.2: 120→60s
-MIN_VOLUME    = clean('MIN_VOLUME_24H',      '500000',  'float')  # v3.2: solo pares con liquidez
-MAX_SYMBOLS   = clean('MAX_SYMBOLS_TO_ANALYZE',  '50',  'int')    # v3.2: 90→50 más selectivo
-MIN_SCORE     = clean('MIN_SCORE',               '82',  'float')  # v3.2: 72→82 solo señales fuertes
+POSITION_SIZE = clean('MAX_POSITION_SIZE',      '10',   'float')
+MIN_TRADE     = clean('MIN_TRADE_USDT',          '8',   'float')
+TP_PCT        = clean('TAKE_PROFIT_PCT',         '2.5', 'float')
+SL_PCT        = clean('STOP_LOSS_PCT',           '1.5', 'float')
+INTERVAL      = clean('CHECK_INTERVAL',          '60',  'int')
+MIN_VOLUME    = clean('MIN_VOLUME_24H',      '500000',  'float')
+MAX_SYMBOLS   = clean('MAX_SYMBOLS_TO_ANALYZE',  '50',  'int')
+MIN_SCORE     = clean('MIN_SCORE',               '82',  'float')
 TRAILING      = clean('TRAILING_STOP_ENABLED', 'true',  'bool')
-TRAILING_START= clean('TRAILING_START_PCT',     '1.0',  'float')  # v3.2: activa desde 1% ganancia
-TRAILING_LOCK = clean('TRAILING_LOCK_PCT',       '60',  'float')  # v3.2: protege 60% ganancia
+TRAILING_START= clean('TRAILING_START_PCT',     '1.0',  'float')
+TRAILING_LOCK = clean('TRAILING_LOCK_PCT',       '60',  'float')
 USE_LIMIT_ORDERS   = clean('USE_LIMIT_ORDERS',      'true', 'bool')
 BTC_BULL_BLOCK_PCT = clean('BTC_BULL_BLOCK_PCT',    '1.5',  'float')
-MAX_LOSS_PCT       = clean('MAX_LOSS_PCT',           '5.0',  'float')  # v3.2: 8→5% cierre más rápido
+MAX_LOSS_PCT       = clean('MAX_LOSS_PCT',           '5.0',  'float')
 SL_LIMIT_OFFSET    = clean('SL_LIMIT_OFFSET_PCT',   '0.05', 'float') / 100
-FORCE_MIN_USDT     = clean('FORCE_MIN_USDT',         '8.0',  'float')  # v3.2: rechaza trades < 8 USDT
-COOLDOWN_MIN_TP    = clean('COOLDOWN_AFTER_TP_MIN',  '15',   'int')    # v3.2: cooldown diferenciado
-COOLDOWN_MIN_SL    = clean('COOLDOWN_AFTER_SL_MIN',  '45',   'int')    # v3.2: más espera tras SL
+FORCE_MIN_USDT     = clean('FORCE_MIN_USDT',         '8.0',  'float')
+COOLDOWN_MIN_TP    = clean('COOLDOWN_AFTER_TP_MIN',  '15',   'int')
+COOLDOWN_MIN_SL    = clean('COOLDOWN_AFTER_SL_MIN',  '45',   'int')
 
 # ── NUEVOS parámetros v3.0 ───────────────────────────────────────
-MAE_PERIOD    = clean('MAE_PERIOD',     '20',  'int')    # MA base de envelopes
-MAE_PCT       = clean('MAE_PCT',        '2.0', 'float')  # banda ±2%
-MAE_EXTREME   = clean('MAE_EXTREME',    '1.8', 'float')  # % sobre banda para "extremo"
-PATTERN_SCORE = clean('PATTERN_SCORE', 'true', 'bool')   # activar/desactivar bonus patrones
-REGIME_FILTER = clean('REGIME_FILTER', 'true', 'bool')   # activar filtro régimen mercado
+MAE_PERIOD    = clean('MAE_PERIOD',     '20',  'int')
+MAE_PCT       = clean('MAE_PCT',        '2.0', 'float')
+MAE_EXTREME   = clean('MAE_EXTREME',    '1.8', 'float')
+PATTERN_SCORE = clean('PATTERN_SCORE', 'true', 'bool')
+REGIME_FILTER = clean('REGIME_FILTER', 'true', 'bool')
+
+# ══════════════════════════════════════════════════════════════════
+# HARD CAPS — NO MODIFICAR — protegen contra .env mal configurado
+# ══════════════════════════════════════════════════════════════════
+_lev_env    = clean('LEVERAGE',        '3', 'int')
+_trades_env = clean('MAX_OPEN_TRADES', '2', 'int')
+_min_env    = clean('FORCE_MIN_USDT',  '8.0', 'float')
+
+LEVERAGE       = min(_lev_env,    3)   # NUNCA más de 3x aunque .env diga 18x
+MAX_TRADES     = min(_trades_env, 3)   # NUNCA más de 3 trades simultáneos
+FORCE_MIN_USDT = max(_min_env,    8.0) # SIEMPRE mínimo 8 USDT por trade
+# ══════════════════════════════════════════════════════════════════
 
 LIMIT_OFFSET_PCT = 0.05
 SKIP_HOURS_UTC   = {0, 1}
@@ -566,19 +536,22 @@ class ShortBot:
         fee_lbl = f"LÍMITE maker {COMISION_MAKER*100:.2f}%" if USE_LIMIT_ORDERS \
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
         log.info("=" * 70)
-        log.info("  BOT SHORTS PROFESIONAL v3.5")
-        log.info("  v3.4: FIX DEFINITIVO mínimo 8 USDT — qty_c validado en todos los métodos")
-        log.info("  FIX v2.4: fees reales 0.02/0.05%, TP maker, qty real")
+        log.info("  BOT SHORTS PROFESIONAL v3.6 — main_shorts.py")
+        log.info("  HARD CAPS: LEVERAGE≤3x | MAX_TRADES≤3 | MIN_USDT≥8")
         log.info("=" * 70)
         log.info(f"  Modo:      {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
-        log.info(f"  Capital:   ${POSITION_SIZE} USDT | Leverage: {LEVERAGE}x")
+        log.info(f"  Capital:   ${POSITION_SIZE} USDT | Leverage: {LEVERAGE}x (cap 3x)")
         log.info(f"  TP/SL:     {TP_PCT}% / {SL_PCT}%  RR:{TP_PCT/SL_PCT:.1f}:1")
         log.info(f"  TP mín:    {TP_MIN_RENTABLE}% (cubre comisiones)")
         log.info(f"  Órdenes:   {fee_lbl}")
         log.info(f"  MAE:       MA{MAE_PERIOD} ±{MAE_PCT}% (filtro contexto)")
         log.info(f"  Patrones:  {'ON' if PATTERN_SCORE else 'OFF'} | Régimen: {'ON' if REGIME_FILTER else 'OFF'}")
-        log.info(f"  BTC filtro:{BTC_BULL_BLOCK_PCT}% | Cooldown:15min")
+        log.info(f"  BTC filtro:{BTC_BULL_BLOCK_PCT}% | MAX trades:{MAX_TRADES} (cap 3)")
         log.info("=" * 70)
+        if _lev_env > 3:
+            log.warning(f"  ⚠️  LEVERAGE={_lev_env}x en .env → forzado a {LEVERAGE}x por hard cap")
+        if _trades_env > 3:
+            log.warning(f"  ⚠️  MAX_OPEN_TRADES={_trades_env} en .env → forzado a {MAX_TRADES} por hard cap")
 
         self.symbols         = []
         self.open_trades     = {}
@@ -592,10 +565,11 @@ class ShortBot:
         self._load_contracts()
         self._get_symbols()
         self._tg(
-            f"<b>🔴 Bot SHORTS v3.5 iniciado</b>\n"
-            f"FIX: mínimo {FORCE_MIN_USDT} USDT garantizado en todas las órdenes\n"
+            f"<b>🔴 Bot SHORTS v3.6 iniciado</b>\n"
+            f"<b>HARD CAPS: LEV≤3x | MAX≤3 trades | MIN≥8 USDT</b>\n"
             f"TP:{TP_PCT}% SL:{SL_PCT}% RR≥1.7 LEV:{LEVERAGE}x\n"
-            f"Score≥{MIN_SCORE} | Capital: ${POSITION_SIZE}"
+            f"Score≥{MIN_SCORE} | Capital: ${POSITION_SIZE}\n"
+            f"{'⚠️ LEVERAGE estaba en '+str(_lev_env)+'x → cap a 3x' if _lev_env > 3 else ''}"
         )
 
     # ---------------------------------------------------------------- setup
@@ -1198,6 +1172,19 @@ class ShortBot:
             log.warning(f"  [REAL] Error contando posiciones: {e}")
         return len(self.open_trades)
 
+    def _set_leverage(self, symbol):
+        """v3.6: fuerza leverage en BingX antes de abrir — hard cap a LEVERAGE (max 3x)."""
+        try:
+            for side in ['LONG', 'SHORT']:
+                bingx_request('POST', '/openApi/swap/v2/trade/leverage', {
+                    'symbol':   symbol,
+                    'side':     side,
+                    'leverage': str(LEVERAGE),  # ya capeado a 3 por hard cap
+                })
+            log.info(f"  Leverage {symbol} → {LEVERAGE}x (ambos lados)")
+        except Exception as e:
+            log.warning(f"  _set_leverage {symbol}: {e}")
+
     def _tiene_posicion(self, symbol):
         try:
             d = bingx_request('GET', '/openApi/swap/v2/user/positions', {'symbol':symbol}).json()
@@ -1211,6 +1198,9 @@ class ShortBot:
 
     # ---------------------------------------------------------------- lifecycle
 
+    # v3.6: lock para evitar aperturas simultáneas
+    _abriendo = False
+
     def open_trade(self, symbol, sig):
         if not AUTO_TRADING:
             log.info(f"  [SEÑAL] SHORT {symbol} score:{sig['score']:.0f} régimen:{sig['regime']}")
@@ -1219,13 +1209,30 @@ class ShortBot:
             return False
         if symbol in self.open_trades: return False
 
+        # v3.6: bloquear si ya se está abriendo otro trade
+        if ShortBot._abriendo:
+            log.info(f"  {symbol} — skip: ya abriendo otro trade"); return False
+
+        # v3.6: verificar posiciones SHORT reales en BingX
+        pos_reales = self._contar_posiciones_reales()
+        if pos_reales >= MAX_TRADES:
+            log.info(f"  Max trades en BingX: {pos_reales}/{MAX_TRADES} — skip"); return False
+
         tiene, dir_bx = self._tiene_posicion(symbol)
         if tiene: log.info(f"  {symbol} ya tiene {dir_bx} — skip"); return False
 
-        price    = sig['price']
-        usdt_qty = round(max(POSITION_SIZE, FORCE_MIN_USDT, MIN_TRADE), 2)  # v3.2: triple garantía
+        ShortBot._abriendo = True
+        try:
+            return self._open_trade_inner(symbol, sig)
+        finally:
+            ShortBot._abriendo = False
 
-        # v3.2: pre-validación antes de enviar orden — evita trades de 1-2 USDT
+    def _open_trade_inner(self, symbol, sig):
+        """Lógica real de apertura — llamada solo cuando el lock está activo."""
+        price    = sig['price']
+        usdt_qty = round(max(POSITION_SIZE, FORCE_MIN_USDT, MIN_TRADE), 2)
+
+        # pre-validación antes de enviar orden
         test_qty, test_val = self._qty_contratos(symbol, price, usdt_qty)
         if not test_qty or test_val < FORCE_MIN_USDT:
             log.warning(f"  {symbol} rechazado: valor USDT estimado ${test_val:.2f} < ${FORCE_MIN_USDT}")
@@ -1241,6 +1248,9 @@ class ShortBot:
         log.info(f"  MAE pos:{sig['mae_pos']}% | {patterns_str}")
         log.info(f"  {sig['reasons']}")
         log.info(f"  Entry:${price:.6f} | Capital:${usdt_qty} | TP:{sig['tp_pct']:.2f}% SL:{sig['sl_pct']:.2f}% RR:{sig.get('rr',0):.2f}:1")
+
+        # v3.6: forzar leverage en BingX antes de abrir
+        self._set_leverage(symbol)
 
         oid, qty_c = self._place_short_entry(symbol, usdt_qty, price)
         if not oid:
