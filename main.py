@@ -1,8 +1,30 @@
 #!/usr/bin/env python3
 """
-BOT SHORTS PROFESIONAL v3.5
+BOT SHORTS PROFESIONAL v3.6
 ════════════════════════════════════════════════════════════════
-FIXES v3.5 — 5 bugs críticos:
+FIXES v3.6 — 3 bugs que causaban apertura masiva de posiciones:
+
+  FIX-I  _contar_posiciones_reales() ROTO EN HEDGE MODE
+         Solo contaba positionAmt < 0, pero BingX Hedge mode
+         devuelve SHORTs con positionAmt positivo y positionSide=SHORT.
+         El conteo siempre devolvía 0 → slots_libres siempre > 0
+         → el bot abría sin límite aunque hubiera 12 posiciones.
+         Fix: cuenta positionAmt < 0 OR positionSide == SHORT.
+
+  FIX-J  SIN LOCK ENTRE APERTURAS (como longs bot)
+         El longs bot tenía _abriendo=True/False para evitar
+         que dos trades se abrieran a la vez durante _esperar_posicion.
+         El shorts no tenía nada. Si el timeout llegaba rápido,
+         el loop inmediatamente intentaba el siguiente símbolo.
+         Fix: añadir _abriendo class-level lock igual que longs.
+         + await asyncio.sleep(3) tras cada apertura exitosa.
+
+  FIX-K  _set_leverage SILENCIOSO EN FALLO
+         Si BingX rechazaba el set_leverage (ej: BTC en 10X),
+         el bot continuaba abriendo con el leverage del exchange.
+         Fix: si AMBOS lados fallan, abortar la apertura.
+
+  HERENCIA v3.5: recovery, reduceOnly, sync sin guard, hora_ok
 
   FIX-E  RECOVERY AL REINICIAR (causa de las 13 posiciones)
          Al reiniciar Railway, open_trades={} y _sync_bingx()
@@ -386,14 +408,17 @@ def detect_market_regime(closes, period=20):
 
 class ShortBot:
 
+    # FIX-J: lock para evitar aperturas simultáneas
+    _abriendo = False
+
     def __init__(self):
         fee_lbl = f"LÍMITE maker {COMISION_MAKER*100:.2f}%" if USE_LIMIT_ORDERS \
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
         rr = round(TP_PCT / SL_PCT, 2)
         breakeven_wr = round(1 / (1 + rr) * 100, 1)
         log.info("=" * 70)
-        log.info("  BOT SHORTS PROFESIONAL v3.5")
-        log.info("  FIXES: recovery+reduceOnly+conteo real+hora_ok")
+        log.info("  BOT SHORTS PROFESIONAL v3.6")
+        log.info("  FIX-I: conteo Hedge | FIX-J: lock | FIX-K: leverage abort")
         log.info("=" * 70)
         log.info(f"  Modo:        {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
         log.info(f"  Capital:     ${POSITION_SIZE} USDT (mín absoluto: ${FORCE_MIN_USDT})")
@@ -423,8 +448,8 @@ class ShortBot:
         # FIX-E: Recuperar posiciones abiertas ANTES de empezar el loop
         self._recover_open_positions()
         self._tg(
-            f"<b>🔴 Bot SHORTS v3.5 iniciado</b>\n"
-            f"FIXES: recovery+reduceOnly+conteo real | LEV:{LEVERAGE}x\n"
+            f"<b>🔴 Bot SHORTS v3.6 iniciado</b>\n"
+            f"FIX: Hedge mode count+lock+leverage abort | LEV:{LEVERAGE}x\n"
             f"Margen: ${POSITION_SIZE} x{LEVERAGE} = ~${POSITION_SIZE*LEVERAGE:.0f} notional | Recuperadas: {len(self.open_trades)}\n"
             f"Score≥{MIN_SCORE} | Vol≥{MIN_VOLUME/1e6:.0f}M | Cooldown:{COOLDOWN_MINS}min"
         )
@@ -569,16 +594,21 @@ class ShortBot:
 
     def _contar_posiciones_reales(self):
         """
-        FIX-G: Cuenta posiciones SHORT reales en BingX antes de abrir.
-        Evita abrir de más si open_trades está desfasado del exchange.
+        FIX-I CRITICO: Cuenta SHORTs reales en BingX con detección correcta Hedge mode.
+        BingX Hedge mode puede devolver SHORTs con positionAmt positivo y positionSide=SHORT.
+        La versión anterior solo contaba positionAmt < 0 → siempre devolvía 0 en Hedge mode
+        → slots_libres siempre era MAX_TRADES → bot abría sin límite.
         """
         try:
             d = bingx_request('GET', '/openApi/swap/v2/user/positions', {}).json()
             if d.get('code') == 0:
-                shorts = sum(
-                    1 for p in (d.get('data') or [])
-                    if float(p.get('positionAmt', 0) or 0) < 0
-                )
+                shorts = 0
+                for p in (d.get('data') or []):
+                    amt  = float(p.get('positionAmt', 0) or 0)
+                    side = str(p.get('positionSide', '')).upper()
+                    # Hedge mode: SHORT puede tener amt<0 O positionSide=='SHORT' con amt!=0
+                    if amt < 0 or (side == 'SHORT' and abs(amt) > 0):
+                        shorts += 1
                 log.info(f"  [REAL] Posiciones SHORT en BingX: {shorts}/{MAX_TRADES}")
                 return shorts
         except Exception as e:
@@ -637,11 +667,10 @@ class ShortBot:
 
     def _set_leverage(self, symbol):
         """
-        FIX-A CRITICO: Fija el leverage en BingX VIA API antes de cada trade.
-        Sin esto el exchange usa su default (18X, 25X segun el par).
-        Se aplica a ambos lados LONG y SHORT para cubrir todos los casos.
+        FIX-K: Fija leverage en BingX. Si el SHORT side falla con error real
+        (no "ya estaba seteado"), retorna False para abortar la apertura.
         """
-        ok_count = 0
+        short_ok = False
         for side in ('LONG', 'SHORT'):
             try:
                 d = bingx_request('POST', '/openApi/swap/v2/trade/leverage', {
@@ -649,17 +678,39 @@ class ShortBot:
                     'side': side,
                     'leverage': str(LEVERAGE),
                 }).json()
-                if d.get('code') == 0:
+                code = d.get('code', -1)
+                if code == 0:
                     lev_real = d.get('data', {}).get('leverage', LEVERAGE)
                     log.info(f"  Leverage {side} {symbol}: {lev_real}x OK")
-                    ok_count += 1
+                    if side == 'SHORT': short_ok = True
                 else:
-                    # code != 0 puede ser "ya esta al mismo valor" — no es error fatal
-                    log.warning(f"  set_leverage {side} [{d.get('code')}]: {d.get('msg')}")
-                    ok_count += 1  # Contar como OK (puede estar ya seteado)
+                    msg = str(d.get('msg', ''))
+                    # Códigos que significan "ya estaba seteado" → no es error
+                    already_set = any(x in msg.lower() for x in ['same', 'already', 'equal', 'igual'])
+                    if already_set:
+                        log.info(f"  Leverage {side} {symbol}: ya en {LEVERAGE}x")
+                        if side == 'SHORT': short_ok = True
+                    else:
+                        log.warning(f"  set_leverage {side} [{code}]: {msg}")
             except Exception as e:
                 log.warning(f"  set_leverage {side} excepcion: {e}")
-        return ok_count > 0
+        if not short_ok:
+            log.warning(f"  set_leverage SHORT {symbol} no confirmado — verificando leverage actual")
+            # Intentar leer el leverage actual para validar
+            try:
+                d2 = bingx_request('GET', '/openApi/swap/v2/trade/leverage',
+                                   {'symbol': symbol}).json()
+                if d2.get('code') == 0:
+                    for item in (d2.get('data') or []):
+                        if str(item.get('positionSide','')) == 'SHORT':
+                            actual = int(item.get('leverage', 0))
+                            if actual == LEVERAGE:
+                                log.info(f"  Leverage SHORT {symbol} confirmado: {actual}x")
+                                short_ok = True
+                            else:
+                                log.error(f"  Leverage SHORT {symbol} es {actual}x, no {LEVERAGE}x — ABORTANDO")
+            except: pass
+        return short_ok
 
     # ---------------------------------------------------------------- FIX-B: sizing por margen real
 
@@ -865,8 +916,10 @@ class ShortBot:
     # ---------------------------------------------------------------- órdenes
 
     def _place_short_entry(self, symbol, margin_usdt, price):
-        # FIX-A: Fijar leverage VIA API antes de enviar la orden
-        self._set_leverage(symbol)
+        # FIX-K: Fijar leverage VIA API — abortar si falla
+        if not self._set_leverage(symbol):
+            log.error(f"  _place_short_entry: leverage no confirmado para {symbol} — ABORTANDO")
+            return None, None
 
         # FIX-B: margin_usdt es el margen. El notional = margen * leverage
         margin_usdt  = max(margin_usdt, FORCE_MIN_USDT)
@@ -1044,7 +1097,11 @@ class ShortBot:
             return False
         if symbol in self.open_trades: return False
 
-        # FIX-G: verificar límite con conteo real antes de abrir
+        # FIX-J: lock para evitar dos aperturas simultáneas
+        if ShortBot._abriendo:
+            log.info(f"  {symbol} — skip: ya abriendo otro trade"); return False
+
+        # FIX-I: conteo real con detección Hedge mode correcta
         pos_reales = self._contar_posiciones_reales()
         if pos_reales >= MAX_TRADES:
             log.info(f"  Max trades BingX: {pos_reales}/{MAX_TRADES} — skip"); return False
@@ -1056,8 +1113,14 @@ class ShortBot:
         tiene, dir_bx = self._tiene_posicion(symbol)
         if tiene: log.info(f"  {symbol} ya tiene {dir_bx} — skip"); return False
 
+        ShortBot._abriendo = True
+        try:
+            return self._open_trade_inner(symbol, sig)
+        finally:
+            ShortBot._abriendo = False
+
+    def _open_trade_inner(self, symbol, sig):
         price    = sig['price']
-        # FIX-B: usdt_qty es MARGEN (capital real). Notional = usdt_qty * LEVERAGE en _place_short_entry
         usdt_qty = round(max(POSITION_SIZE, FORCE_MIN_USDT, MIN_TRADE), 2)
 
         tp_price = price * (1 - sig['tp_pct'] / 100)
@@ -1072,9 +1135,10 @@ class ShortBot:
         log.info(f"  {sig['reasons']}")
         log.info(f"  Entry:${price:.6f} | MARGEN:${usdt_qty} USDT x{LEVERAGE} = notional ~${usdt_qty*LEVERAGE:.2f} | TP:{sig['tp_pct']:.2f}% SL:{sig['sl_pct']:.1f}% RR:{rr_real}:1")
 
+        # _place_short_entry llama a _set_leverage internamente (FIX-K: aborta si falla)
         oid, qty_c = self._place_short_entry(symbol, usdt_qty, price)
         if not oid:
-            log.error(f"  No se pudo abrir {symbol}"); return False
+            log.error(f"  No se pudo abrir {symbol} (posible fallo de leverage)"); return False
 
         qty_real, entry_real = self._esperar_posicion(symbol, timeout=60)
         if qty_real is None:
@@ -1137,7 +1201,7 @@ class ShortBot:
         rr = round(sig['tp_pct'] / sig['sl_pct'], 1)
         pat_str = f"\nPatrones: {', '.join(sig['patterns'])}" if sig['patterns'] else ""
         self._tg(
-            f"<b>🔴 SHORT ABIERTO v3.5</b>\n<b>{symbol}</b> | Score:{sig['score']:.0f}/{sig['score_min']:.0f}\n"
+            f"<b>🔴 SHORT ABIERTO v3.6</b>\n<b>{symbol}</b> | Score:{sig['score']:.0f}/{sig['score_min']:.0f}\n"
             f"Entrada: ${entry_final:.6f}\n"
             f"{'✅' if tp_ok else '❌'} TP: ${tp_price:.6f} (-{sig['tp_pct']:.2f}%)\n"
             f"{'✅' if sl_ok else '❌'} SL: ${sl_price:.6f} (+{sig['sl_pct']:.1f}%)\n"
@@ -1252,7 +1316,7 @@ class ShortBot:
         rr = round(TP_PCT / SL_PCT, 2)
         btc_st = "⛔ BLOQUEADO" if self._btc_blocked else "✅ OK"
         self._tg(
-            f"<b>📊 Reporte horario v3.5</b>\n"
+            f"<b>📊 Reporte horario v3.6</b>\n"
             f"PnL: ${self.stats['pnl']:+.3f} | WR:{wr:.1f}%\n"
             f"({self.stats['wins']}W/{self.stats['losses']}L | {self.stats['closed']} trades)\n"
             f"Abiertos: {len(self.open_trades)}/{MAX_TRADES}\n"
@@ -1271,7 +1335,7 @@ class ShortBot:
     # ---------------------------------------------------------------- loop
 
     async def run(self):
-        log.info("\n▶  Bot SHORT v3.5 arrancado\n")
+        log.info("\n▶  Bot SHORT v3.6 arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
@@ -1318,7 +1382,10 @@ class ShortBot:
                                 pat_str = f" [{','.join(sig['patterns'])}]" if sig['patterns'] else ""
                                 log.info(f"  * {sym} score:{sig['score']:.0f} RSI:{sig['rsi']:.0f} "
                                          f"regimen:{sig['regime']}{pat_str}")
-                                self.open_trade(sym, sig)
+                                abierto = self.open_trade(sym, sig)
+                            if abierto:
+                                # FIX-J: pausa para que BingX registre la posición
+                                await asyncio.sleep(3)
                             await asyncio.sleep(0.12)
                             if (i+1) % 20 == 0:
                                 log.info(f"  ...{i+1}/{len(self.symbols)} analizados")
