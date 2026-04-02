@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 WYCKOFF SMC BOT v1.0 — wyckoff_bot.py para Railway/GitHub
@@ -927,6 +926,7 @@ class WyckoffBot:
         self._daily_pnl  = 0.0
         self._daily_reset= datetime.utcnow().date()
         self._circuit    = False
+        self._circuit_until = None
         self.stats = {'exec':0,'closed':0,'wins':0,'losses':0,'pnl':0.0}
 
         self._verify()
@@ -1106,14 +1106,39 @@ class WyckoffBot:
 
     def _check_circuit(self):
         today = datetime.utcnow().date()
+        # Reset diario automático
         if today != self._daily_reset:
-            self._daily_pnl = 0.0; self._daily_reset = today; self._circuit = False
-        if self._circuit: return True
+            self._daily_pnl  = 0.0
+            self._daily_reset= today
+            self._circuit    = False
+            self._circuit_until = None
+            log.info("  [CIRCUIT] Reset diario — bot reanudado")
+
+        # Auto-desactivar tras 2h
+        if self._circuit:
+            if self._circuit_until and datetime.utcnow() > self._circuit_until:
+                self._circuit = False
+                self._circuit_until = None
+                log.info("  [CIRCUIT] 2h cumplidas — bot Wyckoff reanudado")
+                self._tg("<b>🟢 Circuit Breaker desactivado [Wyckoff]</b> — reanudando")
+            else:
+                remaining = ""
+                if self._circuit_until:
+                    mins = int((self._circuit_until - datetime.utcnow()).total_seconds() / 60)
+                    remaining = f" ({mins}min restantes)"
+                log.warning(f"  [CIRCUIT] Bot Wyckoff pausado{remaining}")
+                return True
+
         loss_pct = abs(min(self._daily_pnl, 0)) / max(POSITION_SIZE, 1) * 100
         if loss_pct >= CIRCUIT_PCT:
-            self._circuit = True
-            log.warning(f"  [CIRCUIT] 🔴 Pérdida diaria {loss_pct:.1f}% — pausado 2h")
-            self._tg(f"<b>🔴 Circuit Breaker — Wyckoff Bot</b>\nPérdida: ${self._daily_pnl:.3f} ({loss_pct:.1f}%)\nPausado 2h")
+            self._circuit       = True
+            self._circuit_until = datetime.utcnow() + timedelta(hours=2)
+            log.warning(f"  [CIRCUIT] 🔴 Pérdida {loss_pct:.1f}% — pausado 2h")
+            self._tg(
+                f"<b>🔴 Circuit Breaker [Wyckoff]</b>\n"
+                f"Pérdida: ${self._daily_pnl:.3f} ({loss_pct:.1f}%)\n"
+                f"Reanuda: {self._circuit_until.strftime('%H:%M')} UTC"
+            )
         return self._circuit
 
     # ---------------------------------------------------------------- órdenes
