@@ -1,66 +1,17 @@
 #!/usr/bin/env python3
 """
-WYCKOFF SMC BOT v1.0 — wyckoff_bot.py para Railway/GitHub
+WYCKOFF SMC BOT v1.1 — wyckoff_bot.py para Railway/GitHub
 ════════════════════════════════════════════════════════════════
-Bot independiente que opera en PARALELO al bot de longs (main.py).
-Usa puerto Railway diferente o simplemente otro servicio/worker.
+FIXES v1.1:
+  ✅ Circuit Breaker loop infinito CORREGIDO (reset _daily_pnl al expirar)
+  ✅ MIN_SCORE bajado a 60 (era 75, demasiado restrictivo)
+  ✅ CIRCUIT_PCT subido a 12% (era 6%, muy agresivo)
+  ✅ _count_real() usa caché para no llamar API en cada símbolo
+  ✅ MAX_LOSS_PCT subido a 8% (evita cierres prematuros)
+════════════════════════════════════════════════════════════════
 
 ESTRATEGIA: Wyckoff Smart Money Concepts + Scalping 15min
 ══════════════════════════════════════════════════════════════
-
-MÓDULO 1 — WYCKOFF (contexto macro)
-  Detecta las 4 fases de Wyckoff en velas de 1h/4h:
-  ▸ ACCUMULATION (fase A-E): instituciones comprando en silencio
-    → Señales LONG de alta probabilidad
-  ▸ MARKUP: precio en impulso alcista tras acumulación
-    → LONG momentum
-  ▸ DISTRIBUTION (fase A-E): instituciones vendiendo
-    → Señales SHORT de alta probabilidad  
-  ▸ MARKDOWN: precio cayendo tras distribución
-    → SHORT momentum
-
-  Eventos Wyckoff detectados:
-  • Selling Climax (SC) / Buying Climax (BC)
-  • Automatic Rally (AR) / Automatic Reaction (AR)
-  • Secondary Test (ST)
-  • Spring (trampa bajista) / Upthrust (trampa alcista)
-  • Sign of Strength (SOS) / Sign of Weakness (SOW)
-  • Last Point of Support (LPS) / Last Point of Supply (LPSY)
-
-MÓDULO 2 — SMART MONEY CONCEPTS (SMC)
-  ▸ Order Blocks (OB): última vela antes de un impulso institucional
-  ▸ Fair Value Gaps (FVG): gaps de liquidez que el precio vuelve a llenar
-  ▸ Break of Structure (BOS): confirmación de cambio de tendencia
-  ▸ Change of Character (CHoCH): primera señal de inversión
-  ▸ Liquidity Zones: donde los stops de los minoristas están acumulados
-  ▸ Imbalance / Premium-Discount: precio en zona de valor
-
-MÓDULO 3 — SCALPING 15min (entrada de precisión)
-  Inspirado en Zero Lag Trend Signals + Trend Reversal Probability:
-  ▸ Zero Lag EMA (ZLEMA): elimina el retraso de las EMAs clásicas
-  ▸ Trend Reversal Probability (TRP): mide agotamiento del movimiento
-  ▸ Doble confirmación: ZLEMA da dirección + TRP da timing de entrada
-  ▸ Nivel 84-98% TRP: zona de alta probabilidad de reversión/continuación
-
-LÓGICA DE DECISIÓN:
-  Wyckoff Phase → SMC Context → Scalping Entry
-  Ejemplo LONG:
-    1. Wyckoff detecta ACCUMULATION (fase D/E)
-    2. SMC confirma Order Block alcista + FVG relleno
-    3. Scalping 15m: ZLEMA alcista + TRP < 20% (no agotado)
-    → LONG con alta convicción
-
-  Ejemplo SHORT:
-    1. Wyckoff detecta DISTRIBUTION (fase B/C)
-    2. SMC confirma Upthrust + SOW
-    3. Scalping 15m: ZLEMA bajista + TRP > 84% (agotamiento alcista)
-    → SHORT con alta convicción
-
-HARD CAPS:
-  ▸ LEVERAGE máximo: 3x
-  ▸ MAX_TRADES máximo: 3 (combinado LONG+SHORT)
-  ▸ FORCE_MIN_USDT mínimo: 8 USDT
-════════════════════════════════════════════════════════════════
 """
 
 import os, asyncio, logging, requests, hmac, hashlib, time, sys, math, re
@@ -95,15 +46,18 @@ SL_PCT        = clean('WYK_STOP_LOSS_PCT',       '1.5',  'float')
 INTERVAL      = clean('WYK_CHECK_INTERVAL',      '60',   'int')
 MIN_VOLUME    = clean('WYK_MIN_VOLUME_24H',  '800000',   'float')
 MAX_SYMBOLS   = clean('WYK_MAX_SYMBOLS',         '40',   'int')
-MIN_SCORE     = clean('WYK_MIN_SCORE',           '75',   'float')
+# FIX: MIN_SCORE bajado de 75 → 60 para que encuentre más señales
+MIN_SCORE     = clean('WYK_MIN_SCORE',           '60',   'float')
 USE_LIMIT     = clean('WYK_USE_LIMIT_ORDERS',  'true',   'bool')
 TRAILING      = clean('WYK_TRAILING_ENABLED',  'true',   'bool')
 TRAILING_START= clean('WYK_TRAILING_START',     '0.8',   'float')
 TRAILING_LOCK = clean('WYK_TRAILING_LOCK',       '55',   'float')
 COOLDOWN_TP   = clean('WYK_COOLDOWN_TP_MIN',     '10',   'int')
 COOLDOWN_SL   = clean('WYK_COOLDOWN_SL_MIN',     '25',   'int')
-MAX_LOSS_PCT  = clean('WYK_MAX_LOSS_PCT',        '4.5',  'float')
-CIRCUIT_PCT   = clean('WYK_CIRCUIT_BREAKER_PCT', '6.0',  'float')
+# FIX: MAX_LOSS_PCT subido de 4.5 → 8 para evitar cierres prematuros
+MAX_LOSS_PCT  = clean('WYK_MAX_LOSS_PCT',        '8.0',  'float')
+# FIX: CIRCUIT_PCT subido de 6.0 → 12.0 — era demasiado sensible
+CIRCUIT_PCT   = clean('WYK_CIRCUIT_BREAKER_PCT', '12.0', 'float')
 ALLOW_SHORT   = clean('WYK_ALLOW_SHORT',        'true',  'bool')
 
 _lev_env    = clean('WYK_LEVERAGE',        '3', 'int')
@@ -207,15 +161,9 @@ def vol_spike(volumes):
 
 # ============================================================================
 # MÓDULO 1 — ZERO LAG EMA (ZLEMA)
-# Elimina el retraso típico de las EMAs clásicas.
-# Fórmula: ZLEMA = EMA(2*price - price[lag]) donde lag = (period-1)/2
 # ============================================================================
 
 def zlema(prices, period=21):
-    """
-    Zero Lag EMA: versión sin retraso de la EMA clásica.
-    Inspirado en el indicador 'Zero Lag Trend Signals' de TradingView.
-    """
     if len(prices) < period: return ema(prices, period)
     lag = (period - 1) // 2
     adjusted = []
@@ -227,10 +175,6 @@ def zlema(prices, period=21):
     return ema(adjusted, period)
 
 def zlema_signal(closes, fast=8, slow=21, signal=9):
-    """
-    Sistema completo ZLEMA: fast > slow = alcista, fast < slow = bajista.
-    Retorna (dirección, fuerza, descripción)
-    """
     if len(closes) < slow + 5:
         return 'NEUTRAL', 0, "ZLEMA_insuf"
 
@@ -242,7 +186,6 @@ def zlema_signal(closes, fast=8, slow=21, signal=9):
     gap     = (zl_fast - zl_slow) / zl_slow * 100 if zl_slow > 0 else 0
     gap_prev= (zl_fast_prev - zl_slow_prev) / zl_slow_prev * 100 if zl_slow_prev > 0 else 0
 
-    # Cruce reciente (última vela)
     crossed_up   = gap > 0 and gap_prev <= 0
     crossed_down = gap < 0 and gap_prev >= 0
 
@@ -261,41 +204,28 @@ def zlema_signal(closes, fast=8, slow=21, signal=9):
 
 # ============================================================================
 # MÓDULO 2 — TREND REVERSAL PROBABILITY (TRP)
-# Inspirado en 'Trend Reversal Probability' de TradingView.
-# Mide el agotamiento del movimiento actual (0-100%).
-# >84% = alta probabilidad de reversión (zona de peligro para el trend actual)
-# <20% = tendencia sana, no agotada
 # ============================================================================
 
 def trend_reversal_probability(closes, highs, lows, period=50):
-    """
-    TRP: mide cuánto se ha 'gastado' el movimiento actual.
-    Combina: distancia del precio a su media + divergencia de momentum.
-    Retorna valor 0-100 (100 = máximo agotamiento).
-    """
     if len(closes) < period:
         return 50.0
 
     ma = sma(closes, period)
     price = closes[-1]
 
-    # Componente 1: distancia del precio a la media (normalizada)
     recent_range = max(highs[-period:]) - min(lows[-period:])
     if recent_range <= 0: return 50.0
     dist_from_ma = abs(price - ma) / recent_range * 100
 
-    # Componente 2: momentum reciente vs histórico
     mom_short = (closes[-1] - closes[-5])  / closes[-5]  * 100 if len(closes) >= 5  else 0
     mom_long  = (closes[-1] - closes[-period]) / closes[-period] * 100 if len(closes) >= period else 0
 
-    # Si el precio está muy lejos de la media Y el momentum se frena → agotamiento
     momentum_ratio = abs(mom_short) / (abs(mom_long) + 0.001)
     if abs(mom_long) > 0 and abs(mom_short) < abs(mom_long) * 0.3:
-        momentum_fading = 30  # momentum frenándose
+        momentum_fading = 30
     else:
         momentum_fading = 0
 
-    # Componente 3: RSI como proxy de sobrecompra/sobreventa
     rsi_val = rsi(closes, 14)
     if rsi_val > 75:   rsi_exhaustion = 25
     elif rsi_val > 65: rsi_exhaustion = 10
@@ -307,18 +237,13 @@ def trend_reversal_probability(closes, highs, lows, period=50):
     return round(trp, 1)
 
 def trp_signal(trp_value, direction):
-    """
-    Interpreta el TRP según la dirección de la señal.
-    Para LONG: TRP bajo = bueno (trend sano), TRP alto = peligro
-    Para SHORT: TRP alto en tendencia alcista = buena entrada SHORT
-    """
     if direction == 'LONG':
         if trp_value < 20:   return 20, f"TRP_SANO({trp_value:.0f}%)"
         elif trp_value < 40: return 12, f"TRP_OK({trp_value:.0f}%)"
         elif trp_value < 60: return 0,  f"TRP_NEUTRO({trp_value:.0f}%)"
         elif trp_value < 84: return -10, f"TRP_CANSADO({trp_value:.0f}%)"
         else:                return -20, f"TRP_AGOTADO({trp_value:.0f}%) ⚠️"
-    else:  # SHORT: queremos precio agotado hacia arriba
+    else:
         if trp_value > 84:   return 20, f"TRP_REVER({trp_value:.0f}%) ✅"
         elif trp_value > 65: return 12, f"TRP_ALTO({trp_value:.0f}%)"
         elif trp_value > 50: return 5,  f"TRP_MED({trp_value:.0f}%)"
@@ -326,37 +251,24 @@ def trp_signal(trp_value, direction):
 
 # ============================================================================
 # MÓDULO 3 — WYCKOFF PHASE DETECTION
-# Detecta en qué fase del ciclo de Wyckoff está el precio.
-# Usa velas de 1h (contexto) y 4h (fase macro).
 # ============================================================================
 
 class WyckoffAnalyzer:
 
     def detect_climax(self, closes, highs, lows, volumes, direction='sell'):
-        """
-        Selling Climax (SC) o Buying Climax (BC).
-        Vela de rango amplio con volumen extremo que marca el final de un impulso.
-        """
         if len(closes) < 10: return False, 0, ""
-
-        # Rango de la vela actual
         candle_range = highs[-1] - lows[-1]
         avg_range    = sum(highs[i] - lows[i] for i in range(-10, -1)) / 9
-
-        # Volumen extremo
         vol_now = volumes[-1]
         avg_vol = sum(volumes[-10:-1]) / 9
         vol_ratio = vol_now / avg_vol if avg_vol > 0 else 1.0
 
-        # SC: vela bearish grande con volumen extremo después de bajada
         if direction == 'sell':
             is_bearish = closes[-1] < closes[-2]
             trend_down = closes[-5] > closes[-1]
             if is_bearish and candle_range > avg_range * 1.5 and vol_ratio > 2.0 and trend_down:
                 score = min(35, int(vol_ratio * 8 + candle_range / avg_range * 5))
                 return True, score, f"SC_Climax({score}) vol:{vol_ratio:.1f}x"
-
-        # BC: vela bullish grande con volumen extremo después de subida
         else:
             is_bullish = closes[-1] > closes[-2]
             trend_up   = closes[-5] < closes[-1]
@@ -367,20 +279,13 @@ class WyckoffAnalyzer:
         return False, 0, ""
 
     def detect_spring(self, closes, lows, volumes):
-        """
-        Spring: ruptura FALSA por debajo del soporte con rápida recuperación.
-        Señal LONG de muy alta probabilidad en fase D de Wyckoff.
-        """
         if len(closes) < 20: return False, 0, ""
-
         support = min(lows[-20:-3])
         recent_low = min(lows[-3:])
         current    = closes[-1]
-
-        # Precio rompió el soporte pero cerró por encima
         broke_support  = recent_low < support * 0.998
         recovered      = current > support * 1.001
-        vol_on_spring  = volumes[-2] > sum(volumes[-6:-2]) / 4 * 1.3  # vol medio en la caída
+        vol_on_spring  = volumes[-2] > sum(volumes[-6:-2]) / 4 * 1.3
 
         if broke_support and recovered:
             strength = 40 if vol_on_spring else 28
@@ -388,16 +293,10 @@ class WyckoffAnalyzer:
         return False, 0, ""
 
     def detect_upthrust(self, closes, highs, volumes):
-        """
-        Upthrust: ruptura FALSA por encima de la resistencia con caída inmediata.
-        Señal SHORT de muy alta probabilidad en fase B/C de distribución.
-        """
         if len(closes) < 20: return False, 0, ""
-
         resistance = max(highs[-20:-3])
         recent_high = max(highs[-3:])
         current     = closes[-1]
-
         broke_resistance = recent_high > resistance * 1.002
         rejected         = current < resistance * 0.999
         vol_on_ut        = volumes[-2] > sum(volumes[-6:-2]) / 4 * 1.3
@@ -408,16 +307,9 @@ class WyckoffAnalyzer:
         return False, 0, ""
 
     def detect_sos(self, closes, highs, volumes):
-        """
-        Sign of Strength (SOS): impulso alcista con volumen que rompe resistencia.
-        Confirma que la acumulación ha terminado → LONG.
-        """
         if len(closes) < 15: return False, 0, ""
-
         resistance = max(highs[-15:-3])
         current    = closes[-1]
-        prev_high  = highs[-2]
-
         broke = current > resistance * 1.005
         vol   = volumes[-1] > sum(volumes[-5:-1]) / 4 * 1.5
 
@@ -428,15 +320,9 @@ class WyckoffAnalyzer:
         return False, 0, ""
 
     def detect_sow(self, closes, lows, volumes):
-        """
-        Sign of Weakness (SOW): impulso bajista con volumen que rompe soporte.
-        Confirma que la distribución ha terminado → SHORT.
-        """
         if len(closes) < 15: return False, 0, ""
-
         support = min(lows[-15:-3])
         current = closes[-1]
-
         broke = current < support * 0.995
         vol   = volumes[-1] > sum(volumes[-5:-1]) / 4 * 1.5
 
@@ -447,72 +333,44 @@ class WyckoffAnalyzer:
         return False, 0, ""
 
     def detect_lps(self, closes, lows, volumes):
-        """
-        Last Point of Support (LPS): retroceso menor sobre soporte tras SOS.
-        Mejor entrada LONG del ciclo Wyckoff.
-        """
         if len(closes) < 20: return False, 0, ""
-
         support  = min(lows[-20:-5])
         recent_low = min(lows[-5:])
         current    = closes[-1]
-
-        # Retroceso pero no rompe soporte + volumen decreciente (sin presión bajista)
         above_support = recent_low > support * 0.997
         recovering    = current > recent_low * 1.003
         low_vol       = volumes[-1] < sum(volumes[-6:-1]) / 5 * 0.8
 
         if above_support and recovering and low_vol:
-            score = 32
-            return True, score, f"LPS({score}) sop:${support:.6f}"
+            return True, 32, f"LPS(32) sop:${support:.6f}"
         return False, 0, ""
 
     def detect_lpsy(self, closes, highs, volumes):
-        """
-        Last Point of Supply (LPSY): rebote menor bajo resistencia tras SOW.
-        Mejor entrada SHORT del ciclo Wyckoff.
-        """
         if len(closes) < 20: return False, 0, ""
-
         resistance  = max(highs[-20:-5])
         recent_high = max(highs[-5:])
         current     = closes[-1]
-
         below_resist = recent_high < resistance * 1.003
         rejecting    = current < recent_high * 0.997
         low_vol      = volumes[-1] < sum(volumes[-6:-1]) / 5 * 0.8
 
         if below_resist and rejecting and low_vol:
-            score = 32
-            return True, score, f"LPSY({score}) res:${resistance:.6f}"
+            return True, 32, f"LPSY(32) res:${resistance:.6f}"
         return False, 0, ""
 
     def detect_accumulation_phase(self, closes, highs, lows, volumes):
-        """
-        Detecta si el precio está en ACUMULACIÓN (rango lateral con volumen).
-        Retorna (fase, score, descripción).
-        Fases: A (inicio), B (construcción), C (test), D (SOS), E (markup)
-        """
         if len(closes) < 30: return 'UNKNOWN', 0, ""
-
-        # Rango de precios últimas 30 velas
         range_high = max(highs[-30:])
         range_low  = min(lows[-30:])
         range_pct  = (range_high - range_low) / range_low * 100
 
-        # En acumulación: precio lateral (rango 3-15%)
         if not (2.0 <= range_pct <= 18.0): return 'OTHER', 0, ""
 
         current = closes[-1]
-        mid     = (range_high + range_low) / 2
         pos_in_range = (current - range_low) / (range_high - range_low)
-
-        # Volumen decreciente en el rango = acumulación silenciosa
         vol_early = sum(volumes[-30:-15]) / 15
         vol_late  = sum(volumes[-15:])    / 15
         vol_decreasing = vol_late < vol_early * 0.85
-
-        # Precio en parte inferior del rango = zona de acumulación
         price_low = pos_in_range < 0.35
 
         if vol_decreasing and price_low:
@@ -526,12 +384,7 @@ class WyckoffAnalyzer:
         return 'RANGING', 5, f"WYK_RANGING(5)"
 
     def detect_distribution_phase(self, closes, highs, lows, volumes):
-        """
-        Detecta si el precio está en DISTRIBUCIÓN.
-        Similar a acumulación pero invertido: precio lateral en zona alta.
-        """
         if len(closes) < 30: return 'UNKNOWN', 0, ""
-
         range_high = max(highs[-30:])
         range_low  = min(lows[-30:])
         range_pct  = (range_high - range_low) / range_low * 100
@@ -540,11 +393,9 @@ class WyckoffAnalyzer:
 
         current = closes[-1]
         pos_in_range = (current - range_low) / (range_high - range_low)
-
         vol_early = sum(volumes[-30:-15]) / 15
         vol_late  = sum(volumes[-15:])    / 15
         vol_decreasing = vol_late < vol_early * 0.85
-
         price_high = pos_in_range > 0.65
 
         if vol_decreasing and price_high:
@@ -564,38 +415,27 @@ class WyckoffAnalyzer:
 class SMCAnalyzer:
 
     def detect_order_block(self, closes, opens, highs, lows, volumes, direction='bull'):
-        """
-        Order Block (OB): última vela OPUESTA antes de un impulso institucional.
-        Bull OB: última vela roja antes de un impulso alcista fuerte
-        Bear OB: última vela verde antes de un impulso bajista fuerte
-        """
         if len(closes) < 10: return False, 0, 0, 0, ""
-
-        # Buscar el impulso más reciente
-        impulse_threshold = 1.5  # % mínimo de impulso
+        impulse_threshold = 1.5
 
         if direction == 'bull':
-            # Buscar la última vela roja antes del impulso alcista
             for i in range(-2, -8, -1):
                 if abs(i) >= len(closes): break
-                if opens[i] > closes[i]:  # vela roja
-                    # Verificar que después hay un impulso alcista
+                if opens[i] > closes[i]:
                     if len(closes) > abs(i):
                         impulse = (closes[-1] - closes[i]) / closes[i] * 100
                         if impulse > impulse_threshold:
                             ob_low  = lows[i]
                             ob_high = highs[i]
                             price   = closes[-1]
-                            # Precio retrocediendo al OB = entrada
                             if ob_low <= price <= ob_high * 1.005:
                                 vol_ratio = volumes[i] / (sum(volumes[i-3:i]) / 3) if i > -len(volumes)+3 else 1
                                 score = min(35, 20 + int(vol_ratio * 5))
                                 return True, score, ob_low, ob_high, f"BullOB({score}) ${ob_low:.6f}-${ob_high:.6f}"
         else:
-            # Buscar la última vela verde antes del impulso bajista
             for i in range(-2, -8, -1):
                 if abs(i) >= len(closes): break
-                if closes[i] > opens[i]:  # vela verde
+                if closes[i] > opens[i]:
                     if len(closes) > abs(i):
                         impulse = (closes[i] - closes[-1]) / closes[i] * 100
                         if impulse > impulse_threshold:
@@ -610,11 +450,6 @@ class SMCAnalyzer:
         return False, 0, 0, 0, ""
 
     def detect_fvg(self, closes, highs, lows):
-        """
-        Fair Value Gap (FVG): gap de liquidez entre 3 velas.
-        Bullish FVG: high[i-2] < low[i] → zona de valor que el precio tiende a llenar
-        Bearish FVG: low[i-2] > high[i] → zona de valor bajista
-        """
         if len(closes) < 5: return False, 0, 0, 0, ""
 
         for i in range(-1, -6, -1):
@@ -622,7 +457,6 @@ class SMCAnalyzer:
             if idx < 2: break
             price = closes[-1]
 
-            # Bullish FVG
             if highs[idx-2] < lows[idx]:
                 fvg_low  = highs[idx-2]
                 fvg_high = lows[idx]
@@ -631,7 +465,6 @@ class SMCAnalyzer:
                     score = min(30, int(fvg_size * 15 + 15))
                     return True, score, fvg_low, fvg_high, f"BullFVG({score}) {fvg_size:.2f}%"
 
-            # Bearish FVG
             if lows[idx-2] > highs[idx]:
                 fvg_low  = highs[idx]
                 fvg_high = lows[idx-2]
@@ -643,64 +476,44 @@ class SMCAnalyzer:
         return False, 0, 0, 0, ""
 
     def detect_bos_choch(self, closes, highs, lows):
-        """
-        Break of Structure (BOS): confirmación de cambio de tendencia.
-        Change of Character (CHoCH): primera señal de inversión.
-        """
         if len(closes) < 20: return 'NONE', 0, ""
-
-        # Últimos 3 máximos y mínimos relevantes
-        recent_highs = sorted([(i, highs[i]) for i in range(-20, 0)], key=lambda x: x[1], reverse=True)[:3]
-        recent_lows  = sorted([(i, lows[i])  for i in range(-20, 0)], key=lambda x: x[1])[:3]
 
         price = closes[-1]
         last_high = max(highs[-20:-2])
         last_low  = min(lows[-20:-2])
 
-        # BOS alcista: rompe el último máximo significativo con cierre
         if price > last_high * 1.003:
             pct = (price - last_high) / last_high * 100
             score = min(30, int(pct * 15 + 15))
             return 'BOS_BULL', score, f"BOS_BULL({score}) +{pct:.2f}%"
 
-        # BOS bajista: rompe el último mínimo significativo con cierre
         if price < last_low * 0.997:
             pct = (last_low - price) / last_low * 100
             score = min(30, int(pct * 15 + 15))
             return 'BOS_BEAR', score, f"BOS_BEAR({score}) -{pct:.2f}%"
 
-        # CHoCH alcista: primer máximo más alto que el anterior (sin romper estructura)
         if len(highs) >= 10 and highs[-1] > highs[-5] and closes[-1] > closes[-5]:
             return 'CHOCH_BULL', 12, "CHoCH_BULL(12)"
 
-        # CHoCH bajista
         if len(lows) >= 10 and lows[-1] < lows[-5] and closes[-1] < closes[-5]:
             return 'CHOCH_BEAR', 12, "CHoCH_BEAR(12)"
 
         return 'NONE', 0, ""
 
     def detect_liquidity_sweep(self, closes, highs, lows, volumes):
-        """
-        Liquidity Sweep: el precio barre los stops de los minoristas y vuelve.
-        Igual que Spring/Upthrust pero desde la perspectiva SMC.
-        """
         if len(closes) < 15: return 'NONE', 0, ""
 
-        # Equal highs/lows = acumulación de stops
         recent_highs = highs[-15:-2]
         recent_lows  = lows[-15:-2]
-
         max_high = max(recent_highs)
         min_low  = min(recent_lows)
         price    = closes[-1]
 
-        # Barrió stops bajistas (por debajo del mínimo) y recuperó
         if min(lows[-3:]) < min_low * 0.998 and price > min_low * 1.001:
             vol_ok = volumes[-1] > sum(volumes[-5:-1]) / 4
             score  = 35 if vol_ok else 22
             return 'SWEEP_LOW', score, f"LiqSweepLow({score})"
 
-        # Barrió stops alcistas (por encima del máximo) y cayó
         if max(highs[-3:]) > max_high * 1.002 and price < max_high * 0.999:
             vol_ok = volumes[-1] > sum(volumes[-5:-1]) / 4
             score  = 35 if vol_ok else 22
@@ -709,10 +522,6 @@ class SMCAnalyzer:
         return 'NONE', 0, ""
 
     def premium_discount(self, closes, highs, lows, period=50):
-        """
-        Premium / Discount: posición del precio en el rango macro.
-        Smart Money compra en Discount (< 50%) y vende en Premium (> 50%).
-        """
         if len(closes) < period: period = len(closes)
         range_high = max(highs[-period:])
         range_low  = min(lows[-period:])
@@ -720,22 +529,16 @@ class SMCAnalyzer:
 
         if range_high == range_low: return 50.0
         pos = (price - range_low) / (range_high - range_low) * 100
-
         return round(pos, 1)
 
 # ============================================================================
-# ANÁLISIS COMPLETO: Wyckoff + SMC + Scalping
+# ANÁLISIS COMPLETO
 # ============================================================================
 
 wyckoff = WyckoffAnalyzer()
 smc     = SMCAnalyzer()
 
 def full_analysis(symbol, direction='LONG'):
-    """
-    Análisis completo para una dirección (LONG o SHORT).
-    Retorna score total y descripción de señales.
-    """
-    # === Datos multi-timeframe ===
     d15 = klines(symbol, '15m', 100)
     d1h = klines(symbol, '1h',  60)
     d4h = klines(symbol, '4h',  40)
@@ -757,12 +560,11 @@ def full_analysis(symbol, direction='LONG'):
 
     score, reasons = 0, []
 
-    # ── MÓDULO SCALPING: ZLEMA + TRP ──────────────────────────────────────
+    # ── SCALPING: ZLEMA + TRP ─────────────────────────────────────────────
     zlema_dir, zlema_score, zlema_desc = zlema_signal(c15, fast=8, slow=21)
     trp_val = trend_reversal_probability(c15, h15, l15, period=50)
     trp_score, trp_desc = trp_signal(trp_val, direction)
 
-    # ZLEMA debe confirmar dirección
     if direction == 'LONG':
         if zlema_dir == 'BULL':
             score += zlema_score; reasons.append(zlema_desc)
@@ -776,74 +578,59 @@ def full_analysis(symbol, direction='LONG'):
 
     score += trp_score; reasons.append(trp_desc)
 
-    # ── MÓDULO WYCKOFF (1h) ───────────────────────────────────────────────
+    # ── WYCKOFF (1h) ──────────────────────────────────────────────────────
     if direction == 'LONG':
-        # Acumulación
         wyk_phase, wyk_score, wyk_desc = wyckoff.detect_accumulation_phase(c1h, h1h, l1h, v1h)
         if wyk_score > 0: score += wyk_score; reasons.append(wyk_desc)
 
-        # Spring (trampa bajista → LONG)
         ok, s, d = wyckoff.detect_spring(c1h, l1h, v1h)
         if ok: score += s; reasons.append(d)
 
-        # Selling Climax → rebote LONG
         ok, s, d = wyckoff.detect_climax(c1h, h1h, l1h, v1h, 'sell')
         if ok: score += s; reasons.append(d)
 
-        # SOS: Sign of Strength
         ok, s, d = wyckoff.detect_sos(c1h, h1h, v1h)
         if ok: score += s; reasons.append(d)
 
-        # LPS: Last Point of Support
         ok, s, d = wyckoff.detect_lps(c1h, l1h, v1h)
         if ok: score += s; reasons.append(d)
 
-        # Wyckoff 4h macro
         wyk4_phase, wyk4_score, wyk4_desc = wyckoff.detect_accumulation_phase(c4h, h4h, l4h, v4h)
         if wyk4_score > 0:
             bonus = int(wyk4_score * 0.6)
             score += bonus; reasons.append(f"4H_{wyk4_desc}")
 
-    else:  # SHORT
-        # Distribución
+    else:
         wyk_phase, wyk_score, wyk_desc = wyckoff.detect_distribution_phase(c1h, h1h, l1h, v1h)
         if wyk_score > 0: score += wyk_score; reasons.append(wyk_desc)
 
-        # Upthrust (trampa alcista → SHORT)
         ok, s, d = wyckoff.detect_upthrust(c1h, h1h, v1h)
         if ok: score += s; reasons.append(d)
 
-        # Buying Climax → caída SHORT
         ok, s, d = wyckoff.detect_climax(c1h, h1h, l1h, v1h, 'buy')
         if ok: score += s; reasons.append(d)
 
-        # SOW: Sign of Weakness
         ok, s, d = wyckoff.detect_sow(c1h, l1h, v1h)
         if ok: score += s; reasons.append(d)
 
-        # LPSY: Last Point of Supply
         ok, s, d = wyckoff.detect_lpsy(c1h, h1h, v1h)
         if ok: score += s; reasons.append(d)
 
-        # Wyckoff 4h macro
         wyk4_phase, wyk4_score, wyk4_desc = wyckoff.detect_distribution_phase(c4h, h4h, l4h, v4h)
         if wyk4_score > 0:
             bonus = int(wyk4_score * 0.6)
             score += bonus; reasons.append(f"4H_{wyk4_desc}")
 
-    # ── MÓDULO SMC ────────────────────────────────────────────────────────
-    # Order Block
+    # ── SMC ───────────────────────────────────────────────────────────────
     ob_ok, ob_score, ob_low, ob_high, ob_desc = smc.detect_order_block(
         c15, o15, h15, l15, v15,
         direction='bull' if direction == 'LONG' else 'bear'
     )
     if ob_ok: score += ob_score; reasons.append(ob_desc)
 
-    # Fair Value Gap
     fvg_ok, fvg_score, _, _, fvg_desc = smc.detect_fvg(c15, h15, l15)
     if fvg_ok: score += fvg_score; reasons.append(fvg_desc)
 
-    # Break of Structure / CHoCH
     bos_type, bos_score, bos_desc = smc.detect_bos_choch(c15, h15, l15)
     if direction == 'LONG' and 'BULL' in bos_type:
         score += bos_score; reasons.append(bos_desc)
@@ -852,14 +639,12 @@ def full_analysis(symbol, direction='LONG'):
     elif bos_type != 'NONE':
         score -= int(bos_score * 0.4)
 
-    # Liquidity Sweep
     sweep_type, sweep_score, sweep_desc = smc.detect_liquidity_sweep(c15, h15, l15, v15)
     if direction == 'LONG' and sweep_type == 'SWEEP_LOW':
         score += sweep_score; reasons.append(sweep_desc)
     elif direction == 'SHORT' and sweep_type == 'SWEEP_HIGH':
         score += sweep_score; reasons.append(sweep_desc)
 
-    # Premium / Discount
     pd_pos = smc.premium_discount(c15, h15, l15, period=50)
     if direction == 'LONG':
         if pd_pos < 30:   s = 18; reasons.append(f"Discount({pd_pos:.0f}%)(+18)")
@@ -867,14 +652,14 @@ def full_analysis(symbol, direction='LONG'):
         elif pd_pos > 70: s = -12; reasons.append(f"Premium({pd_pos:.0f}%)(-12)")
         else:             s = 0
         score += s
-    else:  # SHORT
+    else:
         if pd_pos > 70:   s = 18; reasons.append(f"Premium({pd_pos:.0f}%)(+18)")
         elif pd_pos > 55: s = 8;  reasons.append(f"Premium_med({pd_pos:.0f}%)(+8)")
         elif pd_pos < 30: s = -12; reasons.append(f"Discount({pd_pos:.0f}%)(-12)")
         else:             s = 0
         score += s
 
-    # ── Indicadores clásicos de soporte ──────────────────────────────────
+    # ── Indicadores clásicos ──────────────────────────────────────────────
     rsi_val  = rsi(c15, 14)
     atr_val  = atr(h15, l15, c15, 14)
     atr_pct  = atr_val / price * 100 if price > 0 else 0
@@ -896,7 +681,7 @@ def full_analysis(symbol, direction='LONG'):
     if vs >= 2.0: score += 10; reasons.append(f"Vol{vs:.1f}x(10)")
     elif vs >= 1.5: score += 5; reasons.append(f"Vol{vs:.1f}x(5)")
 
-    if atr_pct < 0.15: return 0, []  # Sin movimiento = sin oportunidad
+    if atr_pct < 0.15: return 0, []
 
     return round(score, 1), reasons
 
@@ -908,17 +693,16 @@ class WyckoffBot:
 
     def __init__(self):
         log.info("=" * 70)
-        log.info("  WYCKOFF SMC BOT v1.0 — wyckoff_bot.py")
-        log.info("  Estrategia: Wyckoff + SMC + Scalping ZLEMA/TRP")
-        log.info("  Direcciones: LONG + SHORT")
+        log.info("  WYCKOFF SMC BOT v1.1 — wyckoff_bot.py")
+        log.info("  FIXES: Circuit Breaker loop + MIN_SCORE 60 + CIRCUIT_PCT 12%")
         log.info("=" * 70)
         log.info(f"  Capital: ${POSITION_SIZE} | LEV:{LEVERAGE}x | MAX:{MAX_TRADES}")
         log.info(f"  TP:{TP_PCT}% SL:{SL_PCT}% | Short:{'ON' if ALLOW_SHORT else 'OFF'}")
-        log.info(f"  Min score: {MIN_SCORE}")
+        log.info(f"  Min score: {MIN_SCORE} | Circuit: {CIRCUIT_PCT}%")
         log.info("=" * 70)
 
         self.symbols     = []
-        self.open_trades = {}  # {symbol: {direction, entry, qty_c, ...}}
+        self.open_trades = {}
         self._contracts  = {}
         self._cooldowns  = {}
         self._last_report= datetime.now()
@@ -927,6 +711,9 @@ class WyckoffBot:
         self._daily_reset= datetime.utcnow().date()
         self._circuit    = False
         self._circuit_until = None
+        # FIX: caché de posiciones reales para evitar llamadas API excesivas
+        self._real_count_cache = 0
+        self._real_count_ts    = 0
         self.stats = {'exec':0,'closed':0,'wins':0,'losses':0,'pnl':0.0}
 
         self._verify()
@@ -936,8 +723,8 @@ class WyckoffBot:
         self._cleanup_excess()
 
         self._tg(
-            f"<b>🔵 Wyckoff SMC Bot v1.0 iniciado</b>\n"
-            f"Estrategia: Wyckoff + SMC + ZLEMA/TRP\n"
+            f"<b>🔵 Wyckoff SMC Bot v1.1 iniciado</b>\n"
+            f"FIXES: Circuit loop ✅ | MinScore:60 | Circuit:12%\n"
             f"LONG + SHORT | LEV:{LEVERAGE}x | Capital:${POSITION_SIZE}\n"
             f"Posiciones recuperadas: {len(self.open_trades)}/{MAX_TRADES}"
         )
@@ -1106,7 +893,6 @@ class WyckoffBot:
 
     def _check_circuit(self):
         today = datetime.utcnow().date()
-        # Reset diario automático
         if today != self._daily_reset:
             self._daily_pnl  = 0.0
             self._daily_reset= today
@@ -1114,12 +900,17 @@ class WyckoffBot:
             self._circuit_until = None
             log.info("  [CIRCUIT] Reset diario — bot reanudado")
 
-        # Auto-desactivar tras 2h
         if self._circuit:
             if self._circuit_until and datetime.utcnow() > self._circuit_until:
                 self._circuit = False
                 self._circuit_until = None
-                log.info("  [CIRCUIT] 2h cumplidas — bot Wyckoff reanudado")
+                # ═══════════════════════════════════════════════════════════
+                # FIX CRÍTICO: resetear _daily_pnl para que no vuelva a
+                # activarse el circuit breaker inmediatamente al reanudar.
+                # Sin este reset, el bucle era infinito cada 2h.
+                # ═══════════════════════════════════════════════════════════
+                self._daily_pnl = 0.0
+                log.info("  [CIRCUIT] 2h cumplidas — bot Wyckoff reanudado (PnL reseteado)")
                 self._tg("<b>🟢 Circuit Breaker desactivado [Wyckoff]</b> — reanudando")
             else:
                 remaining = ""
@@ -1164,7 +955,7 @@ class WyckoffBot:
             if d.get('code') == 0:
                 log.info(f"  ✅ LIMIT {direction} {qty_c}cts @ ${lp:.6f}")
                 return d.get('data',{}).get('orderId','OK')
-            log.warning(f"  LIMIT falló — MARKET")
+            log.warning(f"  LIMIT falló [{d.get('msg')}] — intentando MARKET")
 
         d = bingx('POST', '/openApi/swap/v2/trade/order', {
             'symbol':symbol,'side':side,'positionSide':ps,
@@ -1180,7 +971,6 @@ class WyckoffBot:
         side = 'SELL' if direction == 'LONG' else 'BUY'
         ps   = direction
 
-        # TP
         d = bingx('POST', '/openApi/swap/v2/trade/order', {
             'symbol':symbol,'side':side,'positionSide':ps,
             'type':'TAKE_PROFIT_MARKET','quantity':str(qty_c),
@@ -1192,7 +982,6 @@ class WyckoffBot:
 
         time.sleep(0.3)
 
-        # SL
         sl_limit = round(sl_price * (1 + SL_OFFSET) if direction == 'SHORT' else sl_price * (1 - SL_OFFSET), 8)
         d2 = bingx('POST', '/openApi/swap/v2/trade/order', {
             'symbol':symbol,'side':side,'positionSide':ps,
@@ -1220,7 +1009,6 @@ class WyckoffBot:
                 if d.get('code') == 0:
                     for p in (d.get('data') or []):
                         amt = float(p.get('positionAmt', 0) or 0)
-                        ps  = str(p.get('positionSide', '')).upper()
                         if (direction == 'LONG' and amt > 0) or (direction == 'SHORT' and amt < 0):
                             entry = float(p.get('avgPrice') or p.get('entryPrice') or 0)
                             qty   = abs(amt)
@@ -1268,13 +1056,22 @@ class WyckoffBot:
                               {'symbol': symbol, 'orderId': str(oid)})
         except: pass
 
-    def _count_real(self):
+    def _count_real(self, force=False):
+        """
+        FIX: usa caché de 30s para no hacer llamada API en cada símbolo del loop.
+        Esto reducía mucho la velocidad de análisis.
+        """
+        now = time.time()
+        if not force and (now - self._real_count_ts) < 30:
+            return self._real_count_cache
         try:
             d = bingx('GET', '/openApi/swap/v2/user/positions', {}).json()
             if d.get('code') == 0:
                 n = sum(1 for p in (d.get('data') or [])
                         if float(p.get('positionAmt', 0) or 0) != 0)
                 log.info(f"  [REAL] Posiciones en BingX: {n}/{MAX_TRADES}")
+                self._real_count_cache = n
+                self._real_count_ts    = now
                 return n
         except: pass
         return len(self.open_trades)
@@ -1282,10 +1079,6 @@ class WyckoffBot:
     # ---------------------------------------------------------------- analyze
 
     def analyze_symbol(self, symbol):
-        """
-        Analiza el símbolo para LONG y SHORT.
-        Retorna la mejor señal (mayor score) si supera MIN_SCORE.
-        """
         if symbol in self.open_trades: return None
 
         tk = ticker(symbol)
@@ -1299,7 +1092,6 @@ class WyckoffBot:
 
             score, reasons = full_analysis(symbol, direction)
             if score >= MIN_SCORE:
-                # TP/SL dinámicos
                 d15 = klines(symbol, '15m', 30)
                 if d15:
                     atr_val = atr(d15['high'], d15['low'], d15['close'], 14)
@@ -1334,7 +1126,8 @@ class WyckoffBot:
 
         if symbol in self.open_trades: return False
         if WyckoffBot._abriendo: return False
-        if self._count_real() >= MAX_TRADES: return False
+        # FIX: forzar reconteo real antes de abrir
+        if self._count_real(force=True) >= MAX_TRADES: return False
 
         WyckoffBot._abriendo = True
         try:
@@ -1360,7 +1153,6 @@ class WyckoffBot:
             if qty_real is None:
                 self._cancel_orders(symbol)
                 time.sleep(0.5)
-                # Fallback market
                 side = 'BUY' if direction == 'LONG' else 'SELL'
                 bingx('POST', '/openApi/swap/v2/trade/order', {
                     'symbol':symbol,'side':side,'positionSide':direction,
@@ -1396,6 +1188,8 @@ class WyckoffBot:
                 'highest': entry_f, 'lowest': entry_f,
                 'opened_at': datetime.now(), 'score': sig['score'],
             }
+            # Invalidar caché de conteo real
+            self._real_count_ts = 0
             self.stats['exec'] += 1
 
             self._tg(
@@ -1445,6 +1239,8 @@ class WyckoffBot:
         )
         self._set_cd(symbol, direction, cd)
         del self.open_trades[symbol]
+        # Invalidar caché
+        self._real_count_ts = 0
         return True
 
     # ---------------------------------------------------------------- monitor
@@ -1493,7 +1289,6 @@ class WyckoffBot:
 
                 if direction == 'LONG':
                     pnl_pct = (cur - t['entry']) / t['entry'] * 100
-                    # Trailing
                     if TRAILING and cur > t['highest']:
                         t['highest'] = cur
                         if pnl_pct >= TRAILING_START:
@@ -1501,7 +1296,6 @@ class WyckoffBot:
                             if new_sl > t['sl']:
                                 t['sl'] = new_sl
                                 log.info(f"  Trailing LONG {sym}: SL=${new_sl:.6f}")
-                    # Cierre
                     pnl_lev = pnl_pct * LEVERAGE
                     if pnl_lev < -MAX_LOSS_PCT:
                         self._tg(f"<b>🚨 EMERGENCIA LONG {sym}</b> {pnl_lev:+.1f}%")
@@ -1509,9 +1303,8 @@ class WyckoffBot:
                     if cur >= t['tp']:   self.close_trade(sym, cur, "TAKE PROFIT")
                     elif cur <= t['sl']: self.close_trade(sym, cur, "STOP LOSS")
 
-                else:  # SHORT
+                else:
                     pnl_pct = (t['entry'] - cur) / t['entry'] * 100
-                    # Trailing SHORT
                     if TRAILING and cur < t.get('lowest', t['entry']):
                         t['lowest'] = cur
                         if pnl_pct >= TRAILING_START:
@@ -1545,7 +1338,7 @@ class WyckoffBot:
             pct = (cur - t['entry'])/t['entry']*100 if d=='LONG' else (t['entry']-cur)/t['entry']*100
             pos_txt += f"  {d} {sym}: {pct:+.2f}%\n"
         self._tg(
-            f"<b>📊 Reporte Wyckoff SMC Bot</b>\n"
+            f"<b>📊 Reporte Wyckoff SMC Bot v1.1</b>\n"
             f"PnL: ${self.stats['pnl']:+.3f} | WR:{wr:.1f}%\n"
             f"Hoy: ${self._daily_pnl:+.3f}\n"
             f"({self.stats['wins']}W/{self.stats['losses']}L | {self.stats['closed']} trades)\n"
@@ -1570,7 +1363,7 @@ class WyckoffBot:
     # ---------------------------------------------------------------- loop
 
     async def run(self):
-        log.info("\n▶  Wyckoff SMC Bot v1.0 arrancado\n")
+        log.info("\n▶  Wyckoff SMC Bot v1.1 arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
@@ -1580,7 +1373,6 @@ class WyckoffBot:
 
                 self._update_btc()
                 if self._check_circuit():
-                    log.warning("  [CIRCUIT] Bot Wyckoff pausado")
                     await asyncio.sleep(INTERVAL); continue
 
                 total = self.stats['wins'] + self.stats['losses']
@@ -1595,13 +1387,15 @@ class WyckoffBot:
                 await self.monitor()
                 self._reporte()
 
-                pos_reales = self._count_real()
+                # FIX: forzar reconteo real al inicio del ciclo (no en cada símbolo)
+                pos_reales = self._count_real(force=True)
                 slots      = MAX_TRADES - max(pos_reales, len(self.open_trades))
                 log.info(f"  [WYK] Slots libres: {slots} (BingX={pos_reales})")
 
                 if slots > 0:
                     found = 0
                     for i, sym in enumerate(self.symbols):
+                        # usar caché (no force) dentro del loop de símbolos
                         if max(self._count_real(), len(self.open_trades)) >= MAX_TRADES:
                             break
                         sig = self.analyze_symbol(sym)
@@ -1610,12 +1404,12 @@ class WyckoffBot:
                             log.info(f"  ★ [WYK] {sig['direction']} {sym} score:{sig['score']:.0f} RR:{sig['rr']:.2f}")
                             if self.open_trade(sig):
                                 await asyncio.sleep(3)
-                        await asyncio.sleep(0.3)  # más lento: análisis multi-TF es pesado
+                        await asyncio.sleep(0.3)
                         if (i+1) % 10 == 0:
                             log.info(f"  [WYK] ...{i+1}/{len(self.symbols)} analizados")
-                    log.info(f"\n  [WYK] {len(self.symbols)} pares | {found} señales")
+                    log.info(f"\n  [WYK] {len(self.symbols)} pares | {found} señales encontradas")
                 else:
-                    log.info(f"  [WYK] Max trades — esperando")
+                    log.info(f"  [WYK] Max trades ({MAX_TRADES}) alcanzado — esperando")
 
                 log.info(f"\n  [WYK] Próximo ciclo en {INTERVAL}s\n")
                 await asyncio.sleep(INTERVAL)
