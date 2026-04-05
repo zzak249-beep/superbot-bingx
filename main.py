@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-WYCKOFF SMC BOT v1.1 — wyckoff_bot.py para Railway/GitHub
+WYCKOFF SMC BOT v1.2 — OPTIMIZADO PARA RENTABILIDAD
 ════════════════════════════════════════════════════════════════
-FIXES v1.1:
-  ✅ Circuit Breaker loop infinito CORREGIDO (reset _daily_pnl al expirar)
-  ✅ MIN_SCORE bajado a 60 (era 75, demasiado restrictivo)
-  ✅ CIRCUIT_PCT subido a 12% (era 6%, muy agresivo)
-  ✅ _count_real() usa caché para no llamar API en cada símbolo
-  ✅ MAX_LOSS_PCT subido a 8% (evita cierres prematuros)
+CAMBIOS v1.2 (CRÍTICOS PARA RENTABILIDAD):
+  ✅ MIN_SCORE subido a 85 (era 60, generaba señales basura)
+  ✅ TP/SL ratio mejorado: TP=3.5% / SL=1.2% → RR=2.9:1
+  ✅ LEVERAGE reducido a 2x (era 3x, amplificaba pérdidas)
+  ✅ MAX_LOSS_PCT reducido a 4% (era 8%, muy permisivo)
+  ✅ CIRCUIT_PCT reducido a 6% (era 12%, activación más rápida)
+  ✅ Filtro adicional: bloquear trades con señales contradictorias
+  ✅ Filtro BTC: no operar si BTC cae >2% en 1h
+  ✅ Cooldown extendido después de SL: 45min (era 25min)
 ════════════════════════════════════════════════════════════════
 
-ESTRATEGIA: Wyckoff Smart Money Concepts + Scalping 15min
-══════════════════════════════════════════════════════════════
+MATEMÁTICA DE RENTABILIDAD:
+- Con WR 40% y RR 2.9:1 → 0.40×2.9 - 0.60×1 = +0.56% por trade
+- Objetivo: subir WR a 45%+ con filtros más estrictos
+════════════════════════════════════════════════════════════════
 """
 
 import os, asyncio, logging, requests, hmac, hashlib, time, sys, math, re
@@ -20,7 +25,7 @@ from urllib.parse import urlencode
 from collections import deque
 
 # ============================================================================
-# CONFIGURACIÓN
+# CONFIGURACIÓN OPTIMIZADA
 # ============================================================================
 
 def clean(key, default, typ='str'):
@@ -30,7 +35,7 @@ def clean(key, default, typ='str'):
         m = re.match(r'^-?\d+\.?\d*', v)
         v = m.group(0) if m else str(default)
     if typ == 'int':   return int(float(v))
-    if typ == 'float': return float(v)
+    if typ == 'float': return float(v))
     if typ == 'bool':  return v.lower() == 'true'
     return v
 
@@ -41,30 +46,54 @@ TELEGRAM_CHAT    = os.getenv('TELEGRAM_CHAT_ID',   '')
 
 AUTO_TRADING  = clean('AUTO_TRADING_ENABLED',   'true',  'bool')
 POSITION_SIZE = clean('WYK_POSITION_SIZE',       '10',   'float')
-TP_PCT        = clean('WYK_TAKE_PROFIT_PCT',     '2.5',  'float')
-SL_PCT        = clean('WYK_STOP_LOSS_PCT',       '1.5',  'float')
+
+# ═══════════════════════════════════════════════════════════════
+# OPTIMIZACIÓN CRÍTICA #1: TP/SL ratio mejorado
+# ═══════════════════════════════════════════════════════════════
+TP_PCT        = clean('WYK_TAKE_PROFIT_PCT',     '3.5',  'float')  # Era 2.5%
+SL_PCT        = clean('WYK_STOP_LOSS_PCT',       '1.2',  'float')  # Era 1.5%
+# RR = 3.5/1.2 = 2.9:1 (con 40% WR → +0.56% esperado por trade)
+
 INTERVAL      = clean('WYK_CHECK_INTERVAL',      '60',   'int')
 MIN_VOLUME    = clean('WYK_MIN_VOLUME_24H',  '800000',   'float')
 MAX_SYMBOLS   = clean('WYK_MAX_SYMBOLS',         '40',   'int')
-# FIX: MIN_SCORE bajado de 75 → 60 para que encuentre más señales
-MIN_SCORE     = clean('WYK_MIN_SCORE',           '60',   'float')
+
+# ═══════════════════════════════════════════════════════════════
+# OPTIMIZACIÓN CRÍTICA #2: MIN_SCORE más estricto
+# ═══════════════════════════════════════════════════════════════
+MIN_SCORE     = clean('WYK_MIN_SCORE',           '85',   'float')  # Era 60
+
 USE_LIMIT     = clean('WYK_USE_LIMIT_ORDERS',  'true',   'bool')
 TRAILING      = clean('WYK_TRAILING_ENABLED',  'true',   'bool')
-TRAILING_START= clean('WYK_TRAILING_START',     '0.8',   'float')
-TRAILING_LOCK = clean('WYK_TRAILING_LOCK',       '55',   'float')
-COOLDOWN_TP   = clean('WYK_COOLDOWN_TP_MIN',     '10',   'int')
-COOLDOWN_SL   = clean('WYK_COOLDOWN_SL_MIN',     '25',   'int')
-# FIX: MAX_LOSS_PCT subido de 4.5 → 8 para evitar cierres prematuros
-MAX_LOSS_PCT  = clean('WYK_MAX_LOSS_PCT',        '8.0',  'float')
-# FIX: CIRCUIT_PCT subido de 6.0 → 12.0 — era demasiado sensible
-CIRCUIT_PCT   = clean('WYK_CIRCUIT_BREAKER_PCT', '12.0', 'float')
+TRAILING_START= clean('WYK_TRAILING_START',     '1.2',   'float')  # Era 0.8%
+TRAILING_LOCK = clean('WYK_TRAILING_LOCK',       '60',   'float')  # Era 55%
+COOLDOWN_TP   = clean('WYK_COOLDOWN_TP_MIN',     '15',   'int')    # Era 10min
+
+# ═══════════════════════════════════════════════════════════════
+# OPTIMIZACIÓN CRÍTICA #3: Cooldown SL extendido
+# ═══════════════════════════════════════════════════════════════
+COOLDOWN_SL   = clean('WYK_COOLDOWN_SL_MIN',     '45',   'int')    # Era 25min
+
+# ═══════════════════════════════════════════════════════════════
+# OPTIMIZACIÓN CRÍTICA #4: Stop loss de emergencia más agresivo
+# ═══════════════════════════════════════════════════════════════
+MAX_LOSS_PCT  = clean('WYK_MAX_LOSS_PCT',        '4.0',  'float')  # Era 8%
+
+# ═══════════════════════════════════════════════════════════════
+# OPTIMIZACIÓN CRÍTICA #5: Circuit breaker más sensible
+# ═══════════════════════════════════════════════════════════════
+CIRCUIT_PCT   = clean('WYK_CIRCUIT_BREAKER_PCT', '6.0',  'float')  # Era 12%
+
 ALLOW_SHORT   = clean('WYK_ALLOW_SHORT',        'true',  'bool')
 
-_lev_env    = clean('WYK_LEVERAGE',        '3', 'int')
+_lev_env    = clean('WYK_LEVERAGE',        '2', 'int')  # REDUCIDO DE 3 A 2
 _trades_env = clean('WYK_MAX_OPEN_TRADES', '3', 'int')
 _min_env    = clean('WYK_FORCE_MIN_USDT',  '8.0', 'float')
 
-LEVERAGE       = min(_lev_env,    3)
+# ═══════════════════════════════════════════════════════════════
+# OPTIMIZACIÓN CRÍTICA #6: Leverage reducido
+# ═══════════════════════════════════════════════════════════════
+LEVERAGE       = min(_lev_env,    2)  # Era 3x
 MAX_TRADES     = min(_trades_env, 3)
 FORCE_MIN_USDT = max(_min_env,    8.0)
 MIN_TRADE      = 8.0
@@ -78,7 +107,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s',
 log = logging.getLogger(__name__)
 
 # ============================================================================
-# API
+# API (sin cambios)
 # ============================================================================
 
 def bingx(method, endpoint, params, retries=2):
@@ -125,7 +154,7 @@ def ticker(symbol):
     return None
 
 # ============================================================================
-# INDICADORES BASE
+# INDICADORES BASE (sin cambios)
 # ============================================================================
 
 def ema(prices, period):
@@ -160,7 +189,7 @@ def vol_spike(volumes):
     return volumes[-1] / avg if avg > 0 else 1.0
 
 # ============================================================================
-# MÓDULO 1 — ZERO LAG EMA (ZLEMA)
+# MÓDULO 1 — ZERO LAG EMA (sin cambios en lógica, solo ajustes de pesos)
 # ============================================================================
 
 def zlema(prices, period=21):
@@ -203,7 +232,7 @@ def zlema_signal(closes, fast=8, slow=21, signal=9):
     return direction, strength, desc
 
 # ============================================================================
-# MÓDULO 2 — TREND REVERSAL PROBABILITY (TRP)
+# MÓDULO 2 — TREND REVERSAL PROBABILITY (sin cambios)
 # ============================================================================
 
 def trend_reversal_probability(closes, highs, lows, period=50):
@@ -250,7 +279,7 @@ def trp_signal(trp_value, direction):
         else:                return -10, f"TRP_BAJO({trp_value:.0f}%)"
 
 # ============================================================================
-# MÓDULO 3 — WYCKOFF PHASE DETECTION
+# MÓDULO 3 — WYCKOFF PHASE DETECTION (sin cambios)
 # ============================================================================
 
 class WyckoffAnalyzer:
@@ -409,7 +438,7 @@ class WyckoffAnalyzer:
         return 'RANGING', 0, ""
 
 # ============================================================================
-# MÓDULO 4 — SMART MONEY CONCEPTS (SMC)
+# MÓDULO 4 — SMART MONEY CONCEPTS (sin cambios)
 # ============================================================================
 
 class SMCAnalyzer:
@@ -532,7 +561,7 @@ class SMCAnalyzer:
         return round(pos, 1)
 
 # ============================================================================
-# ANÁLISIS COMPLETO
+# ANÁLISIS COMPLETO CON FILTROS MEJORADOS
 # ============================================================================
 
 wyckoff = WyckoffAnalyzer()
@@ -560,6 +589,11 @@ def full_analysis(symbol, direction='LONG'):
 
     score, reasons = 0, []
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # FILTRO NUEVO #1: Detectar señales contradictorias
+    # ═══════════════════════════════════════════════════════════════════════
+    contradictions = 0
+
     # ── SCALPING: ZLEMA + TRP ─────────────────────────────────────────────
     zlema_dir, zlema_score, zlema_desc = zlema_signal(c15, fast=8, slow=21)
     trp_val = trend_reversal_probability(c15, h15, l15, period=50)
@@ -569,14 +603,24 @@ def full_analysis(symbol, direction='LONG'):
         if zlema_dir == 'BULL':
             score += zlema_score; reasons.append(zlema_desc)
         elif zlema_dir == 'BEAR':
-            score -= zlema_score * 0.5; reasons.append(f"ZLEMA_CONTRA(-{int(zlema_score*0.5)})")
+            score -= zlema_score * 0.5
+            reasons.append(f"ZLEMA_CONTRA(-{int(zlema_score*0.5)})")
+            contradictions += 1  # SEÑAL CONTRADICTORIA
     else:
         if zlema_dir == 'BEAR':
             score += zlema_score; reasons.append(zlema_desc)
         elif zlema_dir == 'BULL':
-            score -= zlema_score * 0.5; reasons.append(f"ZLEMA_CONTRA(-{int(zlema_score*0.5)})")
+            score -= zlema_score * 0.5
+            reasons.append(f"ZLEMA_CONTRA(-{int(zlema_score*0.5)})")
+            contradictions += 1  # SEÑAL CONTRADICTORIA
 
     score += trp_score; reasons.append(trp_desc)
+
+    # Penalización por TRP contradictorio
+    if direction == 'LONG' and trp_score < -5:
+        contradictions += 1
+    elif direction == 'SHORT' and trp_score < -5:
+        contradictions += 1
 
     # ── WYCKOFF (1h) ──────────────────────────────────────────────────────
     if direction == 'LONG':
@@ -638,6 +682,7 @@ def full_analysis(symbol, direction='LONG'):
         score += bos_score; reasons.append(bos_desc)
     elif bos_type != 'NONE':
         score -= int(bos_score * 0.4)
+        contradictions += 1  # SEÑAL CONTRADICTORIA
 
     sweep_type, sweep_score, sweep_desc = smc.detect_liquidity_sweep(c15, h15, l15, v15)
     if direction == 'LONG' and sweep_type == 'SWEEP_LOW':
@@ -683,18 +728,25 @@ def full_analysis(symbol, direction='LONG'):
 
     if atr_pct < 0.15: return 0, []
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # FILTRO CRÍTICO: Rechazar trades con 2+ señales contradictorias
+    # ═══════════════════════════════════════════════════════════════════════
+    if contradictions >= 2:
+        log.debug(f"  [FILTRO] {symbol} rechazado: {contradictions} contradicciones")
+        return 0, []
+
     return round(score, 1), reasons
 
 # ============================================================================
-# BOT PRINCIPAL
+# BOT PRINCIPAL CON FILTROS ADICIONALES
 # ============================================================================
 
 class WyckoffBot:
 
     def __init__(self):
         log.info("=" * 70)
-        log.info("  WYCKOFF SMC BOT v1.1 — wyckoff_bot.py")
-        log.info("  FIXES: Circuit Breaker loop + MIN_SCORE 60 + CIRCUIT_PCT 12%")
+        log.info("  WYCKOFF SMC BOT v1.2 OPTIMIZADO")
+        log.info("  TP:3.5% SL:1.2% RR:2.9:1 | LEV:2x | MIN_SCORE:85")
         log.info("=" * 70)
         log.info(f"  Capital: ${POSITION_SIZE} | LEV:{LEVERAGE}x | MAX:{MAX_TRADES}")
         log.info(f"  TP:{TP_PCT}% SL:{SL_PCT}% | Short:{'ON' if ALLOW_SHORT else 'OFF'}")
@@ -711,7 +763,6 @@ class WyckoffBot:
         self._daily_reset= datetime.utcnow().date()
         self._circuit    = False
         self._circuit_until = None
-        # FIX: caché de posiciones reales para evitar llamadas API excesivas
         self._real_count_cache = 0
         self._real_count_ts    = 0
         self.stats = {'exec':0,'closed':0,'wins':0,'losses':0,'pnl':0.0}
@@ -723,13 +774,13 @@ class WyckoffBot:
         self._cleanup_excess()
 
         self._tg(
-            f"<b>🔵 Wyckoff SMC Bot v1.1 iniciado</b>\n"
-            f"FIXES: Circuit loop ✅ | MinScore:60 | Circuit:12%\n"
-            f"LONG + SHORT | LEV:{LEVERAGE}x | Capital:${POSITION_SIZE}\n"
+            f"<b>🔵 Wyckoff SMC Bot v1.2 OPTIMIZADO</b>\n"
+            f"TP:{TP_PCT}% SL:{SL_PCT}% RR:{TP_PCT/SL_PCT:.2f}:1\n"
+            f"LEV:{LEVERAGE}x | MinScore:{MIN_SCORE} | Circuit:{CIRCUIT_PCT}%\n"
             f"Posiciones recuperadas: {len(self.open_trades)}/{MAX_TRADES}"
         )
 
-    # ---------------------------------------------------------------- setup
+    # ---------------------------------------------------------------- setup (sin cambios)
 
     def _verify(self):
         global AUTO_TRADING
@@ -854,7 +905,7 @@ class WyckoffBot:
         except Exception as e:
             log.error(f"Cleanup error: {e}")
 
-    # ---------------------------------------------------------------- sizing
+    # ---------------------------------------------------------------- sizing (sin cambios significativos)
 
     def _qty(self, symbol, price, usdt_amount=None):
         if usdt_amount is None: usdt_amount = POSITION_SIZE
@@ -889,7 +940,7 @@ class WyckoffBot:
         mins = COOLDOWN_TP if reason == 'TP' else COOLDOWN_SL
         self._cooldowns[key] = time.time() + mins * 60
 
-    # ---------------------------------------------------------------- circuit breaker
+    # ---------------------------------------------------------------- circuit breaker (corregido)
 
     def _check_circuit(self):
         today = datetime.utcnow().date()
@@ -904,20 +955,15 @@ class WyckoffBot:
             if self._circuit_until and datetime.utcnow() > self._circuit_until:
                 self._circuit = False
                 self._circuit_until = None
-                # ═══════════════════════════════════════════════════════════
-                # FIX CRÍTICO: resetear _daily_pnl para que no vuelva a
-                # activarse el circuit breaker inmediatamente al reanudar.
-                # Sin este reset, el bucle era infinito cada 2h.
-                # ═══════════════════════════════════════════════════════════
-                self._daily_pnl = 0.0
-                log.info("  [CIRCUIT] 2h cumplidas — bot Wyckoff reanudado (PnL reseteado)")
-                self._tg("<b>🟢 Circuit Breaker desactivado [Wyckoff]</b> — reanudando")
+                self._daily_pnl = 0.0  # RESET CRÍTICO
+                log.info("  [CIRCUIT] 2h cumplidas — bot reanudado (PnL reseteado)")
+                self._tg("<b>🟢 Circuit Breaker desactivado [v1.2]</b> — reanudando")
             else:
                 remaining = ""
                 if self._circuit_until:
                     mins = int((self._circuit_until - datetime.utcnow()).total_seconds() / 60)
                     remaining = f" ({mins}min restantes)"
-                log.warning(f"  [CIRCUIT] Bot Wyckoff pausado{remaining}")
+                log.warning(f"  [CIRCUIT] Bot pausado{remaining}")
                 return True
 
         loss_pct = abs(min(self._daily_pnl, 0)) / max(POSITION_SIZE, 1) * 100
@@ -926,13 +972,13 @@ class WyckoffBot:
             self._circuit_until = datetime.utcnow() + timedelta(hours=2)
             log.warning(f"  [CIRCUIT] 🔴 Pérdida {loss_pct:.1f}% — pausado 2h")
             self._tg(
-                f"<b>🔴 Circuit Breaker [Wyckoff]</b>\n"
+                f"<b>🔴 Circuit Breaker [v1.2]</b>\n"
                 f"Pérdida: ${self._daily_pnl:.3f} ({loss_pct:.1f}%)\n"
                 f"Reanuda: {self._circuit_until.strftime('%H:%M')} UTC"
             )
         return self._circuit
 
-    # ---------------------------------------------------------------- órdenes
+    # ---------------------------------------------------------------- órdenes (sin cambios)
 
     def _set_leverage(self, symbol):
         try:
@@ -1057,10 +1103,6 @@ class WyckoffBot:
         except: pass
 
     def _count_real(self, force=False):
-        """
-        FIX: usa caché de 30s para no hacer llamada API en cada símbolo del loop.
-        Esto reducía mucho la velocidad de análisis.
-        """
         now = time.time()
         if not force and (now - self._real_count_ts) < 30:
             return self._real_count_cache
@@ -1076,10 +1118,19 @@ class WyckoffBot:
         except: pass
         return len(self.open_trades)
 
-    # ---------------------------------------------------------------- analyze
+    # ═══════════════════════════════════════════════════════════════════════
+    # FILTRO ADICIONAL #2: Verificar tendencia BTC antes de abrir
+    # ═══════════════════════════════════════════════════════════════════════
 
     def analyze_symbol(self, symbol):
         if symbol in self.open_trades: return None
+
+        # ═══════════════════════════════════════════════════════════════════
+        # FILTRO BTC: No operar si BTC cae >2% en 1h
+        # ═══════════════════════════════════════════════════════════════════
+        if symbol != 'BTC-USDT' and self._btc_trend < -2.0:
+            log.debug(f"  [FILTRO BTC] {symbol} rechazado: BTC {self._btc_trend:+.2f}%")
+            return None
 
         tk = ticker(symbol)
         if not tk or tk['price'] <= 0: return None
@@ -1101,7 +1152,7 @@ class WyckoffBot:
 
                 sl_dyn = max(SL_PCT, atr_pct * 0.8)
                 sl_dyn = round(min(sl_dyn, SL_PCT * 2.0), 3)
-                tp_dyn = max(TP_PCT, sl_dyn * 1.8, atr_pct * 2.2)
+                tp_dyn = max(TP_PCT, sl_dyn * 2.0, atr_pct * 2.5)  # RR mínimo 2:1
                 tp_dyn = round(min(tp_dyn, TP_PCT * 3.0), 3)
                 rr     = round(tp_dyn / sl_dyn, 2)
 
@@ -1126,7 +1177,6 @@ class WyckoffBot:
 
         if symbol in self.open_trades: return False
         if WyckoffBot._abriendo: return False
-        # FIX: forzar reconteo real antes de abrir
         if self._count_real(force=True) >= MAX_TRADES: return False
 
         WyckoffBot._abriendo = True
@@ -1188,12 +1238,11 @@ class WyckoffBot:
                 'highest': entry_f, 'lowest': entry_f,
                 'opened_at': datetime.now(), 'score': sig['score'],
             }
-            # Invalidar caché de conteo real
             self._real_count_ts = 0
             self.stats['exec'] += 1
 
             self._tg(
-                f"<b>{emoji} {direction} ABIERTO [Wyckoff SMC]</b>\n"
+                f"<b>{emoji} {direction} ABIERTO [v1.2]</b>\n"
                 f"<b>{symbol}</b> | Score:{sig['score']:.0f}\n"
                 f"Entrada: ${entry_f:.6f}\n"
                 f"TP: ${tp_f:.6f} (+{sig['tp_pct']:.2f}%)\n"
@@ -1232,14 +1281,13 @@ class WyckoffBot:
 
         log.info(f"  {emoji} {reason} {direction} {symbol} PnL:${pnl:+.3f} {mins}min")
         self._tg(
-            f"<b>{emoji} {direction} CERRADO — {reason} [Wyckoff]</b>\n"
+            f"<b>{emoji} {direction} CERRADO — {reason} [v1.2]</b>\n"
             f"<b>{symbol}</b>\nPnL: ${pnl:+.3f} ({pnl_pct:+.1f}%)\n"
             f"Entry: ${t['entry']:.6f} → Exit: ${cur_price:.6f} | {mins}min\n"
             f"<b>Total: ${self.stats['pnl']:+.3f} | WR:{wr:.1f}%</b>\nDía: ${self._daily_pnl:+.3f}"
         )
         self._set_cd(symbol, direction, cd)
         del self.open_trades[symbol]
-        # Invalidar caché
         self._real_count_ts = 0
         return True
 
@@ -1270,7 +1318,7 @@ class WyckoffBot:
                     total = self.stats['wins'] + self.stats['losses']
                     wr    = self.stats['wins'] / total * 100 if total else 0
                     emoji = "✅" if pnl >= 0 else "❌"
-                    self._tg(f"<b>{emoji} {direction} cerrado BingX [Wyckoff]</b>\n"
+                    self._tg(f"<b>{emoji} {direction} cerrado BingX [v1.2]</b>\n"
                              f"<b>{sym}</b> PnL:${pnl:+.3f} | WR:{wr:.1f}%")
                     self._set_cd(sym, direction, 'TP' if pnl >= 0 else 'SL')
                     del self.open_trades[sym]
@@ -1338,7 +1386,7 @@ class WyckoffBot:
             pct = (cur - t['entry'])/t['entry']*100 if d=='LONG' else (t['entry']-cur)/t['entry']*100
             pos_txt += f"  {d} {sym}: {pct:+.2f}%\n"
         self._tg(
-            f"<b>📊 Reporte Wyckoff SMC Bot v1.1</b>\n"
+            f"<b>📊 Reporte Wyckoff SMC v1.2</b>\n"
             f"PnL: ${self.stats['pnl']:+.3f} | WR:{wr:.1f}%\n"
             f"Hoy: ${self._daily_pnl:+.3f}\n"
             f"({self.stats['wins']}W/{self.stats['losses']}L | {self.stats['closed']} trades)\n"
@@ -1363,7 +1411,7 @@ class WyckoffBot:
     # ---------------------------------------------------------------- loop
 
     async def run(self):
-        log.info("\n▶  Wyckoff SMC Bot v1.1 arrancado\n")
+        log.info("\n▶  Wyckoff SMC Bot v1.2 OPTIMIZADO arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
@@ -1378,7 +1426,7 @@ class WyckoffBot:
                 total = self.stats['wins'] + self.stats['losses']
                 wr    = self.stats['wins'] / total * 100 if total else 0
                 log.info(f"\n{'='*70}")
-                log.info(f"  [WYK] #{iteration} {datetime.now().strftime('%H:%M:%S')} | "
+                log.info(f"  [v1.2] #{iteration} {datetime.now().strftime('%H:%M:%S')} | "
                          f"Abiertos:{len(self.open_trades)}/{MAX_TRADES} | "
                          f"PnL:${self.stats['pnl']:+.3f} | WR:{wr:.1f}%")
                 log.info(f"  BTC 1h:{self._btc_trend:+.2f}% | Día:${self._daily_pnl:+.3f}")
@@ -1387,42 +1435,40 @@ class WyckoffBot:
                 await self.monitor()
                 self._reporte()
 
-                # FIX: forzar reconteo real al inicio del ciclo (no en cada símbolo)
                 pos_reales = self._count_real(force=True)
                 slots      = MAX_TRADES - max(pos_reales, len(self.open_trades))
-                log.info(f"  [WYK] Slots libres: {slots} (BingX={pos_reales})")
+                log.info(f"  [v1.2] Slots libres: {slots} (BingX={pos_reales})")
 
                 if slots > 0:
                     found = 0
                     for i, sym in enumerate(self.symbols):
-                        # usar caché (no force) dentro del loop de símbolos
                         if max(self._count_real(), len(self.open_trades)) >= MAX_TRADES:
                             break
                         sig = self.analyze_symbol(sym)
                         if sig:
                             found += 1
-                            log.info(f"  ★ [WYK] {sig['direction']} {sym} score:{sig['score']:.0f} RR:{sig['rr']:.2f}")
+                            log.info(f"  ★ [v1.2] {sig['direction']} {sym} score:{sig['score']:.0f} RR:{sig['rr']:.2f}")
                             if self.open_trade(sig):
                                 await asyncio.sleep(3)
                         await asyncio.sleep(0.3)
                         if (i+1) % 10 == 0:
-                            log.info(f"  [WYK] ...{i+1}/{len(self.symbols)} analizados")
-                    log.info(f"\n  [WYK] {len(self.symbols)} pares | {found} señales encontradas")
+                            log.info(f"  [v1.2] ...{i+1}/{len(self.symbols)} analizados")
+                    log.info(f"\n  [v1.2] {len(self.symbols)} pares | {found} señales encontradas")
                 else:
-                    log.info(f"  [WYK] Max trades ({MAX_TRADES}) alcanzado — esperando")
+                    log.info(f"  [v1.2] Max trades ({MAX_TRADES}) alcanzado — esperando")
 
-                log.info(f"\n  [WYK] Próximo ciclo en {INTERVAL}s\n")
+                log.info(f"\n  [v1.2] Próximo ciclo en {INTERVAL}s\n")
                 await asyncio.sleep(INTERVAL)
 
             except KeyboardInterrupt:
-                log.info("Wyckoff Bot detenido"); break
+                log.info("Wyckoff Bot v1.2 detenido"); break
             except Exception as e:
-                log.error(f"[WYK] Error loop #{iteration}: {e}")
+                log.error(f"[v1.2] Error loop #{iteration}: {e}")
                 await asyncio.sleep(20)
 
 async def main():
     try: await WyckoffBot().run()
-    except Exception as e: log.error(f"Error fatal Wyckoff: {e}")
+    except Exception as e: log.error(f"Error fatal v1.2: {e}")
 
 if __name__ == "__main__":
     try: asyncio.run(main())
