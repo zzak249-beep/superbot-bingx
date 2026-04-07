@@ -2,7 +2,9 @@
 BingX API Client - Perpetual Futures (Swap)
 Optimized for low fees using maker orders
 """
-import hmac, hashlib, time, requests, json, os
+import hmac, hashlib, time, requests, json, os, logging
+
+log = logging.getLogger(__name__)
 from urllib.parse import urlencode
 from typing import Optional
 
@@ -76,11 +78,34 @@ class BingXClient:
 
     # ── Account ───────────────────────────────────────────────────────────
     def get_balance(self) -> float:
-        """Available USDT balance."""
+        """Available USDT balance. Handles multiple BingX response shapes."""
         data = self._get("/openApi/swap/v2/user/balance")
-        for a in data.get("data", {}).get("balance", []):
-            if a.get("asset") == "USDT":
-                return float(a.get("availableMargin", 0))
+        payload = data.get("data", {})
+
+        # Shape 1: {"data": {"balance": [{"asset": "USDT", ...}, ...]}}
+        if isinstance(payload, dict):
+            balance_list = payload.get("balance", [])
+            if isinstance(balance_list, list):
+                for a in balance_list:
+                    if isinstance(a, dict) and a.get("asset") == "USDT":
+                        return float(a.get("availableMargin", 0))
+
+            # Shape 2: {"data": {"asset": "USDT", "availableMargin": "123.45"}}
+            if payload.get("asset") == "USDT":
+                return float(payload.get("availableMargin", 0))
+
+            # Shape 3: {"data": {"USDT": {"availableMargin": "123.45"}}}
+            usdt = payload.get("USDT")
+            if isinstance(usdt, dict):
+                return float(usdt.get("availableMargin", 0))
+
+        # Shape 4: {"data": [{"asset": "USDT", ...}]}  (list at top level)
+        if isinstance(payload, list):
+            for a in payload:
+                if isinstance(a, dict) and a.get("asset") == "USDT":
+                    return float(a.get("availableMargin", 0))
+
+        log.warning(f"get_balance: no USDT found in response. data={payload}")
         return 0.0
 
     def get_positions(self) -> list:
