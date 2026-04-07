@@ -1,11 +1,14 @@
 """
-Strategy: VWAP Volatility Bands [BOSWaves] + Sniper Entry [KhanSaab V.02]
-Fiel replicación de ambos Pine Scripts con confirmación dual obligatoria.
+Strategy v3.0 – Triple Confirmation Engine
+Integra los tres Pine Scripts:
+  1. BOSWaves  → T3-VWAP trend direction + bounce desde bandas
+  2. KhanSaab  → EMA9/21 crossover + 7-condition score
+  3. DLO       → Directional Logistic Oscillator como filtro de fuerza
 
-Lógica:
-  BOSWaves  → T3-VWAP direction change = señal principal
-  KhanSaab  → EMA9/21 crossover + 7-condition score = filtro de calidad
-  Ambos deben alinearse para abrir trade.
+Jerarquía:
+  Tier A: los 3 alineados           → máxima prioridad
+  Tier B: BOSWaves + KhanSaab       → prioridad media (DLO neutro/alineado)
+  Sin señal: solo 1 confirma        → NONE
 """
 import numpy as np
 import pandas as pd
@@ -13,47 +16,58 @@ from dataclasses import dataclass
 from typing import Literal
 
 # ─────────────────────────────────────────────────────────────────────
-#  Parámetros (idénticos a Pine Script)
+#  Parámetros
 # ─────────────────────────────────────────────────────────────────────
 T3_LEN        = 28
 T3_FACTOR     = 0.7
-ATR_LEN       = 14
+BAND_M        = [0.5, 1.0, 1.5, 2.2]
+
 EMA_FAST      = 9
 EMA_SLOW      = 21
+ATR_LEN       = 14
 RSI_LEN       = 14
 MACD_FAST     = 12
 MACD_SLOW     = 26
 MACD_SIG      = 9
 ADX_LEN       = 14
 VOL_MA_LEN    = 20
-SL_ATR_MULT   = 1.5     # KhanSaab default
-BAND_M        = [0.5, 1.0, 1.5, 2.2]
+SL_ATR_MULT   = 1.5
 
-MIN_SCORE     = 5        # mínimo de 7 condiciones Sniper
-MIN_ADX       = 25
-MIN_VOL_RATIO = 1.0      # volumen >= media
+DLO_DI_LEN    = 14
+DLO_MEAN_LB   = 200   # reducido de 360 para crypto (más datos recientes)
+DLO_SLOPE     = 0.18
+DLO_SMOOTH    = 3
+DLO_OSC_SCALE = 2.5
+DLO_OSC_SMOOTH = 7
+
+MIN_SCORE     = 5     # mínimo condiciones KhanSaab (de 7)
+MIN_ADX       = 22    # ligeramente más permisivo que los 25 del Pine
+CROSS_WINDOW  = 6     # ventana para EMA crossover (era 3 → demasiado estricto)
+BW_WINDOW     = 5     # ventana para BOSWaves T3 crossover
 
 
 @dataclass
 class Signal:
-    direction: Literal["LONG", "SHORT", "NONE"]
-    entry:     float
-    sl:        float
-    tp1:       float
-    tp2:       float
-    tp3:       float
-    tp4:       float
-    tp5:       float
-    score:     float       # 0-100
-    atr:       float
-    reason:    str
-    adx:       float = 0.0
-    bull_pct:  float = 0.0
-    bear_pct:  float = 0.0
+    direction:  Literal["LONG", "SHORT", "NONE"]
+    entry:      float
+    sl:         float
+    tp1:        float
+    tp2:        float
+    tp3:        float
+    tp4:        float
+    tp5:        float
+    score:      float
+    atr:        float
+    reason:     str
+    adx:        float = 0.0
+    bull_pct:   float = 0.0
+    bear_pct:   float = 0.0
+    dlo_value:  float = 0.0
+    tier:       str   = ""
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  Funciones matemáticas
+#  Matemáticas
 # ─────────────────────────────────────────────────────────────────────
 def _ema(series: np.ndarray, period: int) -> np.ndarray:
     out = np.full_like(series, np.nan, dtype=float)
@@ -68,8 +82,11 @@ def _ema(series: np.ndarray, period: int) -> np.ndarray:
     return out
 
 
+def _sma(series: np.ndarray, period: int) -> np.ndarray:
+    return pd.Series(series).rolling(period, min_periods=1).mean().values
+
+
 def _t3(series: np.ndarray, length: int, factor: float) -> np.ndarray:
-    """T3 de Tillson – exactamente como Pine Script f_t3()"""
     a  = factor
     c1 = -(a ** 3)
     c2 = 3 * a**2 + 3 * a**3
@@ -109,38 +126,31 @@ def _macd(close: np.ndarray):
     return m, sig
 
 
-def _adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
+def _dmi(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int):
+    """Devuelve (plus_di, minus_di, adx)."""
     ph = np.roll(high, 1);  ph[0] = high[0]
     pl = np.roll(low, 1);   pl[0] = low[0]
     pc = np.roll(close, 1); pc[0] = close[0]
     tr    = np.maximum(high - low, np.maximum(np.abs(high - pc), np.abs(low - pc)))
     dm_p  = np.where((high - ph) > (pl - low), np.maximum(high - ph, 0), 0.0)
-    dm_m  = np.where((pl - low)  > (high - ph), np.maximum(pl - low, 0), 0.0)
+    dm_m  = np.where((pl - low) > (high - ph), np.maximum(pl - low, 0), 0.0)
     atr14 = _ema(tr, period)
     safe  = np.where(atr14 == 0, 1e-10, atr14)
     di_p  = 100 * _ema(dm_p, period) / safe
     di_m  = 100 * _ema(dm_m, period) / safe
     dsum  = np.where(di_p + di_m == 0, 1e-10, di_p + di_m)
     dx    = 100 * np.abs(di_p - di_m) / dsum
-    return _ema(dx, period)
+    return di_p, di_m, _ema(dx, period)
 
 
-def _session_vwap(hlc3: np.ndarray, volume: np.ndarray,
-                   timestamps: np.ndarray) -> np.ndarray:
-    """
-    VWAP con reset de sesión (diario) – replica Pine Script BOSWaves.
-    Detecta cambio de día en timestamps (ms epoch).
-    """
+def _session_vwap(hlc3: np.ndarray, volume: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
     vwap = np.full_like(hlc3, np.nan)
-    cum_vol = 0.0
-    cum_tpv = 0.0
+    cum_vol = cum_tpv = 0.0
     prev_day = -1
-
     for i in range(len(hlc3)):
-        day = int(timestamps[i] // 86_400_000)   # ms → día
-        if day != prev_day:                        # nuevo día = reset
-            cum_vol = 0.0
-            cum_tpv = 0.0
+        day = int(timestamps[i] // 86_400_000)
+        if day != prev_day:
+            cum_vol = cum_tpv = 0.0
             prev_day = day
         cum_vol += volume[i]
         cum_tpv += hlc3[i] * volume[i]
@@ -148,28 +158,51 @@ def _session_vwap(hlc3: np.ndarray, volume: np.ndarray,
     return vwap
 
 
-def _crossover(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """True en posición i si a cruza sobre b (a[i]>b[i] y a[i-1]<=b[i-1])"""
-    cross = np.zeros(len(a), dtype=bool)
-    cross[1:] = (a[1:] > b[1:]) & (a[:-1] <= b[:-1])
-    return cross
+def _cross_up(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    c = np.zeros(len(a), dtype=bool)
+    c[1:] = (a[1:] > b[1:]) & (a[:-1] <= b[:-1])
+    return c
 
 
-def _crossunder(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    cross = np.zeros(len(a), dtype=bool)
-    cross[1:] = (a[1:] < b[1:]) & (a[:-1] >= b[:-1])
-    return cross
+def _cross_dn(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    c = np.zeros(len(a), dtype=bool)
+    c[1:] = (a[1:] < b[1:]) & (a[:-1] >= b[:-1])
+    return c
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  DLO – Directional Logistic Oscillator (GainzAlgo)
+# ─────────────────────────────────────────────────────────────────────
+def _logistic_prob(series: np.ndarray, mean_lb: int, slope: float, smooth: int) -> np.ndarray:
+    mean     = _sma(series, mean_lb)
+    z        = np.clip((series - mean) * slope, -20, 20)
+    prob_raw = 1.0 / (1.0 + np.exp(-z))
+    return _ema(prob_raw, smooth)
+
+
+def _compute_dlo(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
+    """
+    Replica del DLO Pine Script.
+    Retorna array `s_ema` acotado en [-1, +1].
+    +0.15 o más  → tendencia alcista fuerte
+    -0.15 o menos → tendencia bajista fuerte
+    """
+    di_p, di_m, adx = _dmi(high, low, close, DLO_DI_LEN)
+    prob_plus  = _logistic_prob(di_p, DLO_MEAN_LB, DLO_SLOPE, DLO_SMOOTH)
+    prob_minus = _logistic_prob(di_m, DLO_MEAN_LB, DLO_SLOPE, DLO_SMOOTH)
+    prob_adx   = _logistic_prob(adx,  DLO_MEAN_LB, DLO_SLOPE, DLO_SMOOTH)
+    net_dir        = prob_plus - prob_minus
+    strength_raw   = net_dir * prob_adx * DLO_OSC_SCALE
+    strength_bound = np.tanh(np.clip(strength_raw, -20, 20))
+    strength       = _ema(strength_bound, DLO_SMOOTH)
+    return _ema(strength, DLO_OSC_SMOOTH)
 
 
 # ─────────────────────────────────────────────────────────────────────
 #  Función principal
 # ─────────────────────────────────────────────────────────────────────
 def compute_signal(candles: list[dict], htf_rsi: float = 50.0) -> Signal:
-    """
-    candles: lista de {ts, open, high, low, close, volume}  (oldest → newest)
-    htf_rsi: RSI de timeframe superior (1h cuando operamos en 15m)
-    """
-    min_bars = max(T3_LEN * 6, ATR_LEN, ADX_LEN, MACD_SLOW + MACD_SIG, VOL_MA_LEN) + 20
+    min_bars = max(T3_LEN * 6, DLO_MEAN_LB, MACD_SLOW + MACD_SIG, VOL_MA_LEN) + 20
     if len(candles) < min_bars:
         return Signal("NONE", 0, 0, 0, 0, 0, 0, 0, 0, 0, "Not enough bars")
 
@@ -182,68 +215,71 @@ def compute_signal(candles: list[dict], htf_rsi: float = 50.0) -> Signal:
     v    = df["volume"].values.astype(float)
     hlc3 = (h + l + c) / 3.0
 
-    # ── BOSWaves: VWAP con reset diario → T3 ──────────────────────────
+    # ── BOSWaves ──────────────────────────────────────────────────────
     raw_vwap = _session_vwap(hlc3, v, ts)
     t3_arr   = _t3(raw_vwap, T3_LEN, T3_FACTOR)
+    atr_arr  = _atr(h, l, c, ATR_LEN)
+    atr_v    = float(atr_arr[-1])
+    t3_v     = float(t3_arr[-1])
+    t3_p     = float(t3_arr[-2])
 
-    # ── Indicadores KhanSaab ──────────────────────────────────────────
-    atr_arr   = _atr(h, l, c, ATR_LEN)
-    ema9_arr  = _ema(c, EMA_FAST)
-    ema21_arr = _ema(c, EMA_SLOW)
-    rsi_arr   = _rsi(c, RSI_LEN)
-    macd_arr, sig_arr = _macd(c)
-    adx_arr   = _adx(h, l, c, ADX_LEN)
-    vol_ma    = pd.Series(v).rolling(VOL_MA_LEN).mean().values
+    band_l3  = t3_v - atr_v * BAND_M[2]
+    band_l4  = t3_v - atr_v * BAND_M[3]
+    band_u3  = t3_v + atr_v * BAND_M[2]
+    band_u4  = t3_v + atr_v * BAND_M[3]
 
-    # ── Crossovers (arrays) ───────────────────────────────────────────
-    # BOSWaves: señal primaria = T3 cambia dirección
-    t3_cross_up   = _crossover(t3_arr, np.roll(t3_arr, 1))
-    t3_cross_down = _crossunder(t3_arr, np.roll(t3_arr, 1))
-
-    # KhanSaab: trigger = EMA9/21 crossover
-    ema_cross_up   = _crossover(ema9_arr, ema21_arr)
-    ema_cross_down = _crossunder(ema9_arr, ema21_arr)
-
-    # ── Últimos valores ───────────────────────────────────────────────
-    i = -1
-    t3_v  = t3_arr[i];   t3_p  = t3_arr[i-1]
-    atr   = float(atr_arr[i])
-    e9    = float(ema9_arr[i]);   e9p  = float(ema9_arr[i-1])
-    e21   = float(ema21_arr[i]);  e21p = float(ema21_arr[i-1])
-    rsi   = float(rsi_arr[i])
-    macd  = float(macd_arr[i]);   sig  = float(sig_arr[i])
-    adx   = float(adx_arr[i])
-    vm    = float(vol_ma[i]) if not np.isnan(vol_ma[i]) else 0.0
-    vwap  = float(raw_vwap[i])
-    price = float(c[i])
-    vol   = float(v[i])
-    open_ = float(o[i])
-
-    # Comprobamos NaN
-    if any(np.isnan(x) for x in [t3_v, t3_p, atr, e9, e21, adx]):
-        return Signal("NONE", price, 0, 0, 0, 0, 0, 0, 0, atr, "NaN in indicators")
-
-    # ── BOSWaves Score (dirección T3) ─────────────────────────────────
+    bw_t3_up   = _cross_up(t3_arr, np.roll(t3_arr, 1))
+    bw_t3_down = _cross_dn(t3_arr, np.roll(t3_arr, 1))
+    bw_long_recent  = any(bw_t3_up[-BW_WINDOW:])
+    bw_short_recent = any(bw_t3_down[-BW_WINDOW:])
     t3_bullish = t3_v > t3_p
     t3_bearish = t3_v < t3_p
 
-    # BOSWaves: señal en las últimas 3 velas (crossover reciente)
-    bw_long_recent  = any(t3_cross_up[-3:])
-    bw_short_recent = any(t3_cross_down[-3:])
+    price = float(c[-1])
+    # Bounce desde banda 3 (alta probabilidad de reversión)
+    bw_bounce_long  = float(l[-2]) <= band_l3 and price > band_l3 and t3_bullish
+    bw_bounce_short = float(h[-2]) >= band_u3 and price < band_u3 and t3_bearish
 
-    # EMA crossover reciente (últimas 3 velas)
-    ema_long_recent  = any(ema_cross_up[-3:])
-    ema_short_recent = any(ema_cross_down[-3:])
+    # ── KhanSaab ──────────────────────────────────────────────────────
+    ema9  = _ema(c, EMA_FAST)
+    ema21 = _ema(c, EMA_SLOW)
+    rsi_a = _rsi(c, RSI_LEN)
+    macd_a, sig_a = _macd(c)
+    _, _, adx_a = _dmi(h, l, c, ADX_LEN)
+    vol_ma = _sma(v, VOL_MA_LEN)
 
-    # ── KhanSaab: 7-condition Bull/Bear score ─────────────────────────
+    ema_cross_up = _cross_up(ema9, ema21)
+    ema_cross_dn = _cross_dn(ema9, ema21)
+
+    e9    = float(ema9[-1])
+    e21   = float(ema21[-1])
+    rsi   = float(rsi_a[-1])
+    macd  = float(macd_a[-1])
+    sig   = float(sig_a[-1])
+    adx   = float(adx_a[-1])
+    vm    = float(vol_ma[-1]) if not np.isnan(vol_ma[-1]) else 0.0
+    vwap  = float(raw_vwap[-1])
+    vol   = float(v[-1])
+    open_ = float(o[-1])
+
+    # Cross reciente O EMA alineada y separándose (> 0.1% de diferencia)
+    ema_long_recent  = (
+        any(ema_cross_up[-CROSS_WINDOW:]) or
+        (e9 > e21 and (e9 - e21) > abs(e21 * 0.001))
+    )
+    ema_short_recent = (
+        any(ema_cross_dn[-CROSS_WINDOW:]) or
+        (e9 < e21 and (e21 - e9) > abs(e21 * 0.001))
+    )
+
     bull_score = sum([
-        price > vwap,                            # Price/VWAP
-        rsi > 50,                                # RSI
-        macd > sig,                              # MACD
-        e9 > e21,                                # EMA alignment
-        adx > MIN_ADX and price > e9,            # ADX Power + price above EMA9
-        vol > vm and open_ < price,              # Volume + green candle
-        htf_rsi > 50,                            # Higher TF RSI (5m/1h)
+        price > vwap,
+        rsi > 50,
+        macd > sig,
+        e9 > e21,
+        adx > MIN_ADX and price > e9,
+        vol > vm and open_ < price,
+        htf_rsi > 50,
     ])
     bear_score = sum([
         price < vwap,
@@ -251,70 +287,110 @@ def compute_signal(candles: list[dict], htf_rsi: float = 50.0) -> Signal:
         macd < sig,
         e9 < e21,
         adx > MIN_ADX and price < e9,
-        vol > vm and open_ > price,              # red candle
+        vol > vm and open_ > price,
         htf_rsi < 50,
     ])
+    bull_pct = bull_score / 7 * 100
+    bear_pct = bear_score / 7 * 100
 
-    bull_pct = (bull_score / 7) * 100
-    bear_pct = (bear_score / 7) * 100
+    # ── DLO ───────────────────────────────────────────────────────────
+    dlo_arr = _compute_dlo(h, l, c)
+    dlo_val = float(dlo_arr[-1]) if not np.isnan(dlo_arr[-1]) else 0.0
+    dlo_strong_bull = dlo_val >  0.15
+    dlo_strong_bear = dlo_val < -0.15
+    dlo_bull        = dlo_val >  0.0
+    dlo_bear        = dlo_val <  0.0
 
-    # ── BOSWaves: banda 4 (no entrar si precio sobreextendido) ────────
-    band_l4 = t3_v - atr * BAND_M[3]
-    band_u4 = t3_v + atr * BAND_M[3]
+    # DLO reversión (señal de giro de ciclo)
+    if len(dlo_arr) >= 3:
+        dlo_rev_up = (dlo_arr[-1] > dlo_arr[-2]) and not (dlo_arr[-2] > dlo_arr[-3])
+        dlo_rev_dn = (dlo_arr[-1] < dlo_arr[-2]) and not (dlo_arr[-2] < dlo_arr[-3])
+    else:
+        dlo_rev_up = dlo_rev_dn = False
+
+    # NaN guard
+    if any(np.isnan(x) for x in [t3_v, t3_p, atr_v, e9, e21, adx]):
+        return Signal("NONE", price, 0, 0, 0, 0, 0, 0, 0, atr_v, "NaN")
+
+    # Sobreextensión
     not_over_bull = price > band_l4
     not_over_bear = price < band_u4
+    risk = atr_v * SL_ATR_MULT
 
-    # ── Riesgo (KhanSaab usa ATR × 1.5) ──────────────────────────────
-    risk = atr * SL_ATR_MULT
+    # ── Condiciones de entrada ─────────────────────────────────────────
+    # LONG
+    bw_l = bw_long_recent or bw_bounce_long or t3_bullish
+    kh_l = ema_long_recent and bull_score >= MIN_SCORE
 
-    # ── Condiciones de entrada (DUAL CONFIRMATION) ────────────────────
-    # LONG: BOSWaves T3 sube + KhanSaab EMA cross up + score + ADX
-    long_ok = (
-        (bw_long_recent or t3_bullish) and   # BOSWaves confirma
-        ema_long_recent and                   # KhanSaab trigger
-        bull_score >= MIN_SCORE and           # score mínimo
-        not_over_bull and                     # precio no sobreextendido
-        adx > MIN_ADX                         # tendencia fuerte
-    )
+    long_a = (bw_long_recent or bw_bounce_long) and kh_l and dlo_strong_bull and adx > MIN_ADX and not_over_bull
+    long_b = bw_l and kh_l and (not dlo_bear) and adx > MIN_ADX and not_over_bull and not long_a
 
-    # SHORT: BOSWaves T3 baja + KhanSaab EMA cross down + score + ADX
-    short_ok = (
-        (bw_short_recent or t3_bearish) and
-        ema_short_recent and
-        bear_score >= MIN_SCORE and
-        not_over_bear and
-        adx > MIN_ADX
-    )
+    # SHORT
+    bw_s = bw_short_recent or bw_bounce_short or t3_bearish
+    kh_s = ema_short_recent and bear_score >= MIN_SCORE
 
-    if long_ok:
-        sl  = price - risk
-        tp1 = price + risk * 1
-        tp2 = price + risk * 2
-        tp3 = price + risk * 3
-        tp4 = price + risk * 4
-        tp5 = price + risk * 5
-        reason = (f"BOSWaves T3↑ + EMA cross UP | "
-                  f"Bull {bull_pct:.0f}% ({bull_score}/7) | ADX {adx:.1f} | "
-                  f"HTF RSI {htf_rsi:.1f}")
+    short_a = (bw_short_recent or bw_bounce_short) and kh_s and dlo_strong_bear and adx > MIN_ADX and not_over_bear
+    short_b = bw_s and kh_s and (not dlo_bull) and adx > MIN_ADX and not_over_bear and not short_a
+
+    def _long_score():
+        s = bull_pct
+        if dlo_strong_bull: s += 20
+        elif dlo_bull:       s += 10
+        if bw_bounce_long:   s += 15
+        if bw_long_recent:   s += 10
+        if dlo_rev_up:       s += 8
+        if adx > 35:         s += 10
+        return min(s, 100.0)
+
+    def _short_score():
+        s = bear_pct
+        if dlo_strong_bear:  s += 20
+        elif dlo_bear:        s += 10
+        if bw_bounce_short:   s += 15
+        if bw_short_recent:   s += 10
+        if dlo_rev_dn:        s += 8
+        if adx > 35:          s += 10
+        return min(s, 100.0)
+
+    if long_a or long_b:
+        tier  = "A" if long_a else "B"
+        score = _long_score() * (1.0 if long_a else 0.85)
+        sl, tp1, tp2, tp3, tp4, tp5 = (
+            price - risk,
+            price + risk, price + risk*2, price + risk*3,
+            price + risk*4, price + risk*5,
+        )
+        bw_lbl = "Bounce" if bw_bounce_long else ("T3-Cross" if bw_long_recent else "T3↑")
+        reason = (
+            f"[{tier}] BW-{bw_lbl} + EMA-cross | "
+            f"Bull {bull_pct:.0f}%({bull_score}/7) | "
+            f"DLO={dlo_val:+.2f} | ADX {adx:.1f} | HTF {htf_rsi:.0f}"
+        )
         return Signal("LONG", price, sl, tp1, tp2, tp3, tp4, tp5,
-                      bull_pct, atr, reason, adx, bull_pct, bear_pct)
+                      score, atr_v, reason, adx, bull_pct, bear_pct, dlo_val, tier)
 
-    if short_ok:
-        sl  = price + risk
-        tp1 = price - risk * 1
-        tp2 = price - risk * 2
-        tp3 = price - risk * 3
-        tp4 = price - risk * 4
-        tp5 = price - risk * 5
-        reason = (f"BOSWaves T3↓ + EMA cross DOWN | "
-                  f"Bear {bear_pct:.0f}% ({bear_score}/7) | ADX {adx:.1f} | "
-                  f"HTF RSI {htf_rsi:.1f}")
+    if short_a or short_b:
+        tier  = "A" if short_a else "B"
+        score = _short_score() * (1.0 if short_a else 0.85)
+        sl, tp1, tp2, tp3, tp4, tp5 = (
+            price + risk,
+            price - risk, price - risk*2, price - risk*3,
+            price - risk*4, price - risk*5,
+        )
+        bw_lbl = "Bounce" if bw_bounce_short else ("T3-Cross" if bw_short_recent else "T3↓")
+        reason = (
+            f"[{tier}] BW-{bw_lbl} + EMA-cross | "
+            f"Bear {bear_pct:.0f}%({bear_score}/7) | "
+            f"DLO={dlo_val:+.2f} | ADX {adx:.1f} | HTF {htf_rsi:.0f}"
+        )
         return Signal("SHORT", price, sl, tp1, tp2, tp3, tp4, tp5,
-                      bear_pct, atr, reason, adx, bull_pct, bear_pct)
+                      score, atr_v, reason, adx, bull_pct, bear_pct, dlo_val, tier)
 
-    dominant = max(bull_pct, bear_pct)
     return Signal(
-        "NONE", price, 0, 0, 0, 0, 0, 0, dominant, atr,
-        f"No trigger | Bull {bull_pct:.0f}% Bear {bear_pct:.0f}% | ADX {adx:.1f}",
-        adx, bull_pct, bear_pct,
+        "NONE", price, 0, 0, 0, 0, 0, 0,
+        max(bull_pct, bear_pct), atr_v,
+        f"No signal | Bull {bull_pct:.0f}% Bear {bear_pct:.0f}% | "
+        f"DLO={dlo_val:+.2f} | ADX {adx:.1f} | "
+        f"EMA↑={ema_long_recent} EMA↓={ema_short_recent}",
+        adx, bull_pct, bear_pct, dlo_val, "",
     )

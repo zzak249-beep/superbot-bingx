@@ -1,13 +1,12 @@
 """
-SuperBot Main Orchestrator – v2.0
-Loop: scan TODOS los pares → filtrar → abrir trades → gestionar posiciones → repetir
+SuperBot v3.0 – Triple Confirmation Engine
+Loop: scan → filtrar → abrir trades → gestionar TP1/TP2/TP3 → repetir
 
-Mejoras:
-  - Variables de entorno defensivas (no crashea sin ellas)
-  - Sincronización de posiciones al arranque (anti-hedge bug)
-  - Gestión de TP1/TP2/TP3
-  - LIMIT entry para comisiones maker (0.02%)
-  - Kill switch diario
+Cambios vs v2:
+  - Gestión de TP1..TP5 (strategy v3 genera 5 TPs)
+  - Logs mejorados con DLO, Tier y score
+  - Sincronización al arranque anti-hedge
+  - LIMIT entry para comisiones maker
 """
 import logging, os, time, json
 from datetime import datetime, timezone
@@ -18,7 +17,6 @@ from scanner import Scanner
 from risk_manager import RiskManager, TradeParams
 from strategy import Signal
 
-# ── Logging ───────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -26,16 +24,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("BOT")
 
-# ── Variables de entorno (defensivo) ─────────────────────────────────
 API_KEY    = os.environ.get("BINGX_API_KEY", "").strip()
 SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "").strip()
-
 if not API_KEY or not SECRET_KEY:
     raise RuntimeError(
         "Variables de entorno faltantes.\n"
         "Añade en Railway -> Variables:\n"
-        "  BINGX_API_KEY\n"
-        "  BINGX_SECRET_KEY"
+        "  BINGX_API_KEY\n  BINGX_SECRET_KEY"
     )
 
 SCAN_PERIOD     = int(os.environ.get("SCAN_PERIOD_SECONDS", "900"))
@@ -43,9 +38,8 @@ DRY_RUN         = os.environ.get("DRY_RUN", "false").lower() == "true"
 LIMIT_ENTRY     = os.environ.get("LIMIT_ENTRY", "true").lower() == "true"
 SLIPPAGE_OFFSET = 0.0003
 
-
-# ── Estado persistente ────────────────────────────────────────────────
 STATE_FILE = "/tmp/bot_state.json"
+
 
 def load_state() -> dict:
     try:
@@ -53,6 +47,7 @@ def load_state() -> dict:
             return json.load(f)
     except Exception:
         return {"open_trades": {}, "daily_date": "", "trade_log": []}
+
 
 def save_state(state: dict):
     with open(STATE_FILE, "w") as f:
@@ -68,20 +63,15 @@ class SuperBot:
         self._init_daily()
         self._sync_positions_from_exchange()
 
-    # ── Sincronización al arranque (anti-hedge bug) ───────────────────
     def _sync_positions_from_exchange(self):
         if DRY_RUN:
             return
         try:
             live = {p["symbol"]: p for p in self.client.get_positions()}
-
-            # Eliminar del estado lo que ya no existe en BingX
             for s in list(self.state["open_trades"]):
                 if s not in live:
-                    log.info(f"Sync: eliminando {s} del estado (cerrado en BingX)")
+                    log.info(f"Sync: eliminando {s} (cerrado en BingX)")
                     del self.state["open_trades"][s]
-
-            # Añadir posiciones reales que faltan en estado
             for sym, pos in live.items():
                 if sym not in self.state["open_trades"]:
                     amt   = float(pos.get("positionAmt", 0))
@@ -90,9 +80,9 @@ class SuperBot:
                     log.info(f"Sync: añadiendo {sym} {side} @ {entry}")
                     self.state["open_trades"][sym] = {
                         "direction": side, "entry": entry,
-                        "sl": 0, "tp1": 0, "tp2": 0, "tp3": 0,
+                        "sl": 0, "tp1": 0, "tp2": 0, "tp3": 0, "tp4": 0, "tp5": 0,
                         "qty": abs(amt), "qty_p": 3,
-                        "tp1_hit": False, "tp2_hit": False,
+                        "tp1_hit": False, "tp2_hit": False, "tp3_hit": False,
                         "opened_at": datetime.utcnow().isoformat(),
                         "synced": True,
                     }
@@ -101,7 +91,6 @@ class SuperBot:
         except Exception as e:
             log.error(f"Error sync: {e}")
 
-    # ── Reset diario ──────────────────────────────────────────────────
     def _init_daily(self):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self.state["daily_date"] != today:
@@ -109,7 +98,7 @@ class SuperBot:
             self.risk.reset_daily(balance)
             self.state["daily_date"] = today
             save_state(self.state)
-            log.info(f"Nuevo dia: {today} | Balance: {balance:.2f} USDT")
+            log.info(f"Nuevo día: {today} | Balance: {balance:.2f} USDT")
 
     def _get_precision(self, symbol: str) -> tuple[int, int]:
         info    = self.client.get_symbol_info(symbol)
@@ -117,7 +106,6 @@ class SuperBot:
         price_p = int(info.get("pricePrecision", 4))
         return qty_p, price_p
 
-    # ── Abrir trade ───────────────────────────────────────────────────
     def _open_trade(self, symbol: str, signal: Signal):
         if symbol in self.state["open_trades"]:
             return
@@ -137,18 +125,26 @@ class SuperBot:
         if not params:
             return
 
+        tier_tag = f"[Tier {signal.tier}] " if signal.tier else ""
+        dlo_tag  = f"DLO={signal.dlo_value:+.2f} " if hasattr(signal, "dlo_value") else ""
+
         if DRY_RUN:
             log.info(
-                f"[DRY RUN] {symbol} {params.direction} x{params.quantity} "
-                f"@ {params.entry_price} SL={params.sl_price} TP1={params.tp1_price}"
+                f"[DRY RUN] {tier_tag}{symbol} {params.direction} x{params.quantity} "
+                f"@ {params.entry_price} SL={params.sl_price} TP1={params.tp1_price} "
+                f"{dlo_tag}| {signal.reason}"
             )
             self.state["open_trades"][symbol] = {
                 "direction": params.direction, "entry": params.entry_price,
-                "sl": params.sl_price, "tp1": params.tp1_price,
-                "tp2": params.tp2_price, "tp3": params.tp3_price,
+                "sl": params.sl_price,
+                "tp1": params.tp1_price, "tp2": params.tp2_price,
+                "tp3": params.tp3_price,
+                "tp4": round(signal.tp4, price_p),
+                "tp5": round(signal.tp5, price_p),
                 "qty": params.quantity, "qty_p": qty_p,
-                "tp1_hit": False, "tp2_hit": False,
+                "tp1_hit": False, "tp2_hit": False, "tp3_hit": False,
                 "opened_at": datetime.utcnow().isoformat(),
+                "tier": signal.tier,
             }
             save_state(self.state)
             return
@@ -161,41 +157,46 @@ class SuperBot:
             pos_side = params.direction
 
             if LIMIT_ENTRY:
-                offset     = SLIPPAGE_OFFSET * params.entry_price
-                limit_px   = (params.entry_price - offset if side == "BUY"
-                              else params.entry_price + offset)
-                limit_px   = round(limit_px, price_p)
-                order_type = "LIMIT"
-                price_arg  = limit_px
+                offset    = SLIPPAGE_OFFSET * params.entry_price
+                limit_px  = (params.entry_price - offset if side == "BUY"
+                             else params.entry_price + offset)
+                limit_px  = round(limit_px, price_p)
+                result    = self.client.place_order(
+                    symbol, side, pos_side, "LIMIT", params.quantity,
+                    price=limit_px, stop_loss=params.sl_price,
+                )
+                price_used = limit_px
             else:
-                order_type = "MARKET"
-                price_arg  = None
+                result    = self.client.place_order(
+                    symbol, side, pos_side, "MARKET", params.quantity,
+                    stop_loss=params.sl_price,
+                )
+                price_used = "MARKET"
 
-            result   = self.client.place_order(
-                symbol, side, pos_side, order_type, params.quantity,
-                price=price_arg, stop_loss=params.sl_price,
-            )
             order_id = result.get("data", {}).get("orderId", "?")
             log.info(
-                f"Abierto {symbol} {params.direction} qty={params.quantity} "
-                f"@ {price_arg or 'MARKET'} SL={params.sl_price} orderId={order_id}"
+                f"{tier_tag}{symbol} {params.direction} qty={params.quantity} "
+                f"@ {price_used} SL={params.sl_price} {dlo_tag}orderId={order_id}"
             )
 
             self.state["open_trades"][symbol] = {
                 "direction": params.direction, "entry": params.entry_price,
-                "sl": params.sl_price, "tp1": params.tp1_price,
-                "tp2": params.tp2_price, "tp3": params.tp3_price,
+                "sl": params.sl_price,
+                "tp1": params.tp1_price, "tp2": params.tp2_price,
+                "tp3": params.tp3_price,
+                "tp4": round(signal.tp4, price_p),
+                "tp5": round(signal.tp5, price_p),
                 "qty": params.quantity, "qty_p": qty_p,
-                "tp1_hit": False, "tp2_hit": False,
+                "tp1_hit": False, "tp2_hit": False, "tp3_hit": False,
                 "order_id": order_id,
                 "opened_at": datetime.utcnow().isoformat(),
+                "tier": getattr(signal, "tier", ""),
             }
             save_state(self.state)
 
         except Exception as e:
             log.error(f"Error abriendo {symbol}: {e}")
 
-    # ── Gestionar posiciones ──────────────────────────────────────────
     def _manage_positions(self):
         try:
             positions = {p["symbol"]: p for p in self.client.get_positions()}
@@ -209,86 +210,97 @@ class SuperBot:
             tp1       = float(trade.get("tp1", 0))
             tp2       = float(trade.get("tp2", 0))
             tp3       = float(trade.get("tp3", 0))
+            tp4       = float(trade.get("tp4", 0))
+            tp5       = float(trade.get("tp5", 0))
             tp1_hit   = trade.get("tp1_hit", False)
             tp2_hit   = trade.get("tp2_hit", False)
+            tp3_hit   = trade.get("tp3_hit", False)
             qty_p     = int(trade.get("qty_p", 3))
             synced    = trade.get("synced", False)
 
-            # Posición cerrada externamente
             if not DRY_RUN and symbol not in positions:
-                log.info(f"Posicion cerrada externamente: {symbol}")
+                log.info(f"Posición cerrada externamente: {symbol}")
                 self.risk.record_pnl(0.0)
                 del self.state["open_trades"][symbol]
                 save_state(self.state)
                 continue
 
-            # Precio actual
             try:
                 ticker = self.client.get_ticker(symbol)
                 price  = float(ticker.get("lastPrice", trade["entry"]))
             except Exception:
                 continue
 
-            # Posiciones sincronizadas sin TPs: solo monitorear
             if synced and tp1 == 0:
                 continue
 
-            # TP1: 50% parcial
-            if not tp1_hit and tp1 > 0:
-                tp1_ok = (direction == "LONG" and price >= tp1) or \
-                         (direction == "SHORT" and price <= tp1)
-                if tp1_ok:
-                    pqty = self.risk.partial_close_qty(qty, qty_p)
-                    log.info(f"TP1 {symbol} | Cerrando {pqty}/{qty}")
-                    if not DRY_RUN:
-                        try:
-                            self.client.close_position(symbol, direction, pqty)
-                        except Exception as e:
-                            log.error(f"Error TP1 {symbol}: {e}")
-                    trade["tp1_hit"] = True
-                    trade["qty"]     = round(qty - pqty, qty_p)
-                    qty              = trade["qty"]
-                    save_state(self.state)
+            def _tp_reached(tp_level):
+                if tp_level == 0:
+                    return False
+                return (direction == "LONG" and price >= tp_level) or \
+                       (direction == "SHORT" and price <= tp_level)
 
-            # TP2: 50% del restante
-            if tp1_hit and not tp2_hit and tp2 > 0:
-                tp2_ok = (direction == "LONG" and price >= tp2) or \
-                         (direction == "SHORT" and price <= tp2)
-                if tp2_ok:
-                    pqty = self.risk.partial_close_qty(qty, qty_p)
-                    log.info(f"TP2 {symbol} | Cerrando {pqty}/{qty}")
-                    if not DRY_RUN:
-                        try:
-                            self.client.close_position(symbol, direction, pqty)
-                        except Exception as e:
-                            log.error(f"Error TP2 {symbol}: {e}")
-                    trade["tp2_hit"] = True
-                    trade["qty"]     = round(qty - pqty, qty_p)
-                    qty              = trade["qty"]
-                    save_state(self.state)
+            def _partial_close(label, pqty):
+                log.info(f"{label} {symbol} | Cerrando {pqty}/{qty}")
+                if not DRY_RUN:
+                    try:
+                        self.client.close_position(symbol, direction, pqty)
+                    except Exception as e:
+                        log.error(f"Error {label} {symbol}: {e}")
 
-            # TP3: cierre total
-            if tp2_hit and tp3 > 0:
-                tp3_ok = (direction == "LONG" and price >= tp3) or \
-                         (direction == "SHORT" and price <= tp3)
-                if tp3_ok:
-                    remaining = trade["qty"]
-                    log.info(f"TP3 {symbol} | Cerrando restante {remaining}")
-                    if not DRY_RUN:
-                        try:
-                            self.client.close_position(symbol, direction, remaining)
-                            entry_p = float(trade["entry"])
-                            pnl     = abs(price - entry_p) * remaining
-                            self.risk.record_pnl(pnl)
-                        except Exception as e:
-                            log.error(f"Error TP3 {symbol}: {e}")
-                    del self.state["open_trades"][symbol]
-                    save_state(self.state)
+            # TP1: 40% de la posición
+            if not tp1_hit and _tp_reached(tp1):
+                pqty = round(qty * 0.4, qty_p)
+                _partial_close("TP1", pqty)
+                trade["tp1_hit"] = True
+                trade["qty"]     = round(qty - pqty, qty_p)
+                qty              = trade["qty"]
+                save_state(self.state)
 
-    # ── Loop principal ────────────────────────────────────────────────
+            # TP2: 30% del restante
+            if tp1_hit and not tp2_hit and _tp_reached(tp2):
+                pqty = round(qty * 0.3, qty_p)
+                _partial_close("TP2", pqty)
+                trade["tp2_hit"] = True
+                trade["qty"]     = round(qty - pqty, qty_p)
+                qty              = trade["qty"]
+                save_state(self.state)
+
+            # TP3: 30% del restante
+            if tp2_hit and not tp3_hit and _tp_reached(tp3):
+                pqty = round(qty * 0.3, qty_p)
+                _partial_close("TP3", pqty)
+                trade["tp3_hit"] = True
+                trade["qty"]     = round(qty - pqty, qty_p)
+                qty              = trade["qty"]
+                save_state(self.state)
+
+            # TP4: 50% del restante
+            if tp3_hit and tp4 > 0 and _tp_reached(tp4):
+                pqty = round(qty * 0.5, qty_p)
+                _partial_close("TP4", pqty)
+                trade["qty"] = round(qty - pqty, qty_p)
+                qty          = trade["qty"]
+                save_state(self.state)
+
+            # TP5: cierre total
+            if tp3_hit and tp5 > 0 and _tp_reached(tp5):
+                remaining = trade["qty"]
+                log.info(f"TP5 {symbol} | Cerrando total {remaining}")
+                if not DRY_RUN:
+                    try:
+                        self.client.close_position(symbol, direction, remaining)
+                        entry_p = float(trade["entry"])
+                        pnl     = abs(price - entry_p) * remaining
+                        self.risk.record_pnl(pnl)
+                    except Exception as e:
+                        log.error(f"Error TP5 {symbol}: {e}")
+                del self.state["open_trades"][symbol]
+                save_state(self.state)
+
     def run(self):
         log.info(
-            f"SuperBot v2.0 | DRY_RUN={DRY_RUN} | "
+            f"SuperBot v3.0 | DRY_RUN={DRY_RUN} | "
             f"SCAN_PERIOD={SCAN_PERIOD}s | LIMIT_ENTRY={LIMIT_ENTRY}"
         )
         while True:
@@ -311,7 +323,7 @@ class SuperBot:
                             self._open_trade(result.symbol, result.signal)
                             opened += 1
                             time.sleep(0.5)
-                    log.info(f"Trades abiertos: {opened}")
+                    log.info(f"Trades abiertos este ciclo: {opened}")
                 else:
                     log.info(
                         f"Posiciones: {open_count} | Balance: {balance:.2f} | Sin capacidad"

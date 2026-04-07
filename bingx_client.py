@@ -1,23 +1,42 @@
 """
-BingX API Client - Perpetual Futures (Swap)
-Optimized for low fees using maker orders
+BingX API Client v3.0
+Fixes:
+  - HTTPAdapter con pool_connections=20 para evitar "Connection pool is full"
+  - get_balance() defensivo (múltiples shapes de respuesta)
+  - Retry automático en errores de red (3 intentos)
 """
 import hmac, hashlib, time, requests, json, os, logging
-
-log = logging.getLogger(__name__)
 from urllib.parse import urlencode
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from typing import Optional
 
+log = logging.getLogger(__name__)
+
 BASE_URL = "https://open-api.bingx.com"
+
 
 class BingXClient:
     def __init__(self, api_key: str, secret_key: str):
         self.api_key    = api_key
         self.secret_key = secret_key
         self.session    = requests.Session()
+
+        # Pool ampliado para evitar "Connection pool is full"
+        adapter = HTTPAdapter(
+            pool_connections=30,
+            pool_maxsize=30,
+            max_retries=Retry(
+                total=3,
+                backoff_factor=0.5,
+                status_forcelist=[429, 500, 502, 503, 504],
+            ),
+        )
+        self.session.mount("https://", adapter)
+        self.session.mount("http://",  adapter)
         self.session.headers.update({"X-BX-APIKEY": self.api_key})
 
-    # ── Auth ──────────────────────────────────────────────────────────────
+    # ── Auth ──────────────────────────────────────────────────────────
     def _sign(self, params: dict) -> str:
         payload = urlencode(sorted(params.items()))
         return hmac.new(
@@ -28,7 +47,7 @@ class BingXClient:
         params = params or {}
         params["timestamp"] = int(time.time() * 1000)
         params["signature"] = self._sign(params)
-        r = self.session.get(BASE_URL + path, params=params, timeout=10)
+        r = self.session.get(BASE_URL + path, params=params, timeout=12)
         r.raise_for_status()
         return r.json()
 
@@ -36,13 +55,12 @@ class BingXClient:
         params = params or {}
         params["timestamp"] = int(time.time() * 1000)
         params["signature"] = self._sign(params)
-        r = self.session.post(BASE_URL + path, params=params, timeout=10)
+        r = self.session.post(BASE_URL + path, params=params, timeout=12)
         r.raise_for_status()
         return r.json()
 
-    # ── Market Data ───────────────────────────────────────────────────────
+    # ── Market Data ───────────────────────────────────────────────────
     def get_all_symbols(self) -> list[str]:
-        """Return all active USDT perpetual symbols."""
         data = self._get("/openApi/swap/v2/quote/contracts")
         return [
             c["symbol"] for c in data.get("data", [])
@@ -50,23 +68,21 @@ class BingXClient:
         ]
 
     def get_klines(self, symbol: str, interval: str = "15m", limit: int = 200) -> list:
-        """OHLCV candles. interval: 1m 5m 15m 30m 1h 4h 1d"""
         data = self._get("/openApi/swap/v3/quote/klines", {
             "symbol": symbol, "interval": interval, "limit": limit
         })
         raw = data.get("data", [])
-        # [open_time, open, high, low, close, volume, close_time]
-        candles = []
-        for k in raw:
-            candles.append({
+        return [
+            {
                 "ts":     int(k[0]),
                 "open":   float(k[1]),
                 "high":   float(k[2]),
                 "low":    float(k[3]),
                 "close":  float(k[4]),
                 "volume": float(k[5]),
-            })
-        return candles
+            }
+            for k in raw
+        ]
 
     def get_ticker(self, symbol: str) -> dict:
         data = self._get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
@@ -76,13 +92,13 @@ class BingXClient:
         t = self.get_ticker(symbol)
         return float(t.get("quoteVolume", 0))
 
-    # ── Account ───────────────────────────────────────────────────────────
+    # ── Account ───────────────────────────────────────────────────────
     def get_balance(self) -> float:
-        """Available USDT balance. Handles multiple BingX response shapes."""
-        data = self._get("/openApi/swap/v2/user/balance")
+        """Available USDT balance. Maneja múltiples shapes de respuesta."""
+        data    = self._get("/openApi/swap/v2/user/balance")
         payload = data.get("data", {})
 
-        # Shape 1: {"data": {"balance": [{"asset": "USDT", ...}, ...]}}
+        # Shape 1: {"data": {"balance": [{"asset": "USDT", ...}]}}
         if isinstance(payload, dict):
             balance_list = payload.get("balance", [])
             if isinstance(balance_list, list):
@@ -90,22 +106,22 @@ class BingXClient:
                     if isinstance(a, dict) and a.get("asset") == "USDT":
                         return float(a.get("availableMargin", 0))
 
-            # Shape 2: {"data": {"asset": "USDT", "availableMargin": "123.45"}}
+            # Shape 2: {"data": {"asset": "USDT", ...}}
             if payload.get("asset") == "USDT":
                 return float(payload.get("availableMargin", 0))
 
-            # Shape 3: {"data": {"USDT": {"availableMargin": "123.45"}}}
+            # Shape 3: {"data": {"USDT": {...}}}
             usdt = payload.get("USDT")
             if isinstance(usdt, dict):
                 return float(usdt.get("availableMargin", 0))
 
-        # Shape 4: {"data": [{"asset": "USDT", ...}]}  (list at top level)
+        # Shape 4: {"data": [{"asset": "USDT", ...}]}
         if isinstance(payload, list):
             for a in payload:
                 if isinstance(a, dict) and a.get("asset") == "USDT":
                     return float(a.get("availableMargin", 0))
 
-        log.warning(f"get_balance: no USDT found in response. data={payload}")
+        log.warning(f"get_balance: USDT no encontrado. data={payload}")
         return 0.0
 
     def get_positions(self) -> list:
@@ -116,14 +132,20 @@ class BingXClient:
         data = self._get("/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
         return data.get("data", {}).get("orders", [])
 
-    # ── Trading ───────────────────────────────────────────────────────────
+    def get_symbol_info(self, symbol: str) -> dict:
+        data = self._get("/openApi/swap/v2/quote/contracts")
+        for c in data.get("data", []):
+            if c["symbol"] == symbol:
+                return c
+        return {}
+
+    # ── Trading ───────────────────────────────────────────────────────
     def set_leverage(self, symbol: str, leverage: int, side: str = "LONG") -> dict:
         return self._post("/openApi/swap/v2/trade/leverage", {
             "symbol": symbol, "side": side, "leverage": leverage
         })
 
     def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED") -> dict:
-        """ISOLATED or CROSSED"""
         return self._post("/openApi/swap/v2/trade/marginType", {
             "symbol": symbol, "marginType": margin_type
         })
@@ -131,9 +153,9 @@ class BingXClient:
     def place_order(
         self,
         symbol: str,
-        side: str,         # BUY or SELL
-        position_side: str, # LONG or SHORT
-        order_type: str,   # LIMIT or MARKET
+        side: str,
+        position_side: str,
+        order_type: str,
         quantity: float,
         price: float = None,
         stop_loss: float = None,
@@ -148,12 +170,18 @@ class BingXClient:
             "quantity":     quantity,
         }
         if order_type == "LIMIT" and price:
-            params["price"]    = price
-            params["timeInForce"] = "GTC"  # Maker = lower fees
+            params["price"]       = price
+            params["timeInForce"] = "GTC"
         if stop_loss:
-            params["stopLoss"]   = json.dumps({"type": "STOP_MARKET", "stopPrice": stop_loss, "workingType": "MARK_PRICE"})
+            params["stopLoss"]   = json.dumps({
+                "type": "STOP_MARKET", "stopPrice": stop_loss,
+                "workingType": "MARK_PRICE"
+            })
         if take_profit:
-            params["takeProfit"] = json.dumps({"type": "TAKE_PROFIT_MARKET", "stopPrice": take_profit, "workingType": "MARK_PRICE"})
+            params["takeProfit"] = json.dumps({
+                "type": "TAKE_PROFIT_MARKET", "stopPrice": take_profit,
+                "workingType": "MARK_PRICE"
+            })
         if reduce_only:
             params["reduceOnly"] = "true"
         return self._post("/openApi/swap/v2/trade/order", params)
@@ -166,10 +194,3 @@ class BingXClient:
         return self.place_order(
             symbol, side, position_side, "MARKET", quantity, reduce_only=True
         )
-
-    def get_symbol_info(self, symbol: str) -> dict:
-        data = self._get("/openApi/swap/v2/quote/contracts")
-        for c in data.get("data", []):
-            if c["symbol"] == symbol:
-                return c
-        return {}
