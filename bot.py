@@ -15,7 +15,8 @@ from typing import Optional
 from bingx_client import BingXClient
 from scanner import Scanner
 from risk_manager import RiskManager, TradeParams
-from strategy import Signal
+from strategy import *
+   print(f"[DEBUG] Strategy version loaded successfully")
 
 logging.basicConfig(
     level=logging.INFO,
