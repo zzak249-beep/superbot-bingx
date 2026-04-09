@@ -94,31 +94,37 @@ class BingXClient:
 
     # ── Account ───────────────────────────────────────────────────────
     def get_balance(self) -> float:
-        """Available USDT balance. Maneja múltiples shapes de respuesta."""
+        """Available USDT balance. Maneja múltiples shapes de respuesta BingX."""
         data    = self._get("/openApi/swap/v2/user/balance")
         payload = data.get("data", {})
 
         if isinstance(payload, dict):
-            # Shape A (visto en producción):
-            # {"data": {"userId":..., "asset":"USDT", "balance":"0.019",
-            #           "equity":"0.019", "availableMargin":"0.019", ...}}
+            inner = payload.get("balance", payload)
+
+            # Shape REAL producción:
+            # {"data": {"balance": {"userId":..., "asset":"USDT", "availableMargin":"0.019"}}}
+            if isinstance(inner, dict) and inner.get("asset") == "USDT":
+                val = inner.get("availableMargin", inner.get("balance", 0))
+                return float(val)
+
+            # Shape lista:
+            # {"data": {"balance": [{"asset":"USDT", "availableMargin":"0.019"}]}}
+            if isinstance(inner, list):
+                for a in inner:
+                    if isinstance(a, dict) and a.get("asset") == "USDT":
+                        return float(a.get("availableMargin", 0))
+
+            # Shape plano: {"data": {"asset":"USDT", "availableMargin":"0.019"}}
             if payload.get("asset") == "USDT":
                 val = payload.get("availableMargin", payload.get("balance", 0))
                 return float(val)
 
-            # Shape B: {"data": {"balance": [{"asset":"USDT", ...}]}}
-            balance_list = payload.get("balance", [])
-            if isinstance(balance_list, list):
-                for a in balance_list:
-                    if isinstance(a, dict) and a.get("asset") == "USDT":
-                        return float(a.get("availableMargin", 0))
-
-            # Shape C: {"data": {"USDT": {"availableMargin": ...}}}
+            # Shape {"data": {"USDT": {"availableMargin": ...}}}
             usdt = payload.get("USDT")
             if isinstance(usdt, dict):
                 return float(usdt.get("availableMargin", 0))
 
-        # Shape D: {"data": [{"asset": "USDT", ...}]}
+        # Shape {"data": [{"asset": "USDT", ...}]}
         if isinstance(payload, list):
             for a in payload:
                 if isinstance(a, dict) and a.get("asset") == "USDT":
