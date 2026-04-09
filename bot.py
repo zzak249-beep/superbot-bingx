@@ -1,11 +1,11 @@
 """
-SuperBot v3.0 – Triple Confirmation Engine
-Loop: scan → filtrar → abrir trades → gestionar TP1/TP2/TP3 → repetir
+SuperBot v4.0 – Professional Grade Engine
+Loop: scan → filtrar → abrir trades → gestionar TP1/TP2/TP3/TP4/TP5 → repetir
 
-Cambios vs v2:
-  - Gestión de TP1..TP5 (strategy v3 genera 5 TPs)
-  - Logs mejorados con DLO, Tier y score
-  - Sincronización al arranque anti-hedge
+Cambios vs v3:
+  - Strategy v4.0: MFI + ZLSMA + Turtle Channels
+  - Tier S / A / B jerarquía mejorada
+  - Logs con MFI, ZLSMA, Tier y score
   - LIMIT entry para comisiones maker
 """
 import logging, os, time, json
@@ -300,7 +300,7 @@ class SuperBot:
 
     def run(self):
         log.info(
-            f"SuperBot v3.0 | DRY_RUN={DRY_RUN} | "
+            f"SuperBot v4.0 | DRY_RUN={DRY_RUN} | "
             f"SCAN_PERIOD={SCAN_PERIOD}s | LIMIT_ENTRY={LIMIT_ENTRY}"
         )
         while True:
