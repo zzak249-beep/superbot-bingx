@@ -1,5 +1,5 @@
 """
-Scanner v3.0 – Escanea todos los pares USDT perpetuales de BingX.
+Scanner v4.0 – Escanea todos los pares USDT perpetuales de BingX.
 Fixes:
   - Connection pool: SCAN_THREADS reducido a 10 (era 20), pool size aumentado
   - HTF: ahora solicita 500 velas (DLO necesita DLO_MEAN_LB=200 + margen)
@@ -131,7 +131,7 @@ class Scanner:
             return None
 
     def scan(self) -> list[ScanResult]:
-        log.info("🔍 Iniciando escaneo completo del mercado (v3.0)...")
+        log.info("🔍 Iniciando escaneo completo del mercado (v4.0)...")
 
         try:
             all_symbols = self.client.get_all_symbols()
