@@ -1,813 +1,569 @@
 """
-SuperBot v3.1 — Triple Confirmation Engine + Bear-Aware
-════════════════════════════════════════════════════════
-
-FIXES v3.1 vs v3.0:
-  1. Balance parsing fix — USDT no encontrado → parseo robusto
-  2. Market regime check — pausa en bajista, añade SHORTs opcionalmente
-  3. Scanner más flexible — reduce exigencias en mercado neutral
-  4. Anti-churn — mismo símbolo bloqueado 4h tras SL, 24h si repetido
-  5. BTC 4h filter — no abrir LONGs si BTC cae >2% en 4h
-  6. Breadth guard — si <40% coins alcistas, reducir tamaño o pausar
-  7. Better sync — detecta posiciones cerradas por SL del exchange
-  8. Retry logic mejorado para órdenes
-  9. Daily stats en Telegram
- 10. Crash guard — pausa automática si BTC cae >3% en 1 ciclo
+Strategy v4.0 – Professional Grade Engine
+Integra:
+  1. BOSWaves + KhanSaab + DLO (existentes)
+  2. MFI (Money Flow Index) → filtro de volumen real
+  3. Turtle Trade Channels → detección de breakouts
+  4. Zero Lag SMA → filtro de tendencia sin lag
+  
+Jerarquía mejorada:
+  Tier S: todos los indicadores alineados   → máxima confianza
+  Tier A: BOSWaves + KhanSaab + MFI + ZLSMA → muy bueno
+  Tier B: 2+ confirmaciones + Turtle         → aceptable
+  Tier C: solo 1-2 confirmaciones            → SKIP
 """
-import logging, os, time, json, requests, hmac, hashlib
-from datetime import datetime, timezone, timedelta
-from collections import defaultdict
-from typing import Optional
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from typing import Literal
 
-from bingx_client import BingXClient
-from scanner import Scanner
-from risk_manager import RiskManager, TradeParams
-from strategy import Signal
+# ─────────────────────────────────────────────────────────────────────
+#  Parámetros base (heredados)
+# ─────────────────────────────────────────────────────────────────────
+T3_LEN        = 28
+T3_FACTOR     = 0.7
+BAND_M        = [0.5, 1.0, 1.5, 2.2]
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("BOT")
+EMA_FAST      = 9
+EMA_SLOW      = 21
+ATR_LEN       = 14
+RSI_LEN       = 14
+MACD_FAST     = 12
+MACD_SLOW     = 26
+MACD_SIG      = 9
+ADX_LEN       = 14
+VOL_MA_LEN    = 20
+SL_ATR_MULT   = 1.5
 
-API_KEY    = os.environ.get("BINGX_API_KEY", "").strip()
-SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "").strip()
-if not API_KEY or not SECRET_KEY:
-    raise RuntimeError(
-        "Variables de entorno faltantes.\n"
-        "Añade en Railway -> Variables:\n"
-        "  BINGX_API_KEY\n  BINGX_SECRET_KEY"
+DLO_DI_LEN    = 14
+DLO_MEAN_LB   = 200
+DLO_SLOPE     = 0.18
+DLO_SMOOTH    = 3
+DLO_OSC_SCALE = 2.5
+DLO_OSC_SMOOTH = 7
+
+# ─────────────────────────────────────────────────────────────────────
+#  NUEVOS: MFI, Turtle Channels, Zero Lag SMA
+# ─────────────────────────────────────────────────────────────────────
+MFI_PERIOD       = 14         # período MFI estándar
+MFI_OVERSOLD     = 30         # oversold
+MFI_OVERBOUGHT   = 70         # overbought
+MFI_NEUTRAL_HIGH = 55         # si >55 en LONG es bueno
+MFI_NEUTRAL_LOW  = 45         # si <45 en SHORT es bueno
+
+TURTLE_LEN       = 20         # período para Turtle Channels
+TURTLE_ATR_MULT  = 2.0        # para los canales
+
+ZLSMA_LEN        = 50         # Zero Lag SMA length
+ZLSMA_LAG        = 0.3        # lag reduction factor (0.3 = muy responsivo)
+
+MIN_SCORE        = 5          # mínimo condiciones KhanSaab
+MIN_ADX          = 22
+CROSS_WINDOW     = 6
+BW_WINDOW        = 5
+
+
+@dataclass
+class Signal:
+    direction:  Literal["LONG", "SHORT", "NONE"]
+    entry:      float
+    sl:         float
+    tp1:        float
+    tp2:        float
+    tp3:        float
+    tp4:        float
+    tp5:        float
+    score:      float
+    atr:        float
+    reason:     str
+    adx:        float = 0.0
+    bull_pct:   float = 0.0
+    bear_pct:   float = 0.0
+    dlo_value:  float = 0.0
+    tier:       str   = ""
+    mfi_value:  float = 0.0
+    zlsma_conf: float = 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Matemáticas base
+# ─────────────────────────────────────────────────────────────────────
+def _ema(series: np.ndarray, period: int) -> np.ndarray:
+    out = np.full_like(series, np.nan, dtype=float)
+    k = 2.0 / (period + 1)
+    for i in range(len(series)):
+        if np.isnan(series[i]):
+            continue
+        if i == 0 or np.isnan(out[i - 1]):
+            out[i] = series[i]
+        else:
+            out[i] = series[i] * k + out[i - 1] * (1 - k)
+    return out
+
+
+def _sma(series: np.ndarray, period: int) -> np.ndarray:
+    return pd.Series(series).rolling(period, min_periods=1).mean().values
+
+
+def _t3(series: np.ndarray, length: int, factor: float) -> np.ndarray:
+    a  = factor
+    c1 = -(a ** 3)
+    c2 = 3 * a**2 + 3 * a**3
+    c3 = -6 * a**2 - 3 * a - 3 * a**3
+    c4 = 1 + 3 * a + a**3 + 3 * a**2
+    e1 = _ema(series, length)
+    e2 = _ema(e1, length)
+    e3 = _ema(e2, length)
+    e4 = _ema(e3, length)
+    e5 = _ema(e4, length)
+    e6 = _ema(e5, length)
+    return c1*e6 + c2*e5 + c3*e4 + c4*e3
+
+
+def _rsi(close: np.ndarray, period: int) -> np.ndarray:
+    delta = np.diff(close, prepend=np.nan)
+    gain  = np.where(delta > 0, delta, 0.0)
+    loss  = np.where(delta < 0, -delta, 0.0)
+    ag    = _ema(gain, period)
+    al    = _ema(loss, period)
+    rs    = np.where(al == 0, 100.0, ag / al)
+    return 100 - (100 / (1 + rs))
+
+
+def _atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
+    pc = np.roll(close, 1); pc[0] = close[0]
+    tr = np.maximum(high - low,
+         np.maximum(np.abs(high - pc), np.abs(low - pc)))
+    return _ema(tr, period)
+
+
+def _macd(close: np.ndarray):
+    fast = _ema(close, MACD_FAST)
+    slow = _ema(close, MACD_SLOW)
+    m    = fast - slow
+    sig  = _ema(m, MACD_SIG)
+    return m, sig
+
+
+def _dmi(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int):
+    """Devuelve (plus_di, minus_di, adx)."""
+    ph = np.roll(high, 1);  ph[0] = high[0]
+    pl = np.roll(low, 1);   pl[0] = low[0]
+    pc = np.roll(close, 1); pc[0] = close[0]
+    tr    = np.maximum(high - low, np.maximum(np.abs(high - pc), np.abs(low - pc)))
+    dm_p  = np.where((high - ph) > (pl - low), np.maximum(high - ph, 0), 0.0)
+    dm_m  = np.where((pl - low) > (high - ph), np.maximum(pl - low, 0), 0.0)
+    atr14 = _ema(tr, period)
+    safe  = np.where(atr14 == 0, 1e-10, atr14)
+    di_p  = 100 * _ema(dm_p, period) / safe
+    di_m  = 100 * _ema(dm_m, period) / safe
+    dsum  = np.where(di_p + di_m == 0, 1e-10, di_p + di_m)
+    dx    = 100 * np.abs(di_p - di_m) / dsum
+    return di_p, di_m, _ema(dx, period)
+
+
+def _session_vwap(hlc3: np.ndarray, volume: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
+    vwap = np.full_like(hlc3, np.nan)
+    cum_vol = cum_tpv = 0.0
+    prev_day = -1
+    for i in range(len(hlc3)):
+        day = int(timestamps[i] // 86_400_000)
+        if day != prev_day:
+            cum_vol = cum_tpv = 0.0
+            prev_day = day
+        cum_vol += volume[i]
+        cum_tpv += hlc3[i] * volume[i]
+        vwap[i] = cum_tpv / cum_vol if cum_vol > 0 else hlc3[i]
+    return vwap
+
+
+def _cross_up(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    c = np.zeros(len(a), dtype=bool)
+    c[1:] = (a[1:] > b[1:]) & (a[:-1] <= b[:-1])
+    return c
+
+
+def _cross_dn(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    c = np.zeros(len(a), dtype=bool)
+    c[1:] = (a[1:] < b[1:]) & (a[:-1] >= b[:-1])
+    return c
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  NUEVO: Money Flow Index (MFI)
+# ─────────────────────────────────────────────────────────────────────
+def _mfi(high: np.ndarray, low: np.ndarray, close: np.ndarray, 
+         volume: np.ndarray, period: int) -> np.ndarray:
+    """
+    Money Flow Index: oscilador de volumen
+    - > 70: overbought (posible reversión bajista)
+    - < 30: oversold (posible reversión alcista)
+    - alineado con dirección = confirmación fuerte
+    """
+    tp = (high + low + close) / 3.0  # Típical Price
+    mf = tp * volume  # Money Flow
+    
+    positive_mf = np.where(tp > np.roll(tp, 1), mf, 0)
+    negative_mf = np.where(tp < np.roll(tp, 1), mf, 0)
+    
+    positive_mf[0] = mf[0]  # primer valor
+    
+    pos_mf_sum = pd.Series(positive_mf).rolling(period, min_periods=1).sum().values
+    neg_mf_sum = pd.Series(negative_mf).rolling(period, min_periods=1).sum().values
+    
+    mfr = np.where(neg_mf_sum == 0, 100.0, pos_mf_sum / neg_mf_sum)
+    mfi = 100.0 - (100.0 / (1.0 + mfr))
+    
+    return np.nan_to_num(mfi, nan=50.0)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  NUEVO: Zero Lag SMA (ZLSMA) - más responsivo que SMA
+# ─────────────────────────────────────────────────────────────────────
+def _zero_lag_sma(series: np.ndarray, period: int, lag: float = 0.3) -> np.ndarray:
+    """
+    Zero Lag SMA: elimina el retardo de SMA
+    Formula: ZLSMA = SMA + lag_factor * (SMA - SMA_delayed)
+    
+    lag = 0.3 → bastante responsivo
+    lag = 0.0 → es solo un SMA normal
+    """
+    sma1 = _sma(series, period)
+    sma2 = _sma(sma1, period)
+    zlsma = sma1 + lag * (sma1 - sma2)
+    return zlsma
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  NUEVO: Turtle Trade Channels (breakout detection)
+# ─────────────────────────────────────────────────────────────────────
+def _turtle_channels(high: np.ndarray, low: np.ndarray, 
+                     atr: np.ndarray, period: int, atr_mult: float):
+    """
+    Canales de Turtle Channels:
+    - High: highest(high, period) + ATR * mult
+    - Low:  lowest(low, period) - ATR * mult
+    
+    Si price > high → breakout alcista
+    Si price < low  → breakout bajista
+    """
+    rolling_high = pd.Series(high).rolling(period, min_periods=1).max().values
+    rolling_low  = pd.Series(low).rolling(period, min_periods=1).min().values
+    
+    ch_high = rolling_high + atr * atr_mult
+    ch_low  = rolling_low - atr * atr_mult
+    
+    return ch_high, ch_low
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  DLO (heredado)
+# ─────────────────────────────────────────────────────────────────────
+def _logistic_prob(series: np.ndarray, mean_lb: int, slope: float, smooth: int) -> np.ndarray:
+    mean     = _sma(series, mean_lb)
+    z        = np.clip((series - mean) * slope, -20, 20)
+    prob_raw = 1.0 / (1.0 + np.exp(-z))
+    return _ema(prob_raw, smooth)
+
+
+def _compute_dlo(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
+    di_p, di_m, adx = _dmi(high, low, close, DLO_DI_LEN)
+    prob_plus  = _logistic_prob(di_p, DLO_MEAN_LB, DLO_SLOPE, DLO_SMOOTH)
+    prob_minus = _logistic_prob(di_m, DLO_MEAN_LB, DLO_SLOPE, DLO_SMOOTH)
+    prob_adx   = _logistic_prob(adx,  DLO_MEAN_LB, DLO_SLOPE, DLO_SMOOTH)
+    net_dir        = prob_plus - prob_minus
+    strength_raw   = net_dir * prob_adx * DLO_OSC_SCALE
+    strength_bound = np.tanh(np.clip(strength_raw, -20, 20))
+    strength       = _ema(strength_bound, DLO_SMOOTH)
+    return _ema(strength, DLO_OSC_SMOOTH)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Función principal v4.0
+# ─────────────────────────────────────────────────────────────────────
+def compute_signal(candles: list[dict], htf_rsi: float = 50.0) -> Signal:
+    min_bars = max(T3_LEN * 6, DLO_MEAN_LB, MACD_SLOW + MACD_SIG, 
+                   VOL_MA_LEN, MFI_PERIOD, ZLSMA_LEN, TURTLE_LEN) + 30
+    if len(candles) < min_bars:
+        return Signal("NONE", 0, 0, 0, 0, 0, 0, 0, 0, 0, "Not enough bars",
+                     0, 0, 0, 0, "", 0, 0)
+
+    df   = pd.DataFrame(candles)
+    ts   = df["ts"].values.astype(float)
+    o    = df["open"].values.astype(float)
+    h    = df["high"].values.astype(float)
+    l    = df["low"].values.astype(float)
+    c    = df["close"].values.astype(float)
+    v    = df["volume"].values.astype(float)
+    hlc3 = (h + l + c) / 3.0
+
+    # ── Indicadores base (heredados) ───────────────────────────────────
+    raw_vwap = _session_vwap(hlc3, v, ts)
+    t3_arr   = _t3(raw_vwap, T3_LEN, T3_FACTOR)
+    atr_arr  = _atr(h, l, c, ATR_LEN)
+    atr_v    = float(atr_arr[-1])
+    t3_v     = float(t3_arr[-1])
+    t3_p     = float(t3_arr[-2])
+
+    band_l3  = t3_v - atr_v * BAND_M[2]
+    band_l4  = t3_v - atr_v * BAND_M[3]
+    band_u3  = t3_v + atr_v * BAND_M[2]
+    band_u4  = t3_v + atr_v * BAND_M[3]
+
+    bw_t3_up   = _cross_up(t3_arr, np.roll(t3_arr, 1))
+    bw_t3_down = _cross_dn(t3_arr, np.roll(t3_arr, 1))
+    bw_long_recent  = any(bw_t3_up[-BW_WINDOW:])
+    bw_short_recent = any(bw_t3_down[-BW_WINDOW:])
+    t3_bullish = t3_v > t3_p
+    t3_bearish = t3_v < t3_p
+
+    price = float(c[-1])
+    bw_bounce_long  = float(l[-2]) <= band_l3 and price > band_l3 and t3_bullish
+    bw_bounce_short = float(h[-2]) >= band_u3 and price < band_u3 and t3_bearish
+
+    # ── KhanSaab ──────────────────────────────────────────────────────
+    ema9  = _ema(c, EMA_FAST)
+    ema21 = _ema(c, EMA_SLOW)
+    rsi_a = _rsi(c, RSI_LEN)
+    macd_a, sig_a = _macd(c)
+    _, _, adx_a = _dmi(h, l, c, ADX_LEN)
+    vol_ma = _sma(v, VOL_MA_LEN)
+
+    ema_cross_up = _cross_up(ema9, ema21)
+    ema_cross_dn = _cross_dn(ema9, ema21)
+
+    e9    = float(ema9[-1])
+    e21   = float(ema21[-1])
+    rsi   = float(rsi_a[-1])
+    macd  = float(macd_a[-1])
+    sig   = float(sig_a[-1])
+    adx   = float(adx_a[-1])
+    vm    = float(vol_ma[-1]) if not np.isnan(vol_ma[-1]) else 0.0
+    vwap  = float(raw_vwap[-1])
+    vol   = float(v[-1])
+    open_ = float(o[-1])
+
+    ema_long_recent  = (
+        any(ema_cross_up[-CROSS_WINDOW:]) or
+        (e9 > e21 and (e9 - e21) > abs(e21 * 0.001))
+    )
+    ema_short_recent = (
+        any(ema_cross_dn[-CROSS_WINDOW:]) or
+        (e9 < e21 and (e21 - e9) > abs(e21 * 0.001))
     )
 
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "")
+    bull_score = sum([
+        price > vwap,
+        rsi > 50,
+        macd > sig,
+        e9 > e21,
+        adx > MIN_ADX and price > e9,
+        vol > vm and open_ < price,
+        htf_rsi > 50,
+    ])
+    bear_score = sum([
+        price < vwap,
+        rsi < 50,
+        macd < sig,
+        e9 < e21,
+        adx > MIN_ADX and price < e9,
+        vol > vm and open_ > price,
+        htf_rsi < 50,
+    ])
+    bull_pct = bull_score / 7 * 100
+    bear_pct = bear_score / 7 * 100
 
-SCAN_PERIOD     = int(os.environ.get("SCAN_PERIOD_SECONDS", "900"))
-DRY_RUN         = os.environ.get("DRY_RUN", "false").lower() == "true"
-LIMIT_ENTRY     = os.environ.get("LIMIT_ENTRY", "true").lower() == "true"
-SLIPPAGE_OFFSET = 0.0003
+    # ── DLO ────────────────────────────────────────────────────────────
+    dlo_arr = _compute_dlo(h, l, c)
+    dlo_val = float(dlo_arr[-1]) if not np.isnan(dlo_arr[-1]) else 0.0
+    dlo_strong_bull = dlo_val >  0.15
+    dlo_strong_bear = dlo_val < -0.15
+    dlo_bull        = dlo_val >  0.0
+    dlo_bear        = dlo_val <  0.0
 
-# v3.1: nuevos parámetros
-REGIME_CHECK         = os.environ.get("REGIME_CHECK", "true").lower() == "true"
-BTC_4H_CRASH_PCT     = float(os.environ.get("BTC_4H_CRASH_PCT", "3.0"))
-BTC_4H_CRASH_HOURS   = int(os.environ.get("BTC_4H_CRASH_HOURS", "2"))
-BREADTH_MIN          = float(os.environ.get("BREADTH_MIN", "0.40"))
-DAILY_LOSS_CAP_PCT   = float(os.environ.get("DAILY_LOSS_CAP_PCT", "10.0"))
-CD_SL_HOURS          = int(os.environ.get("CD_SL_HOURS", "4"))     # cooldown tras SL
-ALLOW_SHORTS         = os.environ.get("ALLOW_SHORTS", "false").lower() == "true"
-MAX_OPEN_TRADES      = int(os.environ.get("MAX_OPEN_TRADES", "3"))
+    # ── NUEVO: MFI (Money Flow Index) ──────────────────────────────────
+    mfi_arr = _mfi(h, l, c, v, MFI_PERIOD)
+    mfi_val = float(mfi_arr[-1])
+    
+    # Confirmaciones MFI
+    mfi_oversold  = mfi_val < MFI_OVERSOLD        # oversold → posible reversión alcista
+    mfi_overbought = mfi_val > MFI_OVERBOUGHT     # overbought → posible reversión bajista
+    mfi_long_confirm = mfi_val < MFI_NEUTRAL_HIGH # para LONG, queremos MFI bajo-medio
+    mfi_short_confirm = mfi_val > MFI_NEUTRAL_LOW # para SHORT, queremos MFI alto-medio
 
-STATE_FILE   = "/tmp/bot_state_v31.json"
-REGIME_FILE  = "/tmp/bot_regime_v31.json"
+    # ── NUEVO: Zero Lag SMA ────────────────────────────────────────────
+    zlsma_arr = _zero_lag_sma(c, ZLSMA_LEN, ZLSMA_LAG)
+    zlsma_v = float(zlsma_arr[-1])
+    zlsma_p = float(zlsma_arr[-2]) if len(zlsma_arr) > 1 else zlsma_v
+    
+    # Para LONG: precio > ZLSMA (uptrend)
+    zlsma_long_trend = price > zlsma_v
+    # Para SHORT: precio < ZLSMA (downtrend)
+    zlsma_short_trend = price < zlsma_v
+    
+    # Fortaleza de la confirmación ZLSMA (% distancia)
+    zlsma_long_strength = (price - zlsma_v) / max(zlsma_v, 0.0001) * 100
+    zlsma_short_strength = (zlsma_v - price) / max(zlsma_v, 0.0001) * 100
+    zlsma_conf = zlsma_long_strength if zlsma_long_trend else zlsma_short_strength
 
-# Coins para breadth check
-BREADTH_COINS = [
-    'BTC-USDT','ETH-USDT','BNB-USDT','SOL-USDT','XRP-USDT',
-    'ADA-USDT','AVAX-USDT','DOGE-USDT','LINK-USDT','NEAR-USDT',
-]
+    # ── NUEVO: Turtle Channels (Breakout detection) ─────────────────────
+    ch_high, ch_low = _turtle_channels(h, l, atr_arr, TURTLE_LEN, TURTLE_ATR_MULT)
+    ch_high_v = float(ch_high[-1])
+    ch_low_v = float(ch_low[-1])
+    
+    turtle_breakout_long = price > ch_high_v   # precio salió por arriba del canal
+    turtle_breakout_short = price < ch_low_v   # precio salió por abajo del canal
+    
+    # ──────────────────────────────────────────────────────────────────────
+    #  DLO reversión (heredado)
+    # ──────────────────────────────────────────────────────────────────────
+    if len(dlo_arr) >= 3:
+        dlo_rev_up = (dlo_arr[-1] > dlo_arr[-2]) and not (dlo_arr[-2] > dlo_arr[-3])
+        dlo_rev_dn = (dlo_arr[-1] < dlo_arr[-2]) and not (dlo_arr[-2] < dlo_arr[-3])
+    else:
+        dlo_rev_up = dlo_rev_dn = False
 
+    # NaN guard
+    if any(np.isnan(x) for x in [t3_v, t3_p, atr_v, e9, e21, adx]):
+        return Signal("NONE", price, 0, 0, 0, 0, 0, 0, 0, atr_v, "NaN",
+                     adx, bull_pct, bear_pct, dlo_val, "", mfi_val, zlsma_conf)
 
-# ============================================================================
-# HELPERS
-# ============================================================================
+    not_over_bull = price > band_l4
+    not_over_bear = price < band_u4
+    risk = atr_v * SL_ATR_MULT
 
-def _tg(msg: str):
-    """Envía mensaje a Telegram."""
-    try:
-        if TG_TOKEN and TG_CHAT:
-            requests.post(
-                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                json={'chat_id': TG_CHAT, 'text': msg, 'parse_mode': 'HTML'},
-                timeout=6
-            )
-    except: pass
+    # ──────────────────────────────────────────────────────────────────────
+    #  Nuevas condiciones de entrada con v4.0
+    # ──────────────────────────────────────────────────────────────────────
+    
+    # BOSWaves base
+    bw_l = bw_long_recent or bw_bounce_long or t3_bullish
+    bw_s = bw_short_recent or bw_bounce_short or t3_bearish
+    
+    # KhanSaab base
+    kh_l = ema_long_recent and bull_score >= MIN_SCORE
+    kh_s = ema_short_recent and bear_score >= MIN_SCORE
+    
+    # LONG condiciones
+    # Tier S: BOSWaves + KhanSaab + MFI + ZLSMA + Turtle + DLO fuerte
+    long_s = (
+        bw_l and kh_l and mfi_long_confirm and zlsma_long_trend and 
+        turtle_breakout_long and dlo_strong_bull and adx > MIN_ADX and not_over_bull
+    )
+    
+    # Tier A: BOSWaves + KhanSaab + MFI + ZLSMA + DLO (sin turtle requerido)
+    long_a = (
+        (bw_long_recent or bw_bounce_long) and kh_l and mfi_long_confirm and 
+        zlsma_long_trend and (not dlo_bear) and adx > MIN_ADX and not_over_bull and not long_s
+    )
+    
+    # Tier B: BOSWaves + KhanSaab + ZLSMA + Turtle
+    long_b = (
+        bw_l and kh_l and zlsma_long_trend and turtle_breakout_long and
+        adx > MIN_ADX and not_over_bull and not long_s and not long_a
+    )
+    
+    # SHORT condiciones
+    # Tier S
+    short_s = (
+        bw_s and kh_s and mfi_short_confirm and zlsma_short_trend and 
+        turtle_breakout_short and dlo_strong_bear and adx > MIN_ADX and not_over_bear
+    )
+    
+    # Tier A
+    short_a = (
+        (bw_short_recent or bw_bounce_short) and kh_s and mfi_short_confirm and 
+        zlsma_short_trend and (not dlo_bull) and adx > MIN_ADX and not_over_bear and not short_s
+    )
+    
+    # Tier B
+    short_b = (
+        bw_s and kh_s and zlsma_short_trend and turtle_breakout_short and
+        adx > MIN_ADX and not_over_bear and not short_s and not short_a
+    )
 
+    def _long_score():
+        s = bull_pct
+        if dlo_strong_bull: s += 25
+        elif dlo_bull:       s += 12
+        if bw_bounce_long:   s += 15
+        if bw_long_recent:   s += 10
+        if mfi_long_confirm: s += 15  # MFI ayuda
+        if zlsma_long_trend: s += 15  # ZLSMA ayuda
+        if turtle_breakout_long: s += 12  # Turtle breakout
+        if dlo_rev_up:       s += 8
+        if adx > 35:         s += 10
+        return min(s, 100.0)
 
-def _safe_float(val, default=0.0) -> float:
-    """Parseo robusto de floats (fix v3.1 para balance USDT)."""
-    if val is None: return default
-    if isinstance(val, (int, float)): return float(val)
-    if isinstance(val, dict):
-        # Buscar en claves conocidas
-        for k in ('equity', 'balance', 'availableMargin', 'amount', 'totalWalletBalance'):
-            if k in val:
-                v = _safe_float(val[k], 0)
-                if v > 0: return v
-        return default
-    try: return float(str(val).replace(',', '.'))
-    except: return default
+    def _short_score():
+        s = bear_pct
+        if dlo_strong_bear:  s += 25
+        elif dlo_bear:       s += 12
+        if bw_bounce_short:  s += 15
+        if bw_short_recent:  s += 10
+        if mfi_short_confirm: s += 15
+        if zlsma_short_trend: s += 15
+        if turtle_breakout_short: s += 12
+        if dlo_rev_dn:       s += 8
+        if adx > 35:         s += 10
+        return min(s, 100.0)
 
-
-def load_state() -> dict:
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return {
-            "open_trades": {}, "daily_date": "", "trade_log": [],
-            "daily_pnl": 0.0, "total_trades": 0, "wins": 0, "losses": 0,
-            "cooldowns": {},
-        }
-
-
-def save_state(state: dict):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2, default=str)
-
-
-# ============================================================================
-# MARKET REGIME DETECTOR v3.1
-# ============================================================================
-
-class RegimeDetector:
-    """Detecta el régimen de mercado (bull/neutral/caution/bear)."""
-
-    def __init__(self, client: 'BingXClient'):
-        self.client   = client
-        self.regime   = 'neutral'
-        self.btc_1h   = 0.0
-        self.btc_4h   = 0.0
-        self.breadth  = 0.5
-        self._pause_until: Optional[datetime] = None
-        self._last_update = datetime.utcnow() - timedelta(hours=1)
-
-    def _get_klines(self, symbol: str, interval: str, limit: int):
-        """Obtiene velas del exchange."""
-        try:
-            return self.client.get_klines(symbol, interval, limit)
-        except Exception as e:
-            log.warning(f"Klines {symbol} {interval}: {e}")
-            return []
-
-    def _ema(self, prices, n):
-        if len(prices) < n: return prices[-1] if prices else 0
-        k = 2 / (n + 1)
-        e = prices[0]
-        for p in prices[1:]: e = p * k + e * (1 - k)
-        return e
-
-    def update(self):
-        """Actualiza el régimen. Llamar cada 5 minutos."""
-        if (datetime.utcnow() - self._last_update).total_seconds() < 250:
-            return  # No actualizar demasiado frecuente
-
-        self._last_update = datetime.utcnow()
-
-        try:
-            # 1. BTC 1h y 4h
-            c1h = self._get_klines('BTC-USDT', '1h', 5)
-            c4h = self._get_klines('BTC-USDT', '4h', 10)
-
-            if c1h and len(c1h) >= 2:
-                self.btc_1h = (c1h[-1] - c1h[-2]) / c1h[-2] * 100 if c1h[-2] > 0 else 0
-
-            if c4h and len(c4h) >= 4:
-                self.btc_4h = (c4h[-1] - c4h[-4]) / c4h[-4] * 100 if c4h[-4] > 0 else 0
-                # Crash guard
-                if self.btc_4h < -BTC_4H_CRASH_PCT:
-                    if not self._pause_until or datetime.utcnow() > self._pause_until:
-                        self._pause_until = datetime.utcnow() + timedelta(hours=BTC_4H_CRASH_HOURS)
-                        log.warning(f"🚨 BTC CRASH {self.btc_4h:.1f}% en 4h — pausa {BTC_4H_CRASH_HOURS}h")
-                        _tg(
-                            f"<b>🚨 CRASH GUARD ACTIVO</b>\n"
-                            f"BTC cayó {self.btc_4h:.1f}% en 4h\n"
-                            f"SuperBot pausado {BTC_4H_CRASH_HOURS}h"
-                        )
-
-            # 2. Breadth: % de coins top-10 sobre su EMA21
-            bulls = 0; total = 0
-            for coin in BREADTH_COINS[:8]:
-                try:
-                    c = self._get_klines(coin, '1h', 25)
-                    if c and len(c) >= 21:
-                        e21 = self._ema(c, 21)
-                        if c[-1] > e21: bulls += 1
-                        total += 1
-                except: pass
-            if total > 0:
-                self.breadth = bulls / total
-
-            # 3. Determinar régimen
-            btc_bear   = (self.btc_4h < -1.5) or (self.btc_1h < -1.0)
-            low_breath = self.breadth < BREADTH_MIN
-
-            old_regime = self.regime
-            if btc_bear and low_breath:
-                self.regime = 'bear'
-            elif btc_bear or low_breath:
-                self.regime = 'caution'
-            elif self.btc_4h > 1.5 and self.breadth > 0.60:
-                self.regime = 'bull'
-            else:
-                self.regime = 'neutral'
-
-            if self.regime != old_regime:
-                log.info(f"📊 RÉGIMEN: {old_regime} → {self.regime} | BTC4h:{self.btc_4h:+.1f}% breadth:{int(self.breadth*100)}%")
-                if self.regime == 'bear':
-                    _tg(
-                        f"<b>🐻 RÉGIMEN BAJISTA</b>\n"
-                        f"BTC 4h: {self.btc_4h:+.1f}% | Breadth: {int(self.breadth*100)}%\n"
-                        f"{'LONGs suspendidos' if not ALLOW_SHORTS else 'Solo SHORTs activos'}"
-                    )
-                elif self.regime == 'bull' and old_regime in ('bear', 'caution'):
-                    _tg(f"<b>🟢 RÉGIMEN ALCISTA</b>\nBTC 4h: {self.btc_4h:+.1f}% | Breadth: {int(self.breadth*100)}%")
-
-        except Exception as e:
-            log.error(f"RegimeDetector.update: {e}")
-
-    def can_open_long(self) -> tuple:
-        """Retorna (bool, reason)."""
-        if self._pause_until and datetime.utcnow() < self._pause_until:
-            remaining = int((self._pause_until - datetime.utcnow()).total_seconds() / 60)
-            return False, f"crash guard {remaining}min"
-        if self.regime == 'bear':
-            return False, "régimen bajista"
-        return True, "ok"
-
-    def can_open_short(self) -> tuple:
-        """Solo para mercados bajistas si ALLOW_SHORTS está activo."""
-        if not ALLOW_SHORTS:
-            return False, "SHORTs no habilitados"
-        if self.regime in ('bear', 'caution') and self.btc_4h < -1.0:
-            return True, "ok"
-        return False, "mercado no bajista suficiente"
-
-    def score_multiplier(self) -> float:
-        """Multiplicador de score según régimen."""
-        if self.regime == 'bull':   return 1.0
-        if self.regime == 'neutral': return 0.9
-        if self.regime == 'caution': return 0.7
-        if self.regime == 'bear':    return 0.3
-        return 1.0
-
-
-# ============================================================================
-# SUPERBOT v3.1
-# ============================================================================
-
-class SuperBot:
-    def __init__(self):
-        self.client  = BingXClient(API_KEY, SECRET_KEY)
-        self.scanner = Scanner(self.client)
-        self.risk    = RiskManager()
-        self.state   = load_state()
-        self.regime  = RegimeDetector(self.client)
-
-        # v3.1: estadísticas
-        self._equity_start  = 0.0
-        self._last_tg_report = datetime.utcnow() - timedelta(hours=3)
-
-        self._init_daily()
-        self._sync_positions_from_exchange()
-
-        log.info(
-            f"SuperBot v3.1 | DRY_RUN={DRY_RUN} | "
-            f"SCAN_PERIOD={SCAN_PERIOD}s | LIMIT_ENTRY={LIMIT_ENTRY} | "
-            f"CD_SL={CD_SL_HOURS}h | ALLOW_SHORTS={ALLOW_SHORTS}"
-        )
-
-    # ── balance ────────────────────────────────────────────────────────────
-
-    def _get_balance(self) -> float:
-        """Parseo robusto del balance (fix crítico v3.1)."""
-        try:
-            raw = self.client.get_balance()
-            # Si ya es un float, úsalo
-            if isinstance(raw, (int, float)):
-                return float(raw)
-            # Si es dict, buscar equity/balance
-            if isinstance(raw, dict):
-                b = _safe_float(raw)
-                if b > 0: return b
-                # Buscar en subclave 'balance'
-                if 'balance' in raw:
-                    inner = raw['balance']
-                    if isinstance(inner, dict):
-                        for k in ('equity', 'balance', 'availableMargin'):
-                            v = _safe_float(inner.get(k, 0))
-                            if v > 0: return v
-                    else:
-                        v = _safe_float(inner)
-                        if v > 0: return v
-            # Fallback: pedir directamente a la API
-            log.warning(f"get_balance: estructura inesperada ({type(raw)}), intentando API directa")
-            return self._get_balance_direct()
-        except Exception as e:
-            log.error(f"get_balance: {e}")
-            return self._get_balance_direct()
-
-    def _get_balance_direct(self) -> float:
-        """Consulta directa a la API de BingX para obtener el balance."""
-        try:
-            import time as _time
-            from urllib.parse import urlencode
-            p = {'timestamp': str(int(_time.time() * 1000))}
-            qs = urlencode(sorted(p.items()))
-            sig = hmac.new(SECRET_KEY.encode(), qs.encode(), hashlib.sha256).hexdigest()
-            url = f"https://open-api.bingx.com/openApi/swap/v2/user/balance?{qs}&signature={sig}"
-            hdr = {'X-BX-APIKEY': API_KEY, 'Content-Type': 'application/x-www-form-urlencoded'}
-            r = requests.get(url, headers=hdr, timeout=15).json()
-            if r.get('code') == 0:
-                b = r.get('data', {})
-                for k in ('equity', 'balance', 'availableMargin'):
-                    v = _safe_float(b.get(k, 0))
-                    if v > 0:
-                        log.info(f"Balance directo: ${v:.2f} USDT ({k})")
-                        return v
-        except Exception as e:
-            log.error(f"_get_balance_direct: {e}")
-        return 50.0  # Fallback seguro
-
-    # ── sync ───────────────────────────────────────────────────────────────
-
-    def _sync_positions_from_exchange(self):
-        if DRY_RUN:
-            return
-        try:
-            live = {p["symbol"]: p for p in self.client.get_positions()}
-
-            # Eliminar trades cerrados
-            for s in list(self.state["open_trades"]):
-                if s not in live:
-                    log.info(f"Sync: eliminando {s} (cerrado en BingX)")
-                    t = self.state["open_trades"].pop(s)
-                    entry = float(t.get("entry", 0))
-                    # No podemos saber el PnL exacto, registrar como cerrado
-                    self.state["trade_log"].append({
-                        "symbol": s, "closed_at": datetime.utcnow().isoformat(),
-                        "reason": "cerrado_externo", "entry": entry,
-                    })
-
-            # Añadir posiciones nuevas del exchange
-            for sym, pos in live.items():
-                if sym not in self.state["open_trades"]:
-                    amt   = float(pos.get("positionAmt", 0))
-                    side  = "LONG" if amt > 0 else "SHORT"
-                    entry = float(pos.get("avgPrice", 0))
-                    log.info(f"Sync: añadiendo {sym} {side} @ {entry}")
-                    self.state["open_trades"][sym] = {
-                        "direction": side, "entry": entry,
-                        "sl": 0, "tp1": 0, "tp2": 0, "tp3": 0, "tp4": 0, "tp5": 0,
-                        "qty": abs(amt), "qty_p": 3,
-                        "tp1_hit": False, "tp2_hit": False, "tp3_hit": False,
-                        "opened_at": datetime.utcnow().isoformat(),
-                        "synced": True,
-                    }
-
-            save_state(self.state)
-            log.info(f"Sync OK: {len(self.state['open_trades'])} posiciones activas")
-        except Exception as e:
-            log.error(f"Error sync: {e}")
-
-    # ── daily ──────────────────────────────────────────────────────────────
-
-    def _init_daily(self):
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if self.state["daily_date"] != today:
-            balance = self._get_balance()
-            self.risk.reset_daily(balance)
-            self._equity_start = balance
-            self.state["daily_date"]  = today
-            self.state["daily_pnl"]   = 0.0
-            save_state(self.state)
-            log.info(f"Nuevo día: {today} | Balance: {balance:.2f} USDT")
+    if long_s or long_a or long_b:
+        if long_s:
+            tier = "S"
+            score_mult = 1.15
+        elif long_a:
+            tier = "A"
+            score_mult = 1.0
         else:
-            self._equity_start = self._get_balance()
+            tier = "B"
+            score_mult = 0.85
+        
+        score = _long_score() * score_mult
+        sl, tp1, tp2, tp3, tp4, tp5 = (
+            price - risk,
+            price + risk, price + risk*2, price + risk*3,
+            price + risk*4, price + risk*5,
+        )
+        
+        bw_lbl = "Bounce" if bw_bounce_long else ("T3-Cross" if bw_long_recent else "T3↑")
+        reason = (
+            f"[{tier}] BW-{bw_lbl} + EMA-cross + MFI({mfi_val:.0f}) + ZLSMA + Turtle | "
+            f"Bull {bull_pct:.0f}% | DLO={dlo_val:+.2f} | ADX {adx:.1f}"
+        )
+        return Signal("LONG", price, sl, tp1, tp2, tp3, tp4, tp5,
+                     score, atr_v, reason, adx, bull_pct, bear_pct, dlo_val, tier, mfi_val, zlsma_conf)
 
-    # ── cooldowns v3.1 ────────────────────────────────────────────────────
-
-    def _cd_ok(self, symbol: str) -> tuple:
-        """Verifica si un símbolo puede ser operado."""
-        cds = self.state.get("cooldowns", {})
-        if symbol in cds:
-            resume_ts = cds[symbol].get("resume", 0)
-            reason    = cds[symbol].get("reason", "cd")
-            if time.time() < resume_ts:
-                remaining = int((resume_ts - time.time()) / 60)
-                return False, f"cooldown {remaining}min ({reason})"
-            else:
-                del cds[symbol]
-                save_state(self.state)
-        return True, "ok"
-
-    def _set_cd(self, symbol: str, reason: str = "TP"):
-        """Establece cooldown para un símbolo."""
-        cds = self.state.setdefault("cooldowns", {})
-        if reason == "SL":
-            hours = CD_SL_HOURS
+    if short_s or short_a or short_b:
+        if short_s:
+            tier = "S"
+            score_mult = 1.15
+        elif short_a:
+            tier = "A"
+            score_mult = 1.0
         else:
-            hours = 0.17  # ~10 minutos para TP
-        cds[symbol] = {
-            "reason": reason,
-            "resume": time.time() + hours * 3600,
-            "set_at": datetime.utcnow().isoformat(),
-        }
-        save_state(self.state)
-
-    # ── precision ──────────────────────────────────────────────────────────
-
-    def _get_precision(self, symbol: str) -> tuple:
-        try:
-            info    = self.client.get_symbol_info(symbol)
-            qty_p   = int(info.get("quantityPrecision", 3))
-            price_p = int(info.get("pricePrecision", 4))
-            return qty_p, price_p
-        except:
-            return 3, 4
-
-    # ── abrir trade ────────────────────────────────────────────────────────
-
-    def _open_trade(self, symbol: str, signal: Signal):
-        if symbol in self.state["open_trades"]:
-            return
-
-        # v3.1: verificar cooldown
-        cd_ok, cd_reason = self._cd_ok(symbol)
-        if not cd_ok:
-            log.debug(f"Skip {symbol}: {cd_reason}")
-            return
-
-        # v3.1: verificar régimen para la dirección de la señal
-        direction = getattr(signal, 'direction', 'LONG')
-        if direction == 'LONG':
-            ok, reason = self.regime.can_open_long()
-            if not ok:
-                log.debug(f"Skip {symbol}: {reason}")
-                return
-        elif direction == 'SHORT':
-            ok, reason = self.regime.can_open_short()
-            if not ok:
-                log.debug(f"Skip {symbol}: {reason}")
-                return
-
-        balance    = self._get_balance()
-        open_count = len(self.state["open_trades"])
-
-        if open_count >= MAX_OPEN_TRADES:
-            log.debug(f"Max trades ({MAX_OPEN_TRADES}) alcanzados")
-            return
-
-        if not self.risk.can_open_trade(open_count, balance):
-            return
-
-        # v3.1: verificar daily loss cap
-        if self._equity_start > 0:
-            daily_loss_pct = abs(self.state.get("daily_pnl", 0)) / self._equity_start * 100
-            if self.state.get("daily_pnl", 0) < 0 and daily_loss_pct > DAILY_LOSS_CAP_PCT:
-                log.warning(f"Daily loss cap alcanzado: {daily_loss_pct:.1f}%")
-                return
-
-        qty_p, price_p = self._get_precision(symbol)
-        params = self.risk.size_position(
-            symbol, signal.direction,
-            signal.entry, signal.sl,
-            signal.tp1, signal.tp2, signal.tp3,
-            balance, qty_p, price_p,
+            tier = "B"
+            score_mult = 0.85
+        
+        score = _short_score() * score_mult
+        sl, tp1, tp2, tp3, tp4, tp5 = (
+            price + risk,
+            price - risk, price - risk*2, price - risk*3,
+            price - risk*4, price - risk*5,
         )
-        if not params:
-            return
-
-        tier_tag = f"[Tier {signal.tier}] " if getattr(signal, 'tier', None) else ""
-
-        if DRY_RUN:
-            log.info(
-                f"[DRY RUN] {tier_tag}{symbol} {params.direction} x{params.quantity} "
-                f"@ {params.entry_price} SL={params.sl_price} TP1={params.tp1_price} "
-                f"| {getattr(signal, 'reason', '?')}"
-            )
-            self.state["open_trades"][symbol] = self._make_trade_record(
-                params, signal, qty_p, price_p, "DRY_RUN"
-            )
-            save_state(self.state)
-            return
-
-        # Orden real
-        try:
-            self.client.set_margin_type(symbol, "ISOLATED")
-            self.client.set_leverage(symbol, params.leverage, params.direction)
-
-            side     = "BUY"  if params.direction == "LONG" else "SELL"
-            pos_side = params.direction
-
-            if LIMIT_ENTRY:
-                offset    = SLIPPAGE_OFFSET * params.entry_price
-                limit_px  = (params.entry_price - offset if side == "BUY"
-                             else params.entry_price + offset)
-                limit_px  = round(limit_px, price_p)
-                result    = self.client.place_order(
-                    symbol, side, pos_side, "LIMIT", params.quantity,
-                    price=limit_px, stop_loss=params.sl_price,
-                )
-                price_used = limit_px
-            else:
-                result    = self.client.place_order(
-                    symbol, side, pos_side, "MARKET", params.quantity,
-                    stop_loss=params.sl_price,
-                )
-                price_used = "MARKET"
-
-            order_id = result.get("data", {}).get("orderId", "?")
-            log.info(
-                f"{tier_tag}{symbol} {params.direction} qty={params.quantity} "
-                f"@ {price_used} SL={params.sl_price} orderId={order_id} "
-                f"| Régimen:{self.regime.regime}"
-            )
-
-            self.state["open_trades"][symbol] = self._make_trade_record(
-                params, signal, qty_p, price_p, order_id
-            )
-            self.state["total_trades"] = self.state.get("total_trades", 0) + 1
-            save_state(self.state)
-
-            _tg(
-                f"<b>{'🟢' if params.direction == 'LONG' else '🔴'} {params.direction}</b> — {symbol}\n"
-                f"{tier_tag}@ ${price_used} | SL: ${params.sl_price}\n"
-                f"TP1: ${params.tp1_price} | TP2: ${params.tp2_price}\n"
-                f"Régimen: {self.regime.regime} | Breadth: {int(self.regime.breadth*100)}%"
-            )
-
-        except Exception as e:
-            log.error(f"Error abriendo {symbol}: {e}")
-
-    def _make_trade_record(self, params, signal, qty_p, price_p, order_id):
-        return {
-            "direction": params.direction, "entry": params.entry_price,
-            "sl": params.sl_price,
-            "tp1": params.tp1_price, "tp2": params.tp2_price,
-            "tp3": params.tp3_price,
-            "tp4": round(getattr(signal, 'tp4', 0), price_p),
-            "tp5": round(getattr(signal, 'tp5', 0), price_p),
-            "qty": params.quantity, "qty_p": qty_p,
-            "tp1_hit": False, "tp2_hit": False, "tp3_hit": False,
-            "order_id": order_id,
-            "opened_at": datetime.utcnow().isoformat(),
-            "tier": getattr(signal, "tier", ""),
-            "regime": self.regime.regime,
-        }
-
-    # ── gestionar posiciones ───────────────────────────────────────────────
-
-    def _manage_positions(self):
-        if not self.state["open_trades"]:
-            return
-
-        try:
-            positions = {p["symbol"]: p for p in self.client.get_positions()}
-        except Exception as e:
-            log.error(f"Error obteniendo posiciones: {e}")
-            return
-
-        for symbol, trade in list(self.state["open_trades"].items()):
-            direction = trade["direction"]
-            qty       = float(trade["qty"])
-            tp1       = float(trade.get("tp1", 0))
-            tp2       = float(trade.get("tp2", 0))
-            tp3       = float(trade.get("tp3", 0))
-            tp4       = float(trade.get("tp4", 0))
-            tp5       = float(trade.get("tp5", 0))
-            tp1_hit   = trade.get("tp1_hit", False)
-            tp2_hit   = trade.get("tp2_hit", False)
-            tp3_hit   = trade.get("tp3_hit", False)
-            qty_p     = int(trade.get("qty_p", 3))
-            synced    = trade.get("synced", False)
-
-            # v3.1: verificar si la posición sigue abierta en el exchange
-            if not DRY_RUN and symbol not in positions:
-                log.info(f"Posición cerrada externamente: {symbol}")
-                entry  = float(trade.get("entry", 0))
-                # Registrar como probable SL
-                self._on_trade_closed(symbol, entry, entry * 0.99, "SL_externo", qty)
-                continue
-
-            try:
-                ticker = self.client.get_ticker(symbol)
-                price  = float(ticker.get("lastPrice", trade["entry"]))
-            except Exception:
-                continue
-
-            if synced and tp1 == 0:
-                continue
-
-            def _tp_reached(tp_level):
-                if tp_level == 0: return False
-                return (direction == "LONG"  and price >= tp_level) or \
-                       (direction == "SHORT" and price <= tp_level)
-
-            def _partial_close(label, pqty):
-                if pqty <= 0: return
-                log.info(f"{label} {symbol} | Cerrando {pqty}/{qty} @ ${price:.4f}")
-                if not DRY_RUN:
-                    try:
-                        self.client.close_position(symbol, direction, pqty)
-                    except Exception as e:
-                        log.error(f"Error {label} {symbol}: {e}")
-
-            # TP1: 40%
-            if not tp1_hit and _tp_reached(tp1):
-                pqty = round(qty * 0.4, qty_p)
-                _partial_close("TP1", pqty)
-                trade["tp1_hit"] = True
-                trade["qty"]     = round(qty - pqty, qty_p)
-                qty              = trade["qty"]
-                # Break-even SL
-                if trade["sl"] < trade["entry"]:
-                    trade["sl"] = round(float(trade["entry"]) * 1.0005, 6)
-                    log.info(f"SL → break-even @ ${trade['sl']}")
-                save_state(self.state)
-
-            # TP2: 30% del restante
-            if tp1_hit and not tp2_hit and _tp_reached(tp2):
-                pqty = round(qty * 0.3, qty_p)
-                _partial_close("TP2", pqty)
-                trade["tp2_hit"] = True
-                trade["qty"]     = round(qty - pqty, qty_p)
-                qty              = trade["qty"]
-                save_state(self.state)
-
-            # TP3: 30% del restante
-            if tp2_hit and not tp3_hit and _tp_reached(tp3):
-                pqty = round(qty * 0.3, qty_p)
-                _partial_close("TP3", pqty)
-                trade["tp3_hit"] = True
-                trade["qty"]     = round(qty - pqty, qty_p)
-                qty              = trade["qty"]
-                save_state(self.state)
-
-            # TP4: 50% del restante
-            if tp3_hit and tp4 > 0 and _tp_reached(tp4):
-                pqty = round(qty * 0.5, qty_p)
-                _partial_close("TP4", pqty)
-                trade["qty"] = round(qty - pqty, qty_p)
-                qty          = trade["qty"]
-                save_state(self.state)
-
-            # TP5: cierre total
-            if tp3_hit and tp5 > 0 and _tp_reached(tp5):
-                _partial_close("TP5 (total)", trade["qty"])
-                entry_p = float(trade["entry"])
-                pnl     = abs(price - entry_p) * trade["qty"]
-                self._on_trade_closed(symbol, entry_p, price, "TP5", trade["qty"])
-                continue
-
-            # v3.1: SL dinámico — si el régimen cambia a bajista con trade abierto, avisar
-            if self.regime.regime == 'bear' and direction == 'LONG':
-                opened_at = datetime.fromisoformat(trade.get("opened_at", datetime.utcnow().isoformat()))
-                mins_open = (datetime.utcnow() - opened_at).total_seconds() / 60
-                if not trade.get("bear_warned") and mins_open > 5:
-                    trade["bear_warned"] = True
-                    entry_p = float(trade["entry"])
-                    pct = (price - entry_p) / entry_p * 100
-                    _tg(
-                        f"<b>⚠️ RÉGIMEN BAJISTA con LONG abierto</b>\n"
-                        f"{symbol} | {pct:+.2f}% desde entrada\n"
-                        f"Considera cerrar manualmente si no hay SL activo"
-                    )
-                    save_state(self.state)
-
-    def _on_trade_closed(self, symbol, entry, exit_price, reason, qty):
-        """Registra cierre de trade y actualiza estadísticas."""
-        win = (exit_price > entry) if symbol in self.state.get("open_trades", {}) \
-              else (reason not in ("SL_externo", "STOP LOSS"))
-        direction = self.state["open_trades"].get(symbol, {}).get("direction", "LONG")
-        if direction == "SHORT":
-            win = (exit_price < entry)
-
-        pnl_pct = abs(exit_price - entry) / entry * 100 * (-1 if not win else 1)
-
-        self.state["trade_log"].append({
-            "symbol": symbol, "entry": entry, "exit": exit_price,
-            "reason": reason, "win": win, "pnl_pct": pnl_pct,
-            "closed_at": datetime.utcnow().isoformat(),
-        })
-        self.state["daily_pnl"] = self.state.get("daily_pnl", 0) + pnl_pct
-        if win:
-            self.state["wins"] = self.state.get("wins", 0) + 1
-        else:
-            self.state["losses"] = self.state.get("losses", 0) + 1
-            # v3.1: aplicar cooldown largo tras SL
-            self._set_cd(symbol, "SL")
-
-        if symbol in self.state["open_trades"]:
-            del self.state["open_trades"][symbol]
-        save_state(self.state)
-
-        total = self.state.get("wins", 0) + self.state.get("losses", 0)
-        wr = self.state.get("wins", 0) / total * 100 if total else 0
-        log.info(f"{'✅' if win else '❌'} {reason} {symbol} | {pnl_pct:+.1f}% | WR:{wr:.0f}% ({total}t)")
-
-        _tg(
-            f"<b>{'✅' if win else '❌'} CERRADO — {reason}</b>\n"
-            f"{symbol} | ${entry:.4f} → ${exit_price:.4f}\n"
-            f"PnL: {pnl_pct:+.2f}% | WR: {wr:.0f}% ({total}t)"
+        
+        bw_lbl = "Bounce" if bw_bounce_short else ("T3-Cross" if bw_short_recent else "T3↓")
+        reason = (
+            f"[{tier}] BW-{bw_lbl} + EMA-cross + MFI({mfi_val:.0f}) + ZLSMA + Turtle | "
+            f"Bear {bear_pct:.0f}% | DLO={dlo_val:+.2f} | ADX {adx:.1f}"
         )
-        self.risk.record_pnl(pnl_pct)
+        return Signal("SHORT", price, sl, tp1, tp2, tp3, tp4, tp5,
+                     score, atr_v, reason, adx, bull_pct, bear_pct, dlo_val, tier, mfi_val, zlsma_conf)
 
-    # ── reporte ────────────────────────────────────────────────────────────
-
-    def _maybe_report(self):
-        if (datetime.utcnow() - self._last_tg_report).total_seconds() < 7200:
-            return
-        self._last_tg_report = datetime.utcnow()
-        balance = self._get_balance()
-        total   = self.state.get("wins", 0) + self.state.get("losses", 0)
-        wr      = self.state.get("wins", 0) / total * 100 if total else 0
-        open_s  = list(self.state["open_trades"].keys())
-
-        cds = self.state.get("cooldowns", {})
-        cd_activos = [s for s, v in cds.items() if time.time() < v.get("resume", 0)]
-
-        _tg(
-            f"<b>📊 SuperBot v3.1 — Reporte</b>\n"
-            f"Balance: ${balance:.2f} USDT\n"
-            f"WR: {wr:.0f}% | Trades: {total}\n"
-            f"PnL hoy: {self.state.get('daily_pnl', 0):+.2f}%\n"
-            f"Régimen: {self.regime.regime} | Breadth: {int(self.regime.breadth*100)}%\n"
-            f"BTC 4h: {self.regime.btc_4h:+.1f}%\n"
-            f"Abiertos: {open_s or 'ninguno'}\n"
-            f"Cooldowns activos: {len(cd_activos)}"
-        )
-
-    # ── main loop ──────────────────────────────────────────────────────────
-
-    def run(self):
-        log.info(
-            f"SuperBot v3.1 | DRY_RUN={DRY_RUN} | "
-            f"SCAN_PERIOD={SCAN_PERIOD}s | REGIME_CHECK={REGIME_CHECK}"
-        )
-        _tg(
-            f"<b>🤖 SuperBot v3.1 iniciado</b>\n"
-            f"DRY_RUN={DRY_RUN} | CD_SL={CD_SL_HOURS}h | MAX_TRADES={MAX_OPEN_TRADES}\n"
-            f"Posiciones activas: {len(self.state['open_trades'])}"
-        )
-
-        iteration = 0
-        last_regime_update = 0
-
-        while True:
-            try:
-                iteration += 1
-                self._init_daily()
-
-                # v3.1: actualizar régimen cada 5 min
-                if REGIME_CHECK and time.time() - last_regime_update > 300:
-                    self.regime.update()
-                    last_regime_update = time.time()
-
-                self._manage_positions()
-                self._maybe_report()
-
-                balance    = self._get_balance()
-                open_count = len(self.state["open_trades"])
-
-                # v3.1: verificar daily loss cap
-                if self._equity_start > 0:
-                    daily_loss_pct = abs(self.state.get("daily_pnl", 0)) / self._equity_start * 100
-                    if self.state.get("daily_pnl", 0) < 0 and daily_loss_pct > DAILY_LOSS_CAP_PCT:
-                        log.warning(f"Daily loss cap: {daily_loss_pct:.1f}% — sin nuevas entradas")
-                        log.info(f"Durmiendo {SCAN_PERIOD}s | Abiertos: {list(self.state['open_trades'].keys())}")
-                        time.sleep(SCAN_PERIOD)
-                        continue
-
-                regime_ok, regime_reason = self.regime.can_open_long()
-
-                if regime_ok and self.risk.can_open_trade(open_count, balance) and open_count < MAX_OPEN_TRADES:
-                    log.info(f"🔍 Escaneando | Régimen: {self.regime.regime} | Breadth: {int(self.regime.breadth*100)}%")
-                    try:
-                        results = self.scanner.scan()
-                    except Exception as e:
-                        log.error(f"Scanner error: {e}")
-                        results = []
-
-                    opened = 0
-                    for result in results:
-                        if not self.risk.can_open_trade(
-                            len(self.state["open_trades"]), balance
-                        ):
-                            break
-                        if len(self.state["open_trades"]) >= MAX_OPEN_TRADES:
-                            break
-                        if result.symbol not in self.state["open_trades"]:
-                            self._open_trade(result.symbol, result.signal)
-                            opened += 1
-                            time.sleep(0.5)
-
-                    log.info(f"Trades abiertos este ciclo: {opened}")
-                else:
-                    if not regime_ok:
-                        log.info(f"⏸️ Sin entradas: {regime_reason}")
-                    log.info(
-                        f"Posiciones: {open_count}/{MAX_OPEN_TRADES} | "
-                        f"Balance: {balance:.2f} | "
-                        f"Régimen: {self.regime.regime}"
-                    )
-
-                log.info(
-                    f"#{iteration} Durmiendo {SCAN_PERIOD}s | "
-                    f"Abiertos: {list(self.state['open_trades'].keys())}"
-                )
-
-            except Exception as e:
-                log.error(f"Error loop #{iteration}: {e}", exc_info=True)
-
-            time.sleep(SCAN_PERIOD)
+    return Signal(
+        "NONE", price, 0, 0, 0, 0, 0, 0,
+        max(bull_pct, bear_pct), atr_v,
+        f"No signal | Bull {bull_pct:.0f}% Bear {bear_pct:.0f}% | "
+        f"MFI={mfi_val:.0f} ZLSMA={zlsma_conf:+.2f}% | DLO={dlo_val:+.2f} | ADX {adx:.1f}",
+        adx, bull_pct, bear_pct, dlo_val, "", mfi_val, zlsma_conf,
+    )
