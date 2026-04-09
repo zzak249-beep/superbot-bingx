@@ -1,5 +1,5 @@
 """
-Strategy v4.0 - Professional Grade Engine [FORCE UPDATE]
+Strategy v4.0 – Professional Grade Engine
 Integra:
   1. BOSWaves + KhanSaab + DLO (existentes)
   2. MFI (Money Flow Index) → filtro de volumen real
