@@ -1,14 +1,16 @@
 """
-Strategy v3.0 – Triple Confirmation Engine
-Integra los tres Pine Scripts:
-  1. BOSWaves  → T3-VWAP trend direction + bounce desde bandas
-  2. KhanSaab  → EMA9/21 crossover + 7-condition score
-  3. DLO       → Directional Logistic Oscillator como filtro de fuerza
-
-Jerarquía:
-  Tier A: los 3 alineados           → máxima prioridad
-  Tier B: BOSWaves + KhanSaab       → prioridad media (DLO neutro/alineado)
-  Sin señal: solo 1 confirma        → NONE
+Strategy v4.0 – Professional Grade Engine
+Integra:
+  1. BOSWaves + KhanSaab + DLO (existentes)
+  2. MFI (Money Flow Index) → filtro de volumen real
+  3. Turtle Trade Channels → detección de breakouts
+  4. Zero Lag SMA → filtro de tendencia sin lag
+  
+Jerarquía mejorada:
+  Tier S: todos los indicadores alineados   → máxima confianza
+  Tier A: BOSWaves + KhanSaab + MFI + ZLSMA → muy bueno
+  Tier B: 2+ confirmaciones + Turtle         → aceptable
+  Tier C: solo 1-2 confirmaciones            → SKIP
 """
 import numpy as np
 import pandas as pd
@@ -16,7 +18,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 # ─────────────────────────────────────────────────────────────────────
-#  Parámetros
+#  Parámetros base (heredados)
 # ─────────────────────────────────────────────────────────────────────
 T3_LEN        = 28
 T3_FACTOR     = 0.7
@@ -34,16 +36,31 @@ VOL_MA_LEN    = 20
 SL_ATR_MULT   = 1.5
 
 DLO_DI_LEN    = 14
-DLO_MEAN_LB   = 200   # reducido de 360 para crypto (más datos recientes)
+DLO_MEAN_LB   = 200
 DLO_SLOPE     = 0.18
 DLO_SMOOTH    = 3
 DLO_OSC_SCALE = 2.5
 DLO_OSC_SMOOTH = 7
 
-MIN_SCORE     = 5     # mínimo condiciones KhanSaab (de 7)
-MIN_ADX       = 22    # ligeramente más permisivo que los 25 del Pine
-CROSS_WINDOW  = 6     # ventana para EMA crossover (era 3 → demasiado estricto)
-BW_WINDOW     = 5     # ventana para BOSWaves T3 crossover
+# ─────────────────────────────────────────────────────────────────────
+#  NUEVOS: MFI, Turtle Channels, Zero Lag SMA
+# ─────────────────────────────────────────────────────────────────────
+MFI_PERIOD       = 14         # período MFI estándar
+MFI_OVERSOLD     = 30         # oversold
+MFI_OVERBOUGHT   = 70         # overbought
+MFI_NEUTRAL_HIGH = 55         # si >55 en LONG es bueno
+MFI_NEUTRAL_LOW  = 45         # si <45 en SHORT es bueno
+
+TURTLE_LEN       = 20         # período para Turtle Channels
+TURTLE_ATR_MULT  = 2.0        # para los canales
+
+ZLSMA_LEN        = 50         # Zero Lag SMA length
+ZLSMA_LAG        = 0.3        # lag reduction factor (0.3 = muy responsivo)
+
+MIN_SCORE        = 5          # mínimo condiciones KhanSaab
+MIN_ADX          = 22
+CROSS_WINDOW     = 6
+BW_WINDOW        = 5
 
 
 @dataclass
@@ -64,10 +81,12 @@ class Signal:
     bear_pct:   float = 0.0
     dlo_value:  float = 0.0
     tier:       str   = ""
+    mfi_value:  float = 0.0
+    zlsma_conf: float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  Matemáticas
+#  Matemáticas base
 # ─────────────────────────────────────────────────────────────────────
 def _ema(series: np.ndarray, period: int) -> np.ndarray:
     out = np.full_like(series, np.nan, dtype=float)
@@ -171,7 +190,74 @@ def _cross_dn(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  DLO – Directional Logistic Oscillator (GainzAlgo)
+#  NUEVO: Money Flow Index (MFI)
+# ─────────────────────────────────────────────────────────────────────
+def _mfi(high: np.ndarray, low: np.ndarray, close: np.ndarray, 
+         volume: np.ndarray, period: int) -> np.ndarray:
+    """
+    Money Flow Index: oscilador de volumen
+    - > 70: overbought (posible reversión bajista)
+    - < 30: oversold (posible reversión alcista)
+    - alineado con dirección = confirmación fuerte
+    """
+    tp = (high + low + close) / 3.0  # Típical Price
+    mf = tp * volume  # Money Flow
+    
+    positive_mf = np.where(tp > np.roll(tp, 1), mf, 0)
+    negative_mf = np.where(tp < np.roll(tp, 1), mf, 0)
+    
+    positive_mf[0] = mf[0]  # primer valor
+    
+    pos_mf_sum = pd.Series(positive_mf).rolling(period, min_periods=1).sum().values
+    neg_mf_sum = pd.Series(negative_mf).rolling(period, min_periods=1).sum().values
+    
+    mfr = np.where(neg_mf_sum == 0, 100.0, pos_mf_sum / neg_mf_sum)
+    mfi = 100.0 - (100.0 / (1.0 + mfr))
+    
+    return np.nan_to_num(mfi, nan=50.0)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  NUEVO: Zero Lag SMA (ZLSMA) - más responsivo que SMA
+# ─────────────────────────────────────────────────────────────────────
+def _zero_lag_sma(series: np.ndarray, period: int, lag: float = 0.3) -> np.ndarray:
+    """
+    Zero Lag SMA: elimina el retardo de SMA
+    Formula: ZLSMA = SMA + lag_factor * (SMA - SMA_delayed)
+    
+    lag = 0.3 → bastante responsivo
+    lag = 0.0 → es solo un SMA normal
+    """
+    sma1 = _sma(series, period)
+    sma2 = _sma(sma1, period)
+    zlsma = sma1 + lag * (sma1 - sma2)
+    return zlsma
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  NUEVO: Turtle Trade Channels (breakout detection)
+# ─────────────────────────────────────────────────────────────────────
+def _turtle_channels(high: np.ndarray, low: np.ndarray, 
+                     atr: np.ndarray, period: int, atr_mult: float):
+    """
+    Canales de Turtle Channels:
+    - High: highest(high, period) + ATR * mult
+    - Low:  lowest(low, period) - ATR * mult
+    
+    Si price > high → breakout alcista
+    Si price < low  → breakout bajista
+    """
+    rolling_high = pd.Series(high).rolling(period, min_periods=1).max().values
+    rolling_low  = pd.Series(low).rolling(period, min_periods=1).min().values
+    
+    ch_high = rolling_high + atr * atr_mult
+    ch_low  = rolling_low - atr * atr_mult
+    
+    return ch_high, ch_low
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  DLO (heredado)
 # ─────────────────────────────────────────────────────────────────────
 def _logistic_prob(series: np.ndarray, mean_lb: int, slope: float, smooth: int) -> np.ndarray:
     mean     = _sma(series, mean_lb)
@@ -181,12 +267,6 @@ def _logistic_prob(series: np.ndarray, mean_lb: int, slope: float, smooth: int) 
 
 
 def _compute_dlo(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
-    """
-    Replica del DLO Pine Script.
-    Retorna array `s_ema` acotado en [-1, +1].
-    +0.15 o más  → tendencia alcista fuerte
-    -0.15 o menos → tendencia bajista fuerte
-    """
     di_p, di_m, adx = _dmi(high, low, close, DLO_DI_LEN)
     prob_plus  = _logistic_prob(di_p, DLO_MEAN_LB, DLO_SLOPE, DLO_SMOOTH)
     prob_minus = _logistic_prob(di_m, DLO_MEAN_LB, DLO_SLOPE, DLO_SMOOTH)
@@ -199,12 +279,14 @@ def _compute_dlo(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.nda
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  Función principal
+#  Función principal v4.0
 # ─────────────────────────────────────────────────────────────────────
 def compute_signal(candles: list[dict], htf_rsi: float = 50.0) -> Signal:
-    min_bars = max(T3_LEN * 6, DLO_MEAN_LB, MACD_SLOW + MACD_SIG, VOL_MA_LEN) + 20
+    min_bars = max(T3_LEN * 6, DLO_MEAN_LB, MACD_SLOW + MACD_SIG, 
+                   VOL_MA_LEN, MFI_PERIOD, ZLSMA_LEN, TURTLE_LEN) + 30
     if len(candles) < min_bars:
-        return Signal("NONE", 0, 0, 0, 0, 0, 0, 0, 0, 0, "Not enough bars")
+        return Signal("NONE", 0, 0, 0, 0, 0, 0, 0, 0, 0, "Not enough bars",
+                     0, 0, 0, 0, "", 0, 0)
 
     df   = pd.DataFrame(candles)
     ts   = df["ts"].values.astype(float)
@@ -215,7 +297,7 @@ def compute_signal(candles: list[dict], htf_rsi: float = 50.0) -> Signal:
     v    = df["volume"].values.astype(float)
     hlc3 = (h + l + c) / 3.0
 
-    # ── BOSWaves ──────────────────────────────────────────────────────
+    # ── Indicadores base (heredados) ───────────────────────────────────
     raw_vwap = _session_vwap(hlc3, v, ts)
     t3_arr   = _t3(raw_vwap, T3_LEN, T3_FACTOR)
     atr_arr  = _atr(h, l, c, ATR_LEN)
@@ -236,7 +318,6 @@ def compute_signal(candles: list[dict], htf_rsi: float = 50.0) -> Signal:
     t3_bearish = t3_v < t3_p
 
     price = float(c[-1])
-    # Bounce desde banda 3 (alta probabilidad de reversión)
     bw_bounce_long  = float(l[-2]) <= band_l3 and price > band_l3 and t3_bullish
     bw_bounce_short = float(h[-2]) >= band_u3 and price < band_u3 and t3_bearish
 
@@ -262,7 +343,6 @@ def compute_signal(candles: list[dict], htf_rsi: float = 50.0) -> Signal:
     vol   = float(v[-1])
     open_ = float(o[-1])
 
-    # Cross reciente O EMA alineada y separándose (> 0.1% de diferencia)
     ema_long_recent  = (
         any(ema_cross_up[-CROSS_WINDOW:]) or
         (e9 > e21 and (e9 - e21) > abs(e21 * 0.001))
@@ -293,7 +373,7 @@ def compute_signal(candles: list[dict], htf_rsi: float = 50.0) -> Signal:
     bull_pct = bull_score / 7 * 100
     bear_pct = bear_score / 7 * 100
 
-    # ── DLO ───────────────────────────────────────────────────────────
+    # ── DLO ────────────────────────────────────────────────────────────
     dlo_arr = _compute_dlo(h, l, c)
     dlo_val = float(dlo_arr[-1]) if not np.isnan(dlo_arr[-1]) else 0.0
     dlo_strong_bull = dlo_val >  0.15
@@ -301,7 +381,42 @@ def compute_signal(candles: list[dict], htf_rsi: float = 50.0) -> Signal:
     dlo_bull        = dlo_val >  0.0
     dlo_bear        = dlo_val <  0.0
 
-    # DLO reversión (señal de giro de ciclo)
+    # ── NUEVO: MFI (Money Flow Index) ──────────────────────────────────
+    mfi_arr = _mfi(h, l, c, v, MFI_PERIOD)
+    mfi_val = float(mfi_arr[-1])
+    
+    # Confirmaciones MFI
+    mfi_oversold  = mfi_val < MFI_OVERSOLD        # oversold → posible reversión alcista
+    mfi_overbought = mfi_val > MFI_OVERBOUGHT     # overbought → posible reversión bajista
+    mfi_long_confirm = mfi_val < MFI_NEUTRAL_HIGH # para LONG, queremos MFI bajo-medio
+    mfi_short_confirm = mfi_val > MFI_NEUTRAL_LOW # para SHORT, queremos MFI alto-medio
+
+    # ── NUEVO: Zero Lag SMA ────────────────────────────────────────────
+    zlsma_arr = _zero_lag_sma(c, ZLSMA_LEN, ZLSMA_LAG)
+    zlsma_v = float(zlsma_arr[-1])
+    zlsma_p = float(zlsma_arr[-2]) if len(zlsma_arr) > 1 else zlsma_v
+    
+    # Para LONG: precio > ZLSMA (uptrend)
+    zlsma_long_trend = price > zlsma_v
+    # Para SHORT: precio < ZLSMA (downtrend)
+    zlsma_short_trend = price < zlsma_v
+    
+    # Fortaleza de la confirmación ZLSMA (% distancia)
+    zlsma_long_strength = (price - zlsma_v) / max(zlsma_v, 0.0001) * 100
+    zlsma_short_strength = (zlsma_v - price) / max(zlsma_v, 0.0001) * 100
+    zlsma_conf = zlsma_long_strength if zlsma_long_trend else zlsma_short_strength
+
+    # ── NUEVO: Turtle Channels (Breakout detection) ─────────────────────
+    ch_high, ch_low = _turtle_channels(h, l, atr_arr, TURTLE_LEN, TURTLE_ATR_MULT)
+    ch_high_v = float(ch_high[-1])
+    ch_low_v = float(ch_low[-1])
+    
+    turtle_breakout_long = price > ch_high_v   # precio salió por arriba del canal
+    turtle_breakout_short = price < ch_low_v   # precio salió por abajo del canal
+    
+    # ──────────────────────────────────────────────────────────────────────
+    #  DLO reversión (heredado)
+    # ──────────────────────────────────────────────────────────────────────
     if len(dlo_arr) >= 3:
         dlo_rev_up = (dlo_arr[-1] > dlo_arr[-2]) and not (dlo_arr[-2] > dlo_arr[-3])
         dlo_rev_dn = (dlo_arr[-1] < dlo_arr[-2]) and not (dlo_arr[-2] < dlo_arr[-3])
@@ -310,87 +425,145 @@ def compute_signal(candles: list[dict], htf_rsi: float = 50.0) -> Signal:
 
     # NaN guard
     if any(np.isnan(x) for x in [t3_v, t3_p, atr_v, e9, e21, adx]):
-        return Signal("NONE", price, 0, 0, 0, 0, 0, 0, 0, atr_v, "NaN")
+        return Signal("NONE", price, 0, 0, 0, 0, 0, 0, 0, atr_v, "NaN",
+                     adx, bull_pct, bear_pct, dlo_val, "", mfi_val, zlsma_conf)
 
-    # Sobreextensión
     not_over_bull = price > band_l4
     not_over_bear = price < band_u4
     risk = atr_v * SL_ATR_MULT
 
-    # ── Condiciones de entrada ─────────────────────────────────────────
-    # LONG
+    # ──────────────────────────────────────────────────────────────────────
+    #  Nuevas condiciones de entrada con v4.0
+    # ──────────────────────────────────────────────────────────────────────
+    
+    # BOSWaves base
     bw_l = bw_long_recent or bw_bounce_long or t3_bullish
-    kh_l = ema_long_recent and bull_score >= MIN_SCORE
-
-    long_a = (bw_long_recent or bw_bounce_long) and kh_l and dlo_strong_bull and adx > MIN_ADX and not_over_bull
-    long_b = bw_l and kh_l and (not dlo_bear) and adx > MIN_ADX and not_over_bull and not long_a
-
-    # SHORT
     bw_s = bw_short_recent or bw_bounce_short or t3_bearish
+    
+    # KhanSaab base
+    kh_l = ema_long_recent and bull_score >= MIN_SCORE
     kh_s = ema_short_recent and bear_score >= MIN_SCORE
-
-    short_a = (bw_short_recent or bw_bounce_short) and kh_s and dlo_strong_bear and adx > MIN_ADX and not_over_bear
-    short_b = bw_s and kh_s and (not dlo_bull) and adx > MIN_ADX and not_over_bear and not short_a
+    
+    # LONG condiciones
+    # Tier S: BOSWaves + KhanSaab + MFI + ZLSMA + Turtle + DLO fuerte
+    long_s = (
+        bw_l and kh_l and mfi_long_confirm and zlsma_long_trend and 
+        turtle_breakout_long and dlo_strong_bull and adx > MIN_ADX and not_over_bull
+    )
+    
+    # Tier A: BOSWaves + KhanSaab + MFI + ZLSMA + DLO (sin turtle requerido)
+    long_a = (
+        (bw_long_recent or bw_bounce_long) and kh_l and mfi_long_confirm and 
+        zlsma_long_trend and (not dlo_bear) and adx > MIN_ADX and not_over_bull and not long_s
+    )
+    
+    # Tier B: BOSWaves + KhanSaab + ZLSMA + Turtle
+    long_b = (
+        bw_l and kh_l and zlsma_long_trend and turtle_breakout_long and
+        adx > MIN_ADX and not_over_bull and not long_s and not long_a
+    )
+    
+    # SHORT condiciones
+    # Tier S
+    short_s = (
+        bw_s and kh_s and mfi_short_confirm and zlsma_short_trend and 
+        turtle_breakout_short and dlo_strong_bear and adx > MIN_ADX and not_over_bear
+    )
+    
+    # Tier A
+    short_a = (
+        (bw_short_recent or bw_bounce_short) and kh_s and mfi_short_confirm and 
+        zlsma_short_trend and (not dlo_bull) and adx > MIN_ADX and not_over_bear and not short_s
+    )
+    
+    # Tier B
+    short_b = (
+        bw_s and kh_s and zlsma_short_trend and turtle_breakout_short and
+        adx > MIN_ADX and not_over_bear and not short_s and not short_a
+    )
 
     def _long_score():
         s = bull_pct
-        if dlo_strong_bull: s += 20
-        elif dlo_bull:       s += 10
+        if dlo_strong_bull: s += 25
+        elif dlo_bull:       s += 12
         if bw_bounce_long:   s += 15
         if bw_long_recent:   s += 10
+        if mfi_long_confirm: s += 15  # MFI ayuda
+        if zlsma_long_trend: s += 15  # ZLSMA ayuda
+        if turtle_breakout_long: s += 12  # Turtle breakout
         if dlo_rev_up:       s += 8
         if adx > 35:         s += 10
         return min(s, 100.0)
 
     def _short_score():
         s = bear_pct
-        if dlo_strong_bear:  s += 20
-        elif dlo_bear:        s += 10
-        if bw_bounce_short:   s += 15
-        if bw_short_recent:   s += 10
-        if dlo_rev_dn:        s += 8
-        if adx > 35:          s += 10
+        if dlo_strong_bear:  s += 25
+        elif dlo_bear:       s += 12
+        if bw_bounce_short:  s += 15
+        if bw_short_recent:  s += 10
+        if mfi_short_confirm: s += 15
+        if zlsma_short_trend: s += 15
+        if turtle_breakout_short: s += 12
+        if dlo_rev_dn:       s += 8
+        if adx > 35:         s += 10
         return min(s, 100.0)
 
-    if long_a or long_b:
-        tier  = "A" if long_a else "B"
-        score = _long_score() * (1.0 if long_a else 0.85)
+    if long_s or long_a or long_b:
+        if long_s:
+            tier = "S"
+            score_mult = 1.15
+        elif long_a:
+            tier = "A"
+            score_mult = 1.0
+        else:
+            tier = "B"
+            score_mult = 0.85
+        
+        score = _long_score() * score_mult
         sl, tp1, tp2, tp3, tp4, tp5 = (
             price - risk,
             price + risk, price + risk*2, price + risk*3,
             price + risk*4, price + risk*5,
         )
+        
         bw_lbl = "Bounce" if bw_bounce_long else ("T3-Cross" if bw_long_recent else "T3↑")
         reason = (
-            f"[{tier}] BW-{bw_lbl} + EMA-cross | "
-            f"Bull {bull_pct:.0f}%({bull_score}/7) | "
-            f"DLO={dlo_val:+.2f} | ADX {adx:.1f} | HTF {htf_rsi:.0f}"
+            f"[{tier}] BW-{bw_lbl} + EMA-cross + MFI({mfi_val:.0f}) + ZLSMA + Turtle | "
+            f"Bull {bull_pct:.0f}% | DLO={dlo_val:+.2f} | ADX {adx:.1f}"
         )
         return Signal("LONG", price, sl, tp1, tp2, tp3, tp4, tp5,
-                      score, atr_v, reason, adx, bull_pct, bear_pct, dlo_val, tier)
+                     score, atr_v, reason, adx, bull_pct, bear_pct, dlo_val, tier, mfi_val, zlsma_conf)
 
-    if short_a or short_b:
-        tier  = "A" if short_a else "B"
-        score = _short_score() * (1.0 if short_a else 0.85)
+    if short_s or short_a or short_b:
+        if short_s:
+            tier = "S"
+            score_mult = 1.15
+        elif short_a:
+            tier = "A"
+            score_mult = 1.0
+        else:
+            tier = "B"
+            score_mult = 0.85
+        
+        score = _short_score() * score_mult
         sl, tp1, tp2, tp3, tp4, tp5 = (
             price + risk,
             price - risk, price - risk*2, price - risk*3,
             price - risk*4, price - risk*5,
         )
+        
         bw_lbl = "Bounce" if bw_bounce_short else ("T3-Cross" if bw_short_recent else "T3↓")
         reason = (
-            f"[{tier}] BW-{bw_lbl} + EMA-cross | "
-            f"Bear {bear_pct:.0f}%({bear_score}/7) | "
-            f"DLO={dlo_val:+.2f} | ADX {adx:.1f} | HTF {htf_rsi:.0f}"
+            f"[{tier}] BW-{bw_lbl} + EMA-cross + MFI({mfi_val:.0f}) + ZLSMA + Turtle | "
+            f"Bear {bear_pct:.0f}% | DLO={dlo_val:+.2f} | ADX {adx:.1f}"
         )
         return Signal("SHORT", price, sl, tp1, tp2, tp3, tp4, tp5,
-                      score, atr_v, reason, adx, bull_pct, bear_pct, dlo_val, tier)
+                     score, atr_v, reason, adx, bull_pct, bear_pct, dlo_val, tier, mfi_val, zlsma_conf)
 
     return Signal(
         "NONE", price, 0, 0, 0, 0, 0, 0,
         max(bull_pct, bear_pct), atr_v,
         f"No signal | Bull {bull_pct:.0f}% Bear {bear_pct:.0f}% | "
-        f"DLO={dlo_val:+.2f} | ADX {adx:.1f} | "
-        f"EMA↑={ema_long_recent} EMA↓={ema_short_recent}",
-        adx, bull_pct, bear_pct, dlo_val, "",
+        f"MFI={mfi_val:.0f} ZLSMA={zlsma_conf:+.2f}% | DLO={dlo_val:+.2f} | ADX {adx:.1f}",
+        adx, bull_pct, bear_pct, dlo_val, "", mfi_val, zlsma_conf,
     )
