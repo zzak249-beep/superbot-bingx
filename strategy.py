@@ -57,10 +57,10 @@ TURTLE_ATR_MULT  = 2.0        # para los canales
 ZLSMA_LEN        = 50         # Zero Lag SMA length
 ZLSMA_LAG        = 0.3        # lag reduction factor (0.3 = muy responsivo)
 
-MIN_SCORE        = 5          # mínimo condiciones KhanSaab
-MIN_ADX          = 22
-CROSS_WINDOW     = 6
-BW_WINDOW        = 5
+MIN_SCORE        = 4          # relajado: 4/7 condiciones (era 5)
+MIN_ADX          = 20           # relajado (era 22)
+CROSS_WINDOW     = 8           # ventana más amplia (era 6)
+BW_WINDOW        = 8           # ventana más amplia (era 5)
 
 
 @dataclass
@@ -445,40 +445,40 @@ def compute_signal(candles: list[dict], htf_rsi: float = 50.0) -> Signal:
     kh_s = ema_short_recent and bear_score >= MIN_SCORE
     
     # LONG condiciones
-    # Tier S: BOSWaves + KhanSaab + MFI + ZLSMA + Turtle + DLO fuerte
+    # Tier S: BOSWaves + KhanSaab + MFI + ZLSMA + DLO fuerte (Turtle opcional)
     long_s = (
-        bw_l and kh_l and mfi_long_confirm and zlsma_long_trend and 
-        turtle_breakout_long and dlo_strong_bull and adx > MIN_ADX and not_over_bull
+        bw_l and kh_l and mfi_long_confirm and zlsma_long_trend and
+        dlo_strong_bull and adx > MIN_ADX and not_over_bull
     )
     
-    # Tier A: BOSWaves + KhanSaab + MFI + ZLSMA + DLO (sin turtle requerido)
+    # Tier A: BOSWaves + KhanSaab + MFI + ZLSMA
     long_a = (
-        (bw_long_recent or bw_bounce_long) and kh_l and mfi_long_confirm and 
-        zlsma_long_trend and (not dlo_bear) and adx > MIN_ADX and not_over_bull and not long_s
+        bw_l and kh_l and mfi_long_confirm and zlsma_long_trend and
+        adx > MIN_ADX and not_over_bull and not long_s
     )
     
-    # Tier B: BOSWaves + KhanSaab + ZLSMA + Turtle
+    # Tier B: BOSWaves + KhanSaab + ZLSMA (Turtle como bonus)
     long_b = (
-        bw_l and kh_l and zlsma_long_trend and turtle_breakout_long and
+        bw_l and kh_l and zlsma_long_trend and
         adx > MIN_ADX and not_over_bull and not long_s and not long_a
     )
     
     # SHORT condiciones
-    # Tier S
+    # Tier S: Turtle opcional
     short_s = (
-        bw_s and kh_s and mfi_short_confirm and zlsma_short_trend and 
-        turtle_breakout_short and dlo_strong_bear and adx > MIN_ADX and not_over_bear
+        bw_s and kh_s and mfi_short_confirm and zlsma_short_trend and
+        dlo_strong_bear and adx > MIN_ADX and not_over_bear
     )
     
     # Tier A
     short_a = (
-        (bw_short_recent or bw_bounce_short) and kh_s and mfi_short_confirm and 
-        zlsma_short_trend and (not dlo_bull) and adx > MIN_ADX and not_over_bear and not short_s
+        bw_s and kh_s and mfi_short_confirm and zlsma_short_trend and
+        adx > MIN_ADX and not_over_bear and not short_s
     )
     
     # Tier B
     short_b = (
-        bw_s and kh_s and zlsma_short_trend and turtle_breakout_short and
+        bw_s and kh_s and zlsma_short_trend and
         adx > MIN_ADX and not_over_bear and not short_s and not short_a
     )
 
