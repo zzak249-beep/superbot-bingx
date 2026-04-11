@@ -1,6 +1,5 @@
-"""Entry point for Railway deployment."""
-from bot import SuperBot
+from institutional_bot_v4 import InstitutionalBot
+import asyncio
 
 if __name__ == "__main__":
-    bot = SuperBot()
-    bot.run()
+    asyncio.run(InstitutionalBot().run())
