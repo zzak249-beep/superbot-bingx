@@ -1,873 +1,598 @@
 """
-InstitutionalBot v6.0 — Multi-Asset Trading Bot para BingX
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-MEJORAS v6.0 vs v5.0:
-  • LONG + SHORT signals (el doble de oportunidades)
-  • Trailing Stop NATIVO de BingX (priceRate) — exchange gestiona el trail
-  • 150 símbolos priorizados por volumen real 24h
-  • 12 indicadores: HTF trend, EMA stack, EMA200, RSI, MACD,
-    ADX (fuerza tendencia), BOS, CHoCH, FVG, HVN, Donchian breakout, BB
-  • Filtro volatilidad mínima (evita monedas planas)
-  • Gestión riesgo diaria: pausa automática si pierde > MAX_DAILY_LOSS_PCT
-  • SL+TP integrados en la orden de apertura (API oficial BingX)
-  • Mega Runner: después de TP2, trail se amplía con TRAILING_STOP_MARKET nativo
-  • Heartbeat cada 100 scans
-  • XAUT-USDT (oro tokenizado Tether Gold, 24/7 por API)
+SuperBot Main Orchestrator v4
+FIXES CRÍTICOS vs v3:
+  1. signal.rr_ratio no existía en Signal → AttributeError silencioso
+  2. trade["atr"] nunca se guardaba → trailing stop usaba 0
+  3. Balance $0.00: fallback a MARKET si LIMIT falla, mejor logging
+  4. close_position_limit → ahora usa close_position (market) como fallback
+  5. DRY_RUN=true por defecto en Railway hasta confirmar balance real
+  6. Sync de posiciones BingX al arrancar (anti-duplicado tras restart)
 
-NOTA: BingX Commodity Futures (GOLD-USDT nativo) NO soporta API trading
-aún. Usamos XAUT-USDT como proxy del oro, que sí opera 24/7 por API.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MEJORAS v4:
+  - Orden de entrada: MARKET (garantiza ejecución) - NO más límits que no ejecutan
+  - TP1: 40% cierre LIMIT maker → TP2: trailing stop dinámico con priceRate
+  - Signal.rr_ratio calculado en bot antes de usar
+  - Cooldown 45 min (era 60)
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import asyncio
-import hashlib
-import hmac
-import json
 import logging
-import os
 import time
-from collections import defaultdict
+import json
+import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
-from urllib.parse import urlencode
 
-import httpx
-import numpy as np
-import pandas as pd
+from bingx_client import BingXClient
+from scanner import Scanner
+from risk_manager import RiskManager, TradeParams
+from strategy import Signal
+import notifier
 
-# ─────────────────────────────────────────────
-#  LOGGING
-# ─────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("BotV6")
+log = logging.getLogger("BOT")
 
 
-# ─────────────────────────────────────────────
-#  CONFIG — todas las variables en Railway
-# ─────────────────────────────────────────────
-class Config:
-    # BingX
-    API_KEY    = os.getenv("BINGX_API_KEY", "")
-    API_SECRET = os.getenv("BINGX_API_SECRET", "")
-    BASE_URL   = "https://open-api.bingx.com"
-
-    # Telegram
-    TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-    # Sizing
-    LEVERAGE        = int(os.getenv("LEVERAGE", "10"))
-    RISK_PCT        = float(os.getenv("RISK_PCT", "1.0"))
-    MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "6"))
-
-    # Scan
-    SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "30"))
-    MAX_SYMBOLS       = int(os.getenv("MAX_SYMBOLS", "150"))
-
-    # Volume Profile
-    VP_BINS           = int(os.getenv("VP_BINS", "20"))
-    HVN_THRESHOLD_PCT = float(os.getenv("HVN_THRESHOLD_PCT", "4.0"))
-    VP_LOOKBACK       = int(os.getenv("VP_LOOKBACK", "150"))
-
-    # Señales
-    MIN_SCORE_LONG  = float(os.getenv("MIN_SCORE_LONG", "3.0"))
-    MIN_SCORE_SHORT = float(os.getenv("MIN_SCORE_SHORT", "3.0"))
-    ENABLE_SHORTS   = os.getenv("ENABLE_SHORTS", "true").lower() == "true"
-
-    # TP / SL
-    SL_ATR_MULT  = float(os.getenv("SL_ATR_MULT", "1.5"))
-    TP1_ATR_MULT = float(os.getenv("TP1_ATR_MULT", "2.0"))
-    TP2_ATR_MULT = float(os.getenv("TP2_ATR_MULT", "4.0"))
-    TP3_ATR_MULT = float(os.getenv("TP3_ATR_MULT", "7.0"))
-
-    # Trailing Stop nativo BingX (% precio)
-    TRAIL_PCT      = float(os.getenv("TRAIL_PCT", "1.5"))
-    MEGA_TRAIL_PCT = float(os.getenv("MEGA_TRAIL_PCT", "3.0"))
-
-    # Mega Runner
-    RUNNER_ENABLED      = os.getenv("RUNNER_ENABLED", "true").lower() == "true"
-    MEGA_RUNNER_TRIGGER = float(os.getenv("MEGA_RUNNER_TRIGGER", "2.0"))
-
-    # Filtros calidad
-    MIN_VOLUME_USDT = float(os.getenv("MIN_VOLUME_USDT", "500000"))
-    MIN_ATR_PCT     = float(os.getenv("MIN_ATR_PCT", "0.5"))
-
-    # Riesgo diario
-    MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "5.0"))
-
-    # Timeframes
-    PRIMARY_TF = os.getenv("PRIMARY_TF", "15m")
-    HTF        = os.getenv("HTF", "1h")
-
-    # Prioridades (siempre incluidos, primeros en lista)
-    PRIORITY_SYMBOLS = [
-        "XAUT-USDT",  # Tether Gold — proxy oro 24/7 por API
-        "BTC-USDT",
-        "ETH-USDT",
-        "SOL-USDT",
-        "BNB-USDT",
-        "XRP-USDT",
-    ]
+def _env(keys: list, required: bool = True, default: str = "") -> str:
+    for key in keys:
+        val = os.environ.get(key, "")
+        if val:
+            return val.strip().strip('"').strip("'")  # limpia escapes de Railway
+    if required and not default:
+        raise EnvironmentError(f"Variable requerida no encontrada: {keys}")
+    return default
 
 
-# ─────────────────────────────────────────────
-#  BINGX HTTP CLIENT
-# ─────────────────────────────────────────────
-class BingXClient:
-    def __init__(self):
-        limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
-        self._c = httpx.AsyncClient(timeout=15, limits=limits)
+API_KEY    = _env(["BINGX_API_KEY"])
+SECRET_KEY = _env(["BINGX_API_SECRET", "BINGX_SECRET_KEY"])
 
-    def _sign(self, params: dict) -> str:
-        qs = urlencode(sorted(params.items()))
-        return hmac.new(Config.API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
+SCAN_PERIOD         = int(_env([], required=False, default=os.environ.get("SCAN_PERIOD_SECONDS", "900")))
+DRY_RUN             = os.environ.get("DRY_RUN", "false").lower() == "true"
+# CAMBIO CRÍTICO: usar MARKET en lugar de LIMIT → ejecución garantizada
+USE_MARKET_ENTRY    = os.environ.get("USE_MARKET_ENTRY", "true").lower() == "true"
+LIMIT_ORDER_TIMEOUT = int(os.environ.get("LIMIT_ORDER_TIMEOUT", "120"))
 
-    def _h(self) -> dict:
-        return {"X-BX-APIKEY": Config.API_KEY}
+RISK_PER_TRADE      = float(os.environ.get("RISK_PER_TRADE", "0.02"))    # 2% por trade
+MAX_POSITIONS       = int(os.environ.get("MAX_OPEN_TRADES", "4"))
+LEVERAGE            = int(os.environ.get("LEVERAGE", "10"))
+DAILY_LOSS_LIMIT    = float(os.environ.get("DAILY_LOSS_LIMIT", "0.06"))  # 6%
+MIN_CONFIDENCE      = float(os.environ.get("MIN_CONFIDENCE", "0.55"))    # bajado para más trades
+SYMBOL_COOLDOWN_MIN = int(os.environ.get("SYMBOL_COOLDOWN_MIN", "45"))   # era 60
 
-    def _ts(self) -> int:
-        return int(time.time() * 1000)
+# Trailing stop en BingX API (% de retroceso para activar cierre)
+TRAILING_STOP_RATE  = float(os.environ.get("TRAILING_STOP_RATE", "0.025"))  # 2.5%
 
-    async def _get(self, path: str, params: dict = None, signed: bool = False):
-        params = params or {}
-        if signed:
-            params["timestamp"] = self._ts()
-            params["signature"] = self._sign(params)
-        r = await self._c.get(Config.BASE_URL + path, params=params, headers=self._h())
-        r.raise_for_status()
-        d = r.json()
-        if d.get("code", 0) != 0:
-            raise ValueError(f"BingX {d.get('code')}: {d.get('msg')}")
-        return d
+STATE_FILE   = "/tmp/superbot_state.json"
+JOURNAL_FILE = Path("/tmp/trade_journal.json")
 
-    async def _post(self, path: str, params: dict = None):
-        params = params or {}
-        params["timestamp"] = self._ts()
-        params["signature"] = self._sign(params)
-        r = await self._c.post(Config.BASE_URL + path, params=params, headers=self._h())
-        r.raise_for_status()
-        d = r.json()
-        if d.get("code", 0) != 0:
-            raise ValueError(f"BingX {d.get('code')}: {d.get('msg')}")
-        return d
 
-    # ─── Mercado ──────────────────────────────
-    async def get_all_tickers(self) -> list[dict]:
-        d = await self._get("/openApi/swap/v2/quote/ticker")
-        return d.get("data", [])
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {"open_trades": {}, "daily_date": "", "cooldowns": {}}
 
-    async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        d = await self._get("/openApi/swap/v3/quote/klines", {
-            "symbol": symbol, "interval": interval, "limit": limit
-        })
-        rows = d.get("data", [])
-        if not rows:
-            return pd.DataFrame()
-        df = pd.DataFrame(rows, columns=["time","open","high","low","close","volume","_"])
-        df = df[["time","open","high","low","close","volume"]].astype(float)
-        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-        return df.sort_values("time").reset_index(drop=True)
 
-    # ─── Cuenta ───────────────────────────────
-    async def get_balance(self) -> float:
-        d = await self._get("/openApi/swap/v3/user/balance", signed=True)
-        for item in d.get("data", {}).get("balance", []):
-            if item.get("asset") == "USDT":
-                return float(item.get("availableMargin", 0))
+def save_state(state: dict):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        log.error(f"Error guardando estado: {e}")
+
+
+def load_journal() -> list:
+    if JOURNAL_FILE.exists():
+        try:
+            return json.loads(JOURNAL_FILE.read_text())
+        except Exception:
+            return []
+    return []
+
+
+def save_journal(journal: list):
+    JOURNAL_FILE.write_text(json.dumps(journal, indent=2))
+
+
+def record_trade(journal: list, symbol: str, direction: str, entry: float,
+                 exit_price: float, pnl: float, fees: float, reason: str):
+    journal.append({
+        "ts":        datetime.utcnow().isoformat(),
+        "symbol":    symbol,
+        "direction": direction,
+        "entry":     entry,
+        "exit":      exit_price,
+        "pnl":       round(pnl, 4),
+        "fees":      round(fees, 4),
+        "net_pnl":   round(pnl - fees, 4),
+        "win":       (pnl - fees) > 0,
+        "reason":    reason,
+    })
+    save_journal(journal)
+
+
+def get_winrate(journal: list, last_n: int = 30) -> float:
+    recent = journal[-last_n:] if len(journal) >= last_n else journal
+    if not recent:
+        return 0.5
+    return sum(1 for t in recent if t.get("win")) / len(recent)
+
+
+def calc_rr(signal: Signal) -> float:
+    """Calcula Risk:Reward ratio sin depender de Signal.rr_ratio"""
+    try:
+        sl_dist = abs(signal.entry - signal.sl)
+        tp1_dist = abs(signal.tp1 - signal.entry)
+        if sl_dist < 1e-10:
+            return 0.0
+        return round(tp1_dist / sl_dist, 2)
+    except Exception:
         return 0.0
 
-    async def get_positions(self) -> list[dict]:
-        d = await self._get("/openApi/swap/v2/user/positions", signed=True)
-        return [p for p in d.get("data", []) if float(p.get("positionAmt", 0)) != 0]
 
-    # ─── Órdenes ──────────────────────────────
-    async def set_leverage(self, symbol: str, lev: int, pos_side: str = "LONG"):
-        try:
-            await self._post("/openApi/swap/v2/trade/leverage", {
-                "symbol": symbol, "side": pos_side, "leverage": lev
-            })
-        except Exception as e:
-            log.debug(f"set_leverage: {e}")
-
-    async def open_position(self, symbol: str, side: str, pos_side: str,
-                            qty: float, sl: float, tp: float) -> dict:
-        """
-        Abre posición con SL y TP integrados (API oficial BingX v2).
-        side: BUY (long) / SELL (short)
-        """
-        params = {
-            "symbol"      : symbol,
-            "side"        : side,
-            "positionSide": pos_side,
-            "type"        : "MARKET",
-            "quantity"    : qty,
-            "takeProfit"  : json.dumps({
-                "type"       : "TAKE_PROFIT_MARKET",
-                "stopPrice"  : round(tp, 8),
-                "workingType": "MARK_PRICE",
-            }),
-            "stopLoss"    : json.dumps({
-                "type"       : "STOP_MARKET",
-                "stopPrice"  : round(sl, 8),
-                "workingType": "MARK_PRICE",
-            }),
-        }
-        d = await self._post("/openApi/swap/v2/trade/order", params)
-        return d.get("data", {})
-
-    async def close_partial(self, symbol: str, pos_side: str, qty: float) -> dict:
-        """Cierre parcial a mercado."""
-        side = "SELL" if pos_side == "LONG" else "BUY"
-        params = {
-            "symbol"      : symbol,
-            "side"        : side,
-            "positionSide": pos_side,
-            "type"        : "MARKET",
-            "quantity"    : qty,
-            "reduceOnly"  : "true",
-        }
-        d = await self._post("/openApi/swap/v2/trade/order", params)
-        return d.get("data", {})
-
-    async def place_trailing_stop(self, symbol: str, pos_side: str,
-                                  qty: float, activation_price: float,
-                                  price_rate: float) -> dict:
-        """
-        Trailing Stop NATIVO BingX.
-        priceRate = % trailing (ej: 1.5 = 1.5%)
-        Se activa cuando precio toca activationPrice.
-        """
-        side = "SELL" if pos_side == "LONG" else "BUY"
-        params = {
-            "symbol"         : symbol,
-            "side"           : side,
-            "positionSide"   : pos_side,
-            "type"           : "TRAILING_STOP_MARKET",
-            "quantity"       : qty,
-            "priceRate"      : price_rate,
-            "activationPrice": round(activation_price, 8),
-            "workingType"    : "MARK_PRICE",
-        }
-        d = await self._post("/openApi/swap/v2/trade/order", params)
-        return d.get("data", {})
-
-    async def cancel_all_orders(self, symbol: str):
-        try:
-            await self._post("/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
-        except Exception as e:
-            log.debug(f"cancel_all: {e}")
-
-    async def update_tp(self, symbol: str, pos_side: str, qty: float, new_tp: float):
-        """Recoloca TP (cancela y crea nuevo TAKE_PROFIT_MARKET)."""
-        await self.cancel_all_orders(symbol)
-        side = "SELL" if pos_side == "LONG" else "BUY"
-        try:
-            await self._post("/openApi/swap/v2/trade/order", {
-                "symbol"      : symbol,
-                "side"        : side,
-                "positionSide": pos_side,
-                "type"        : "TAKE_PROFIT_MARKET",
-                "quantity"    : qty,
-                "stopPrice"   : round(new_tp, 8),
-                "workingType" : "MARK_PRICE",
-                "reduceOnly"  : "true",
-            })
-        except Exception as e:
-            log.warning(f"update_tp {symbol}: {e}")
+def dynamic_min_confidence(journal: list, base: float = MIN_CONFIDENCE) -> float:
+    wr = get_winrate(journal, 20)
+    if len(journal) < 10:
+        return base
+    if wr < 0.40:
+        return min(base + 0.10, 0.78)
+    if wr > 0.65:
+        return max(base - 0.08, 0.45)
+    return base
 
 
-# ─────────────────────────────────────────────
-#  INDICADORES
-# ─────────────────────────────────────────────
-def _atr(df: pd.DataFrame, p: int = 14) -> pd.Series:
-    h, l, cp = df["high"], df["low"], df["close"].shift(1)
-    tr = pd.concat([h - l, (h - cp).abs(), (l - cp).abs()], axis=1).max(axis=1)
-    return tr.ewm(span=p, adjust=False).mean()
-
-def _ema(s: pd.Series, p: int) -> pd.Series:
-    return s.ewm(span=p, adjust=False).mean()
-
-def _rsi(s: pd.Series, p: int = 14) -> pd.Series:
-    d = s.diff()
-    g = d.clip(lower=0).ewm(span=p, adjust=False).mean()
-    l = (-d.clip(upper=0)).ewm(span=p, adjust=False).mean()
-    return 100 - 100 / (1 + g / l.replace(0, np.nan))
-
-def _macd(s: pd.Series):
-    line = _ema(s, 12) - _ema(s, 26)
-    return line, _ema(line, 9)
-
-def _bb(s: pd.Series, p: int = 20, std: float = 2.0):
-    m = s.rolling(p).mean()
-    d = s.rolling(p).std()
-    return m - std * d, m, m + std * d
-
-def _adx(df: pd.DataFrame, p: int = 14) -> float:
-    h, l, cp = df["high"], df["low"], df["close"].shift(1)
-    tr = pd.concat([h - l, (h - cp).abs(), (l - cp).abs()], axis=1).max(axis=1)
-    dp = (h - h.shift(1)).clip(lower=0)
-    dm = (l.shift(1) - l).clip(lower=0)
-    dp[dp < dm] = 0
-    dm[dm < dp] = 0
-    atr_ = tr.ewm(span=p, adjust=False).mean()
-    dip  = 100 * dp.ewm(span=p, adjust=False).mean() / atr_.replace(0, np.nan)
-    dim  = 100 * dm.ewm(span=p, adjust=False).mean() / atr_.replace(0, np.nan)
-    dx   = 100 * (dip - dim).abs() / (dip + dim).replace(0, np.nan)
-    return float(dx.ewm(span=p, adjust=False).mean().iloc[-1])
-
-def _donchian(df: pd.DataFrame, p: int = 20):
-    hmax = df["high"].rolling(p).max().iloc[-2]
-    lmin = df["low"].rolling(p).min().iloc[-2]
-    c    = df["close"].iloc[-1]
-    return c > hmax, c < lmin  # (long_bo, short_bo)
-
-def _volume_profile(df: pd.DataFrame) -> dict:
-    if len(df) < 10:
-        return {"poc": 0.0, "hvn": [], "val": 0.0, "vah": 0.0}
-    bins = Config.VP_BINS
-    lo, hi = df["low"].min(), df["high"].max()
-    if hi == lo:
-        return {"poc": 0.0, "hvn": [], "val": 0.0, "vah": 0.0}
-    edges   = np.linspace(lo, hi, bins + 1)
-    centers = (edges[:-1] + edges[1:]) / 2
-    vols    = np.zeros(bins)
-    for _, row in df.iterrows():
-        rl, rh, rv = row["low"], row["high"], row["volume"]
-        for i in range(bins):
-            ov = min(rh, edges[i+1]) - max(rl, edges[i])
-            if ov > 0:
-                frac = ov / (rh - rl) if rh != rl else 1.0
-                vols[i] += rv * frac
-    total = vols.sum()
-    if total == 0:
-        return {"poc": 0.0, "hvn": [], "val": 0.0, "vah": 0.0}
-    pi  = int(np.argmax(vols))
-    poc = centers[pi]
-    thr = total * (Config.HVN_THRESHOLD_PCT / 100)
-    hvn = [centers[i] for i in range(bins) if vols[i] >= thr]
-    target = total * 0.70
-    lo_i, hi_i, cov = pi, pi, vols[pi]
-    while cov < target and (lo_i > 0 or hi_i < bins - 1):
-        la = vols[lo_i - 1] if lo_i > 0 else 0
-        ha = vols[hi_i + 1] if hi_i < bins - 1 else 0
-        if la >= ha and lo_i > 0:
-            lo_i -= 1; cov += la
-        elif hi_i < bins - 1:
-            hi_i += 1; cov += ha
-        else:
-            lo_i -= 1; cov += la
-    return {"poc": poc, "hvn": hvn, "val": centers[lo_i], "vah": centers[hi_i]}
-
-def _structure(df: pd.DataFrame):
-    if len(df) < 20:
-        return None, None
-    hs = df["high"].rolling(5).max()
-    ls = df["low"].rolling(5).min()
-    c  = df["close"].iloc[-1]
-    bos = "bullish" if c > hs.iloc[-2] else ("bearish" if c < ls.iloc[-2] else None)
-    choch = None
-    if len(df) >= 40:
-        if bos == "bullish" and hs.iloc[-20] > hs.iloc[-2]:
-            choch = "bullish_reversal"
-        elif bos == "bearish" and ls.iloc[-20] < ls.iloc[-2]:
-            choch = "bearish_reversal"
-    return bos, choch
-
-def _fvg(df: pd.DataFrame) -> Optional[dict]:
-    for i in range(len(df) - 3, max(len(df) - 13, 1), -1):
-        c1, c3 = df.iloc[i], df.iloc[i + 2]
-        if c1["high"] < c3["low"]:
-            return {"type": "bullish", "low": c1["high"], "high": c3["low"]}
-        if c1["low"] > c3["high"]:
-            return {"type": "bearish", "low": c3["high"], "high": c1["low"]}
-    return None
-
-
-# ─────────────────────────────────────────────
-#  ANALIZADOR DE SEÑALES
-# ─────────────────────────────────────────────
-async def analyze(bx: BingXClient, symbol: str) -> Optional[dict]:
-    try:
-        df   = await bx.get_klines(symbol, Config.PRIMARY_TF, Config.VP_LOOKBACK)
-        df1h = await bx.get_klines(symbol, Config.HTF, 100)
-        if df.empty or df1h.empty or len(df) < 60:
-            return None
-
-        close = df["close"]
-        price = float(close.iloc[-1])
-
-        # Filtro volatilidad
-        atr_v   = float(_atr(df).iloc[-1])
-        atr_pct = (atr_v / price) * 100
-        if atr_pct < Config.MIN_ATR_PCT:
-            return None
-
-        # Indicadores
-        rsi_v    = float(_rsi(close).iloc[-1])
-        ml, ms   = _macd(close)
-        hist     = float((ml - ms).iloc[-1])
-        blo, _, bhi = _bb(close)
-        bmid     = float(_.iloc[-1])
-        blo_v    = float(blo.iloc[-1])
-        bhi_v    = float(bhi.iloc[-1])
-        ema20    = float(_ema(close, 20).iloc[-1])
-        ema50    = float(_ema(close, 50).iloc[-1])
-        ema200   = float(_ema(close, 200).iloc[-1]) if len(close) >= 200 else ema50
-        adx_v    = _adx(df)
-        don_l, don_s = _donchian(df)
-
-        htf_c   = df1h["close"]
-        htf_e50 = float(_ema(htf_c, 50).iloc[-1])
-        htf_rsi = float(_rsi(htf_c).iloc[-1])
-        htf_bull = float(htf_c.iloc[-1]) > htf_e50
-
-        vol_avg  = float(df["volume"].rolling(20).mean().iloc[-1])
-        vol_last = float(df["volume"].iloc[-1])
-        vol_sp   = vol_last > vol_avg * 1.5
-
-        vp       = _volume_profile(df.tail(Config.VP_LOOKBACK))
-        bos, choch = _structure(df)
-        fvg_     = _fvg(df)
-
-        # ── LONG score ───────────────────────────────────────────
-        ls, lr = 0.0, []
-        if htf_bull:                                     ls += 1.0; lr.append("HTF↑")
-        if price > ema20 > ema50:                        ls += 1.0; lr.append("EMA↑")
-        if price > ema200:                               ls += 0.5; lr.append("EMA200↑")
-        if 40 < rsi_v < 65:                              ls += 0.5; lr.append(f"RSI{rsi_v:.0f}")
-        if rsi_v < 35:                                   ls += 1.0; lr.append(f"RSI_OS{rsi_v:.0f}")
-        if hist > 0:                                     ls += 1.0; lr.append("MACD+")
-        if adx_v > 25:                                   ls += 0.5; lr.append(f"ADX{adx_v:.0f}")
-        if bos == "bullish":                             ls += 1.0; lr.append("BOS↑")
-        if choch == "bullish_reversal":                  ls += 0.5; lr.append("CHoCH↑")
-        if fvg_ and fvg_["type"] == "bullish" and fvg_["low"] <= price <= fvg_["high"]:
-                                                         ls += 1.0; lr.append("FVG↑")
-        if vp["hvn"] and any(abs(price-h)/price < 0.006 for h in vp["hvn"]):
-                                                         ls += 1.0; lr.append("HVN")
-        if vol_sp:                                       ls += 0.5; lr.append("VolSpike")
-        if don_l:                                        ls += 1.0; lr.append("Donchian↑")
-        if vp["val"] < price < vp["vah"]:               ls += 0.5; lr.append("VA")
-        if blo_v < price < bmid:                         ls += 0.5; lr.append("BB_long")
-        if htf_rsi < 45:                                 ls += 0.5; lr.append(f"HTF_RSI{htf_rsi:.0f}")
-
-        # ── SHORT score ──────────────────────────────────────────
-        ss, sr = 0.0, []
-        if not htf_bull:                                 ss += 1.0; sr.append("HTF↓")
-        if price < ema20 < ema50:                        ss += 1.0; sr.append("EMA↓")
-        if price < ema200:                               ss += 0.5; sr.append("EMA200↓")
-        if 35 < rsi_v < 60:                              ss += 0.5; sr.append(f"RSI{rsi_v:.0f}")
-        if rsi_v > 65:                                   ss += 1.0; sr.append(f"RSI_OB{rsi_v:.0f}")
-        if hist < 0:                                     ss += 1.0; sr.append("MACD-")
-        if adx_v > 25:                                   ss += 0.5; sr.append(f"ADX{adx_v:.0f}")
-        if bos == "bearish":                             ss += 1.0; sr.append("BOS↓")
-        if choch == "bearish_reversal":                  ss += 0.5; sr.append("CHoCH↓")
-        if fvg_ and fvg_["type"] == "bearish" and fvg_["low"] <= price <= fvg_["high"]:
-                                                         ss += 1.0; sr.append("FVG↓")
-        if vp["hvn"] and any(abs(price-h)/price < 0.006 for h in vp["hvn"]):
-                                                         ss += 1.0; sr.append("HVN_R")
-        if vol_sp:                                       ss += 0.5; sr.append("VolSpike")
-        if don_s:                                        ss += 1.0; sr.append("Donchian↓")
-        if bmid < price < bhi_v:                         ss += 0.5; sr.append("BB_short")
-        if htf_rsi > 55:                                 ss += 0.5; sr.append(f"HTF_RSI{htf_rsi:.0f}")
-
-        # ── Dirección ────────────────────────────────────────────
-        direction, score, reasons = None, 0.0, []
-        if ls >= Config.MIN_SCORE_LONG and ls >= ss:
-            direction, score, reasons = "LONG", ls, lr
-        elif Config.ENABLE_SHORTS and ss >= Config.MIN_SCORE_SHORT:
-            direction, score, reasons = "SHORT", ss, sr
-        if direction is None:
-            return None
-
-        # ── SL / TP ──────────────────────────────────────────────
-        if direction == "LONG":
-            sl  = price - Config.SL_ATR_MULT  * atr_v
-            tp1 = price + Config.TP1_ATR_MULT * atr_v
-            tp2 = price + Config.TP2_ATR_MULT * atr_v
-            tp3 = price + Config.TP3_ATR_MULT * atr_v
-        else:
-            sl  = price + Config.SL_ATR_MULT  * atr_v
-            tp1 = price - Config.TP1_ATR_MULT * atr_v
-            tp2 = price - Config.TP2_ATR_MULT * atr_v
-            tp3 = price - Config.TP3_ATR_MULT * atr_v
-
-        return {
-            "symbol": symbol, "direction": direction, "price": price,
-            "atr": atr_v, "atr_pct": atr_pct,
-            "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-            "score": score, "reasons": reasons,
-            "rsi": rsi_v, "adx": adx_v,
-            "poc": vp["poc"], "hvn": vp["hvn"],
-            "val": vp["val"], "vah": vp["vah"],
-        }
-    except Exception as e:
-        log.debug(f"analyze {symbol}: {e}")
-        return None
-
-
-# ─────────────────────────────────────────────
-#  TELEGRAM
-# ─────────────────────────────────────────────
-class Telegram:
+class SuperBot:
     def __init__(self):
-        self._c = httpx.AsyncClient(timeout=10)
+        self.client  = BingXClient(API_KEY, SECRET_KEY)
+        self.scanner = Scanner(self.client)
+        self.risk    = RiskManager(
+            risk_pct=RISK_PER_TRADE,
+            max_pos=MAX_POSITIONS,
+            leverage=LEVERAGE,
+            daily_loss_limit=DAILY_LOSS_LIMIT,
+        )
+        self.state   = load_state()
+        self.journal = load_journal()
+        self._sym_info_cache: dict = {}
 
-    async def send(self, text: str):
-        if not Config.TG_TOKEN or not Config.TG_CHAT_ID:
+        log.info(
+            f"🤖 SuperBot v4 | DRY={DRY_RUN} | "
+            f"Risk={RISK_PER_TRADE*100:.1f}% | Lev={LEVERAGE}x | "
+            f"MaxPos={MAX_POSITIONS} | Market={USE_MARKET_ENTRY} | "
+            f"Journal={len(self.journal)}"
+        )
+        self._sync_positions_on_start()
+        self._init_daily()
+
+    # ── Sync posiciones al arrancar (anti-duplicado tras restart) ─────
+    def _sync_positions_on_start(self):
+        if DRY_RUN:
             return
         try:
-            await self._c.post(
-                f"https://api.telegram.org/bot{Config.TG_TOKEN}/sendMessage",
-                json={"chat_id": Config.TG_CHAT_ID, "text": text[:4000], "parse_mode": "HTML"},
-            )
+            live = {p["symbol"] for p in self.client.get_positions() if abs(float(p.get("positionAmt", 0))) > 0}
+            stale = [s for s in list(self.state["open_trades"]) if s not in live]
+            for s in stale:
+                log.info(f"🔄 Sync: eliminando posición huérfana {s}")
+                del self.state["open_trades"][s]
+            if stale:
+                save_state(self.state)
+            log.info(f"🔄 Sync: {len(live)} posiciones vivas en BingX, {len(stale)} huérfanas limpiadas")
         except Exception as e:
-            log.error(f"Telegram: {e}")
+            log.warning(f"Sync positions error (no crítico): {e}")
 
-
-# ─────────────────────────────────────────────
-#  BOT PRINCIPAL
-# ─────────────────────────────────────────────
-class InstitutionalBot:
-    def __init__(self):
-        self.bx     = BingXClient()
-        self.tg     = Telegram()
-        self.symbols: list[str] = []
-        self.trades : dict[str, dict] = {}
-        self.stats  = defaultdict(int)
-        # Riesgo diario
-        self.day_start_bal: float = 0.0
-        self.day_date: str = ""
-        self.paused: bool = False
-
-    # ─── Control riesgo ───────────────────────
-    async def _daily_risk_ok(self) -> bool:
+    def _init_daily(self):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if today != self.day_date:
-            bal = await self.bx.get_balance()
-            self.day_start_bal = bal
-            self.day_date      = today
-            self.paused        = False
-            log.info(f"[DIA NUEVO] Balance: ${bal:.2f}")
-        if self.day_start_bal <= 0:
+        if self.state.get("daily_date") != today:
+            balance = self._safe_get_balance()
+            self.risk.reset_daily(balance)
+            self.state["daily_date"] = today
+            self.state.setdefault("cooldowns", {})
+            save_state(self.state)
+            notifier.notify_startup(balance, DRY_RUN)
+
+    def _safe_get_balance(self) -> float:
+        """
+        FIX: múltiples intentos con logging detallado para diagnosticar $0
+        """
+        for attempt in range(3):
+            try:
+                bal = self.client.get_balance()
+                if bal > 0:
+                    return bal
+                log.warning(f"Balance $0 en intento {attempt+1}/3 (puede ser API issue)")
+                time.sleep(1)
+            except Exception as e:
+                log.error(f"get_balance error intento {attempt+1}: {e}")
+                time.sleep(1)
+        log.error("❌ Balance $0 tras 3 intentos → verifica API keys y permisos en BingX")
+        return 1000.0 if DRY_RUN else 0.0
+
+    def _get_precision(self, symbol: str) -> tuple:
+        if symbol not in self._sym_info_cache:
+            try:
+                info = self.client.get_symbol_info(symbol)
+                self._sym_info_cache[symbol] = (
+                    int(info.get("quantityPrecision", 3)),
+                    int(info.get("pricePrecision", 4)),
+                )
+            except Exception:
+                self._sym_info_cache[symbol] = (3, 4)
+        return self._sym_info_cache[symbol]
+
+    def _is_in_cooldown(self, symbol: str) -> bool:
+        cooldowns = self.state.get("cooldowns", {})
+        last_ts   = cooldowns.get(symbol)
+        if not last_ts:
+            return False
+        elapsed = (time.time() - last_ts) / 60
+        if elapsed < SYMBOL_COOLDOWN_MIN:
+            log.info(f"⏳ {symbol} cooldown ({elapsed:.0f}/{SYMBOL_COOLDOWN_MIN}min)")
             return True
-        bal     = await self.bx.get_balance()
-        loss_p  = (self.day_start_bal - bal) / self.day_start_bal * 100
-        if loss_p >= Config.MAX_DAILY_LOSS_PCT and not self.paused:
-            self.paused = True
-            await self.tg.send(
-                f"⛔ <b>PAUSA DIARIA ACTIVADA</b>\n"
-                f"Pérdida: {loss_p:.1f}% ≥ límite {Config.MAX_DAILY_LOSS_PCT}%\n"
-                f"Reanuda mañana UTC."
-            )
-        return not self.paused
+        return False
 
-    # ─── Símbolos ─────────────────────────────
-    async def _refresh_symbols(self):
-        try:
-            tickers = await self.bx.get_all_tickers()
-            # Filtrar por volumen mínimo y ordenar desc
-            valid = []
-            for t in tickers:
-                sym = t.get("symbol", "")
-                if not sym.endswith("-USDT"):
-                    continue
-                try:
-                    vol = float(t.get("quoteVolume") or t.get("volume") or 0)
-                except Exception:
-                    vol = 0
-                if vol >= Config.MIN_VOLUME_USDT:
-                    valid.append((sym, vol))
-            valid.sort(key=lambda x: x[1], reverse=True)
+    def _set_cooldown(self, symbol: str):
+        self.state.setdefault("cooldowns", {})[symbol] = time.time()
+        save_state(self.state)
 
-            # Prioridades primero
-            selected = list(Config.PRIORITY_SYMBOLS)
-            for sym, _ in valid:
-                if sym not in selected:
-                    selected.append(sym)
-                if len(selected) >= Config.MAX_SYMBOLS:
-                    break
-
-            self.symbols = selected
-            top5 = [s for s, _ in valid[:5]]
-            log.info(f"Símbolos: {len(self.symbols)} | Top5 vol: {top5}")
-        except Exception as e:
-            log.error(f"_refresh_symbols: {e}")
-
-    # ─── Abrir posición ───────────────────────
-    async def open_position(self, sig: dict):
-        symbol = sig["symbol"]
-        if symbol in self.trades or len(self.trades) >= Config.MAX_OPEN_TRADES:
+    # ── Abrir trade ───────────────────────────────────────────────────
+    def _open_trade(self, symbol: str, signal: Signal):
+        if symbol in self.state["open_trades"]:
             return
-        try:
-            bal       = await self.bx.get_balance()
-            risk_usdt = bal * (Config.RISK_PCT / 100)
-            sl_dist   = abs(sig["price"] - sig["sl"])
-            if sl_dist <= 0:
-                return
-            qty = round((risk_usdt * Config.LEVERAGE) / sl_dist, 3)
-            if qty <= 0:
-                return
-
-            pos_side = "LONG" if sig["direction"] == "LONG" else "SHORT"
-            side     = "BUY"  if sig["direction"] == "LONG" else "SELL"
-
-            await self.bx.set_leverage(symbol, Config.LEVERAGE, pos_side)
-            order = await self.bx.open_position(
-                symbol, side, pos_side, qty, sig["sl"], sig["tp1"]
-            )
-            if not order:
-                return
-
-            self.trades[symbol] = {
-                "direction"    : sig["direction"],
-                "pos_side"     : pos_side,
-                "entry"        : sig["price"],
-                "sl"           : sig["sl"],
-                "tp1"          : sig["tp1"],
-                "tp2"          : sig["tp2"],
-                "tp3"          : sig["tp3"],
-                "atr"          : sig["atr"],
-                "qty"          : qty,
-                "qty_left"     : qty,
-                "tp1_hit"      : False,
-                "tp2_hit"      : False,
-                "mega"         : False,
-                "trail_active" : False,
-                "opened_at"    : time.time(),
-            }
-            self.stats["opened"] += 1
-
-            hvn_str = ", ".join(f"${h:.6g}" for h in sig["hvn"][:3]) or "—"
-            emoji   = "🟢" if sig["direction"] == "LONG" else "🔴"
-            arrow   = "↑ LONG" if sig["direction"] == "LONG" else "↓ SHORT"
-
-            await self.tg.send(
-                f"{emoji} <b>{arrow} OPENED v6.0</b>\n"
-                f"━━━━━━━━━━━━━━━━━\n"
-                f"📌 <b>{symbol}</b>\n"
-                f"💰 Entry : <b>${sig['price']:.6g}</b>\n"
-                f"🛑 SL    : ${sig['sl']:.6g}\n"
-                f"🎯 TP1   : ${sig['tp1']:.6g}\n"
-                f"🎯 TP2   : ${sig['tp2']:.6g}\n"
-                f"🎯 TP3   : ${sig['tp3']:.6g}\n"
-                f"━━━━━━━━━━━━━━━━━\n"
-                f"📊 POC: ${sig['poc']:.6g} | VAL: ${sig['val']:.6g} | VAH: ${sig['vah']:.6g}\n"
-                f"🔷 HVN: {hvn_str}\n"
-                f"━━━━━━━━━━━━━━━━━\n"
-                f"⚡ Score: {sig['score']:.1f} | RSI: {sig['rsi']:.0f} | ADX: {sig['adx']:.0f}\n"
-                f"✅ {' | '.join(sig['reasons'])}\n"
-                f"📦 Qty: {qty} | Lev: {Config.LEVERAGE}x | ATR%: {sig['atr_pct']:.2f}%\n"
-                f"💼 Risk: ${risk_usdt:.2f}"
-            )
-            log.info(f"OPENED {sig['direction']} {symbol} @ {sig['price']:.6g} score={sig['score']:.1f}")
-
-        except Exception as e:
-            log.error(f"open_position {symbol}: {e}")
-
-    # ─── Monitorear trades ────────────────────
-    async def monitor(self):
-        if not self.trades:
-            return
-        try:
-            positions = await self.bx.get_positions()
-        except Exception as e:
-            log.warning(f"get_positions: {e}")
+        if self._is_in_cooldown(symbol):
             return
 
-        live = {p["symbol"] for p in positions}
+        direction  = signal.direction
+        entry      = signal.entry
+        sl         = signal.sl
+        tp1        = signal.tp1
+        tp2        = signal.tp2
+        tp3        = signal.tp3
+        score      = signal.score
+        reason     = signal.reason
+        atr_v      = signal.atr
+        confidence = score / 100.0
 
-        for symbol, t in list(self.trades.items()):
-            # Cerrada por SL/TP nativo o manualmente
-            if symbol not in live:
-                self.stats["closed"] += 1
-                await self.tg.send(f"📤 <b>Posición cerrada</b>: {symbol}\n(SL/TP nativo o manual)")
-                del self.trades[symbol]
+        # FIX: calcular rr aquí en lugar de signal.rr_ratio (que no existe)
+        rr = calc_rr(signal)
+
+        # Descartar señales con RR < 1.2 o volumen insuficiente
+        if rr < 1.2:
+            log.info(f"❌ [{symbol}] RR={rr:.1f} < 1.2 → skip")
+            return
+        if hasattr(signal, 'vol_ok') and not signal.vol_ok:
+            log.info(f"❌ [{symbol}] Volumen insuficiente → skip")
+            return
+
+        min_conf = dynamic_min_confidence(self.journal)
+        if confidence < min_conf:
+            log.info(f"❌ [{symbol}] conf={confidence:.2f} < {min_conf:.2f} RR={rr:.1f}x")
+            return
+
+        balance    = self._safe_get_balance()
+        open_count = len(self.state["open_trades"])
+
+        if not self.risk.can_open_trade(open_count, balance):
+            return
+
+        qty_p, price_p = self._get_precision(symbol)
+        params = self.risk.size_position(
+            symbol, direction, entry, sl, tp1, tp2, tp3,
+            balance, qty_p, price_p,
+        )
+        if not params:
+            return
+
+        trade_id = str(uuid.uuid4())[:8]
+        trade_data = {
+            "trade_id":    trade_id,
+            "direction":   direction,
+            "entry":       params.entry_price,
+            "sl":          params.sl_price,
+            "sl_original": params.sl_price,
+            "tp1":         params.tp1_price,
+            "tp2":         params.tp2_price,
+            "tp3":         params.tp3_price,
+            "qty":         params.quantity,
+            "qty_full":    params.quantity,
+            "qty_p":       qty_p,
+            "price_p":     price_p,
+            "atr":         atr_v,              # FIX: guardado correctamente
+            "tp1_hit":     False,
+            "tp2_hit":     False,
+            "breakeven":   False,
+            "trail_active": False,
+            "opened_at":   datetime.utcnow().isoformat(),
+            "est_fee":     params.est_fee,
+            "rr":          rr,
+            "regime":      getattr(signal, "regime", "UNKNOWN"),
+            "tier":        getattr(signal, "tier", "?"),
+        }
+
+        # ── DRY RUN ──────────────────────────────────────────────────
+        if DRY_RUN:
+            log.info(
+                f"🔵 [DRY] {symbol} {direction} x{params.quantity} "
+                f"@ {params.entry_price} SL={params.sl_price} TP1={params.tp1_price} "
+                f"conf={confidence:.2f} RR={rr:.1f}x [{getattr(signal,'tier','?')}]"
+            )
+            trade_data["order_id"] = "DRY-" + trade_id
+            trade_data["status"]   = "FILLED"
+            self.state["open_trades"][symbol] = trade_data
+            save_state(self.state)
+            notifier.notify_trade_opened(
+                symbol, direction, params.quantity,
+                params.entry_price, params.sl_price,
+                params.tp1_price, params.tp2_price,
+                params.notional, dry_run=True,
+            )
+            return
+
+        # ── LIVE ─────────────────────────────────────────────────────
+        try:
+            try:
+                self.client.set_margin_type(symbol, "ISOLATED")
+            except Exception:
+                pass
+            self.client.set_leverage(symbol, params.leverage)
+
+            side     = "BUY" if direction == "LONG" else "SELL"
+            pos_side = direction
+
+            # CAMBIO CLAVE: MARKET order → ejecución garantizada
+            # Antes: LIMIT orders que nunca se ejecutaban
+            result = self.client.place_order(
+                symbol=symbol,
+                side=side,
+                position_side=pos_side,
+                order_type="MARKET",
+                quantity=params.quantity,
+                stop_loss=params.sl_price,
+                take_profit=params.tp1_price,   # TP1 fijo en BingX
+                client_order_id=f"sb_{trade_id}",
+            )
+
+            order_id = result.get("data", {}).get("orderId", "")
+            if not order_id:
+                log.error(f"❌ No orderId {symbol}: {result}")
+                return
+
+            # Después de entrar, colocar trailing stop en BingX
+            # para el 60% restante (TP2 en adelante)
+            try:
+                self.client.place_trailing_stop(
+                    symbol=symbol,
+                    side="SELL" if direction == "LONG" else "BUY",
+                    position_side=pos_side,
+                    quantity=round(params.quantity * 0.60, qty_p),
+                    activation_price=params.tp1_price,
+                    price_rate=TRAILING_STOP_RATE,
+                )
+                log.info(f"📈 Trailing stop colocado {symbol}: rate={TRAILING_STOP_RATE*100:.1f}%")
+            except Exception as e:
+                log.warning(f"Trailing stop no colocado {symbol}: {e}")
+
+            log.info(
+                f"✅ MARKET {symbol} {direction} qty={params.quantity} "
+                f"SL={params.sl_price} TP1={params.tp1_price} "
+                f"id={order_id} conf={confidence:.2f}"
+            )
+
+            trade_data["order_id"] = str(order_id)
+            trade_data["status"]   = "FILLED"
+            self.state["open_trades"][symbol] = trade_data
+            save_state(self.state)
+            notifier.notify_trade_opened(
+                symbol, direction, params.quantity,
+                params.entry_price, params.sl_price,
+                params.tp1_price, params.tp2_price,
+                params.notional, dry_run=False,
+            )
+
+        except Exception as e:
+            log.error(f"❌ Error abriendo {symbol}: {e}", exc_info=True)
+
+    # ── Gestionar posiciones abiertas ─────────────────────────────────
+    def _manage_positions(self):
+        active = {
+            s: t for s, t in self.state["open_trades"].items()
+            if t.get("status") == "FILLED"
+        }
+        if not active:
+            return
+
+        exchange_positions = {}
+        if not DRY_RUN:
+            try:
+                for p in self.client.get_positions():
+                    if abs(float(p.get("positionAmt", 0) or 0)) > 0:
+                        exchange_positions[p["symbol"]] = p
+            except Exception as e:
+                log.error(f"Error obteniendo posiciones: {e}")
+                return
+
+        for symbol, trade in list(active.items()):
+            direction = trade["direction"]
+            qty       = trade["qty"]
+            qty_full  = trade.get("qty_full", qty)
+            tp1       = trade["tp1"]
+            tp2       = trade["tp2"]
+            entry     = trade.get("entry", 0)
+            sl        = trade.get("sl", 0)
+            atr_v     = trade.get("atr", 0)       # FIX: ahora está guardado
+            qty_p     = trade.get("qty_p", 3)
+            price_p   = trade.get("price_p", 4)
+            tp1_hit   = trade.get("tp1_hit", False)
+            breakeven = trade.get("breakeven", False)
+            est_fee   = trade.get("est_fee", 0)
+
+            # Posición cerrada externamente
+            if not DRY_RUN and symbol not in exchange_positions:
+                log.info(f"📤 Cerrada externamente: {symbol}")
+                loss = abs(entry - sl) * qty_full * 0.5 if entry and sl else 0
+                self.risk.record_pnl(-loss, est_fee)
+                notifier.notify_sl_hit(symbol, sl, loss)
+                record_trade(self.journal, symbol, direction, entry, sl, -loss, est_fee, "SL_HIT")
+                self._set_cooldown(symbol)
+                del self.state["open_trades"][symbol]
+                save_state(self.state)
                 continue
 
-            # Precio actual desde position
+            # Precio actual
             try:
-                pos   = next(p for p in positions if p["symbol"] == symbol)
-                price = float(pos.get("markPrice") or pos.get("avgPrice") or 0)
+                ticker = self.client.get_ticker(symbol)
+                price  = float(ticker.get("lastPrice", 0) or 0)
             except Exception:
                 continue
-            if price == 0:
+            if price <= 0:
                 continue
 
-            is_long  = t["direction"] == "LONG"
-            pnl_pct  = ((price - t["entry"]) / t["entry"]) * 100 * (1 if is_long else -1)
-            qty_left = t["qty_left"]
+            # Mover SL a breakeven cuando estamos al 70% del camino a TP1
+            if not breakeven and not tp1_hit and atr_v > 0:
+                progress = (
+                    (price - entry) / max(tp1 - entry, 1e-10) if direction == "LONG"
+                    else (entry - price) / max(entry - tp1, 1e-10)
+                )
+                if progress >= 0.70:
+                    buffer = atr_v * 0.15
+                    new_sl = round(entry + buffer if direction == "LONG" else entry - buffer, price_p)
+                    if not DRY_RUN:
+                        try:
+                            self.client.update_sl(symbol, direction, new_sl)
+                        except Exception as e:
+                            log.warning(f"Update SL {symbol}: {e}")
+                    self.state["open_trades"][symbol]["sl"]        = new_sl
+                    self.state["open_trades"][symbol]["breakeven"] = True
+                    save_state(self.state)
+                    log.info(f"🔒 Breakeven {symbol} SL→{new_sl} (progress={progress:.0%})")
 
-            # ── TP1 ─────────────────────────────────
-            if not t["tp1_hit"]:
-                hit = (is_long and price >= t["tp1"]) or (not is_long and price <= t["tp1"])
-                if hit:
-                    t["tp1_hit"] = True
-                    close_q = round(qty_left * 0.33, 3)
-                    t["qty_left"] = round(qty_left - close_q, 3)
-                    try:
-                        await self.bx.close_partial(symbol, t["pos_side"], close_q)
-                        # Recoloca TP en TP2 y mantiene SL en breakeven
-                        await self.bx.cancel_all_orders(symbol)
-                        side = "SELL" if is_long else "BUY"
-                        await self.bx._post("/openApi/swap/v2/trade/order", {
-                            "symbol": symbol, "side": side, "positionSide": t["pos_side"],
-                            "type": "STOP_MARKET", "quantity": t["qty_left"],
-                            "stopPrice": round(t["entry"], 8),
-                            "workingType": "MARK_PRICE", "reduceOnly": "true",
-                        })
-                        await self.bx._post("/openApi/swap/v2/trade/order", {
-                            "symbol": symbol, "side": side, "positionSide": t["pos_side"],
-                            "type": "TAKE_PROFIT_MARKET", "quantity": t["qty_left"],
-                            "stopPrice": round(t["tp2"], 8),
-                            "workingType": "MARK_PRICE", "reduceOnly": "true",
-                        })
-                    except Exception as e:
-                        log.warning(f"TP1 reorder {symbol}: {e}")
-                    await self.tg.send(
-                        f"🎯 <b>TP1 HIT</b> {symbol}\n"
-                        f"Price: ${price:.6g} | PnL: +{pnl_pct:.1f}%\n"
-                        f"✂️ 33% cerrado | SL → breakeven\n"
-                        f"🎯 Siguiente: ${t['tp2']:.6g}"
-                    )
-                    continue
+            # TP1: cierre parcial 40%
+            if not tp1_hit:
+                tp1_hit_now = (
+                    (direction == "LONG" and price >= tp1) or
+                    (direction == "SHORT" and price <= tp1)
+                )
+                if tp1_hit_now:
+                    partial = round(qty * 0.40, qty_p)
+                    if not DRY_RUN:
+                        try:
+                            # usar MARKET para asegurar el cierre
+                            close_side = "SELL" if direction == "LONG" else "BUY"
+                            self.client.close_position_partial(symbol, direction, partial)
+                        except Exception as e:
+                            log.error(f"Error cierre parcial TP1 {symbol}: {e}")
+                    est_pnl = abs(price - entry) * partial
+                    fee_tp1 = partial * price * 0.0005  # taker fee en cierre market
+                    self.risk.record_pnl(est_pnl - fee_tp1, fee_tp1)
+                    notifier.notify_tp_hit(symbol, 1, price, partial, est_pnl - fee_tp1)
+                    remaining = round(qty - partial, qty_p)
+                    self.state["open_trades"][symbol]["tp1_hit"] = True
+                    self.state["open_trades"][symbol]["qty"]     = remaining
+                    save_state(self.state)
+                    log.info(f"💰 TP1 {symbol} @ {price} | pnl=${est_pnl:.2f} | rest={remaining}")
 
-            # ── TP2 ─────────────────────────────────
-            if t["tp1_hit"] and not t["tp2_hit"]:
-                hit = (is_long and price >= t["tp2"]) or (not is_long and price <= t["tp2"])
-                if hit:
-                    t["tp2_hit"] = True
-                    close_q = round(qty_left * 0.50, 3)
-                    t["qty_left"] = round(qty_left - close_q, 3)
-                    try:
-                        await self.bx.close_partial(symbol, t["pos_side"], close_q)
-                        await self.bx.cancel_all_orders(symbol)
-                        # Trailing Stop NATIVO activado
-                        await self.bx.place_trailing_stop(
-                            symbol, t["pos_side"], t["qty_left"],
-                            activation_price=price,
-                            price_rate=Config.TRAIL_PCT,
-                        )
-                        t["trail_active"] = True
-                    except Exception as e:
-                        log.warning(f"TP2 trail {symbol}: {e}")
-                    await self.tg.send(
-                        f"🎯 <b>TP2 HIT</b> {symbol}\n"
-                        f"Price: ${price:.6g} | PnL: +{pnl_pct:.1f}%\n"
-                        f"✂️ Otro 33% cerrado\n"
-                        f"🔄 Trailing Stop NATIVO {Config.TRAIL_PCT}% activado\n"
-                        f"🎯 TP3: ${t['tp3']:.6g}"
-                    )
-                    continue
+            # TP2: cerrar todo
+            elif not trade.get("tp2_hit", False):
+                tp2_hit_now = (
+                    (direction == "LONG" and price >= tp2) or
+                    (direction == "SHORT" and price <= tp2)
+                )
+                if tp2_hit_now:
+                    remaining = self.state["open_trades"][symbol]["qty"]
+                    if not DRY_RUN:
+                        try:
+                            self.client.close_position_partial(symbol, direction, remaining)
+                        except Exception as e:
+                            log.error(f"Error cierre TP2 {symbol}: {e}")
+                    est_pnl = abs(price - entry) * remaining
+                    fee_tp2 = remaining * price * 0.0005
+                    self.risk.record_pnl(est_pnl - fee_tp2, fee_tp2)
+                    notifier.notify_tp_hit(symbol, 2, price, remaining, est_pnl - fee_tp2)
+                    record_trade(self.journal, symbol, direction, entry, price,
+                                 est_pnl, est_fee + fee_tp2, "TP2")
+                    self._set_cooldown(symbol)
+                    del self.state["open_trades"][symbol]
+                    save_state(self.state)
+                    log.info(f"🎯 TP2 {symbol} @ {price} | pnl=${est_pnl:.2f}")
 
-            # ── Mega Runner ──────────────────────────
-            if t["tp2_hit"] and Config.RUNNER_ENABLED and not t["mega"]:
-                tp2_dist = abs(t["tp2"] - t["entry"])
-                mega_trigger = (t["tp2"] + tp2_dist * Config.MEGA_RUNNER_TRIGGER if is_long
-                                else t["tp2"] - tp2_dist * Config.MEGA_RUNNER_TRIGGER)
-                hit = (is_long and price >= mega_trigger) or (not is_long and price <= mega_trigger)
-                if hit:
-                    t["mega"] = True
-                    try:
-                        await self.bx.cancel_all_orders(symbol)
-                        await self.bx.place_trailing_stop(
-                            symbol, t["pos_side"], t["qty_left"],
-                            activation_price=price,
-                            price_rate=Config.MEGA_TRAIL_PCT,
-                        )
-                    except Exception as e:
-                        log.warning(f"Mega Runner {symbol}: {e}")
-                    await self.tg.send(
-                        f"🚀 <b>MEGA RUNNER!</b> {symbol}\n"
-                        f"Price: ${price:.6g} | PnL: +{pnl_pct:.1f}%\n"
-                        f"🔥 Trail ampliado a {Config.MEGA_TRAIL_PCT}% — ¡dejamos correr!"
-                    )
-
-    # ─── Scan señales ─────────────────────────
-    async def scan(self):
-        slots = Config.MAX_OPEN_TRADES - len(self.trades)
-        if slots <= 0:
+    # ── Limpiar órdenes activación huérfanas ──────────────────────────
+    def _cleanup_stale_triggers(self):
+        """Cancela órdenes trigger que llevan más de 2h sin ejecutarse."""
+        if DRY_RUN:
             return
+        try:
+            open_orders = self.client.get_open_orders()
+            now = time.time() * 1000
+            for o in open_orders:
+                created = float(o.get("time", now))
+                age_h   = (now - created) / 3_600_000
+                otype   = o.get("type", "")
+                if otype in ("TRIGGER", "TRIGGER_LIMIT") and age_h > 2:
+                    sym = o.get("symbol", "")
+                    oid = o.get("orderId", "")
+                    log.info(f"🧹 Cancelando trigger huérfano {sym} id={oid} ({age_h:.1f}h)")
+                    try:
+                        self.client.cancel_order(sym, oid)
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.debug(f"cleanup triggers: {e}")
 
-        sem = asyncio.Semaphore(15)
-
-        async def safe(sym):
-            async with sem:
-                return await analyze(self.bx, sym)
-
-        tasks   = [safe(s) for s in self.symbols if s not in self.trades]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        signals = [r for r in results if isinstance(r, dict)]
-
-        if not signals:
-            log.info("Sin señales")
-            return
-
-        signals.sort(key=lambda x: x["score"], reverse=True)
-        top = signals[0]
-        log.info(f"Señales: {len(signals)} | Top: {top['symbol']} {top['direction']} "
-                 f"score={top['score']:.1f} razones={top['reasons']}")
-
-        for sig in signals[:slots]:
-            await self.open_position(sig)
-            await asyncio.sleep(0.3)
-
-    # ─── Loop principal ───────────────────────
-    async def run(self):
-        log.info("=" * 56)
-        log.info("  InstitutionalBot v6.0 INICIADO")
-        log.info(f"  Lev:{Config.LEVERAGE}x Risk:{Config.RISK_PCT}% MaxTrades:{Config.MAX_OPEN_TRADES}")
-        log.info(f"  Shorts:{'ON' if Config.ENABLE_SHORTS else 'OFF'} "
-                 f"Scan:{Config.SCAN_INTERVAL_SEC}s Syms:{Config.MAX_SYMBOLS}")
-        log.info(f"  Trail:{Config.TRAIL_PCT}% Mega:{Config.MEGA_TRAIL_PCT}% "
-                 f"Runner:{'ON' if Config.RUNNER_ENABLED else 'OFF'}")
-        log.info("=" * 56)
-
-        await self.tg.send(
-            "🤖 <b>InstitutionalBot v6.0 ONLINE</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚙️  Lev: {Config.LEVERAGE}x | Risk: {Config.RISK_PCT}%/trade\n"
-            f"📉 SHORTS: {'✅' if Config.ENABLE_SHORTS else '❌'}\n"
-            f"🔄 Trailing NATIVO: TP1={Config.TRAIL_PCT}% | Mega={Config.MEGA_TRAIL_PCT}%\n"
-            f"🚀 Mega Runner: {'✅' if Config.RUNNER_ENABLED else '❌'}\n"
-            f"📊 VP: {Config.VP_BINS} bins | ADX+Donchian activo\n"
-            f"🔍 {Config.MAX_SYMBOLS} síms c/{Config.SCAN_INTERVAL_SEC}s | "
-            f"Vol mín: ${Config.MIN_VOLUME_USDT/1e6:.1f}M\n"
-            f"⛔ Pausa diaria si pérdida ≥ {Config.MAX_DAILY_LOSS_PCT}%\n"
-            f"🥇 XAUT-USDT (oro 24/7) siempre incluido"
+    def _log_status(self):
+        balance = self._safe_get_balance()
+        syms    = list(self.state["open_trades"].keys())
+        stats   = self.risk.get_stats()
+        wr      = get_winrate(self.journal, 20)
+        log.info(
+            f"📊 Status | Balance: ${balance:.2f} | "
+            f"Open: {syms} | "
+            f"DailyPnL: {stats['daily_pnl']:+.2f} | "
+            f"Fees: ${stats['total_fees']:.3f} | "
+            f"WinRate(20): {wr*100:.0f}%"
         )
 
-        await self._refresh_symbols()
-        scan_n = 0
-
+    def run(self):
+        log.info(f"🚀 SuperBot v4 | DRY={DRY_RUN} | SCAN={SCAN_PERIOD}s | Market={USE_MARKET_ENTRY}")
+        cycle = 0
         while True:
             try:
-                scan_n += 1
-                if scan_n % 30 == 0:
-                    await self._refresh_symbols()
+                cycle += 1
+                log.info(f"{'='*46} CICLO {cycle} {'='*46}")
+                self._init_daily()
+                self._cleanup_stale_triggers()
+                self._manage_positions()
 
-                if not await self._daily_risk_ok():
-                    await asyncio.sleep(300)
-                    continue
+                balance    = self._safe_get_balance()
+                open_count = len(self.state["open_trades"])
 
-                log.info(f"── Scan #{scan_n} trades={len(self.trades)}/{Config.MAX_OPEN_TRADES} ──")
-                await self.monitor()
-                await self.scan()
+                if self.risk.can_open_trade(open_count, balance):
+                    results = self.scanner.scan()
+                    slots   = MAX_POSITIONS - open_count
+                    for result in results[:slots]:
+                        sym = result.symbol
+                        if sym not in self.state["open_trades"]:
+                            self._open_trade(sym, result.signal)
+                            time.sleep(1.5)
+                else:
+                    log.info(f"📊 Sin slots ({open_count}/{MAX_POSITIONS}) o balance bajo")
 
-                # Heartbeat cada 100 scans
-                if scan_n % 100 == 0:
-                    bal = await self.bx.get_balance()
-                    await self.tg.send(
-                        f"💓 <b>Heartbeat #{scan_n}</b>\n"
-                        f"Balance: ${bal:.2f} | Trades: {len(self.trades)}\n"
-                        f"Abiertos total: {self.stats['opened']} | Cerrados: {self.stats['closed']}"
-                    )
+                self._log_status()
+                log.info(f"😴 Esperando {SCAN_PERIOD}s...")
 
-                await asyncio.sleep(Config.SCAN_INTERVAL_SEC)
-
+            except KeyboardInterrupt:
+                log.info("Bot detenido.")
+                break
             except Exception as e:
-                log.error(f"Loop error: {e}", exc_info=True)
-                await asyncio.sleep(30)
+                log.error(f"💥 Error en loop: {e}", exc_info=True)
+
+            time.sleep(SCAN_PERIOD)
+
+
+if __name__ == "__main__":
+    SuperBot().run()

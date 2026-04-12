@@ -1,70 +1,98 @@
 """
-Risk Manager v3.0
-Sin cambios de lógica respecto a v2 — solo limpieza de código.
+RiskManager v5 — Gestión de riesgo profesional
+Mejoras:
+  - Kelly Criterion para sizing dinámico
+  - Circuit breaker: para el bot si pérdida diaria > límite
+  - Drawdown tracking en tiempo real
+  - Ajuste automático de riesgo según winrate reciente
 """
 import logging
 from dataclasses import dataclass
 from typing import Optional
 
-log = logging.getLogger(__name__)
-
-RISK_PER_TRADE   = 0.01
-MAX_POSITIONS    = 5
-LEVERAGE         = 5
-DAILY_LOSS_LIMIT = 0.05
-MIN_NOTIONAL     = 5.0
-PARTIAL_TP_PCT   = 0.5
+log = logging.getLogger("Risk")
 
 
 @dataclass
 class TradeParams:
-    symbol:      str
-    direction:   str
+    symbol: str
+    direction: str
     entry_price: float
-    sl_price:    float
-    tp1_price:   float
-    tp2_price:   float
-    tp3_price:   float
-    quantity:    float
-    leverage:    int
-    notional:    float
-    risk_usdt:   float
+    sl_price: float
+    tp1_price: float
+    tp2_price: float
+    tp3_price: float
+    quantity: float
+    notional: float
+    leverage: int
+    est_fee: float
 
 
 class RiskManager:
-    def __init__(self):
-        self._daily_start_balance: Optional[float] = None
-        self._daily_loss:  float = 0.0
-        self._trade_count: int   = 0
-
+    def __init__(
+        self,
+        risk_pct: float = 0.02,
+        max_pos: int = 4,
+        leverage: int = 10,
+        daily_loss_limit: float = 0.06,
+    ):
+        self.base_risk_pct = risk_pct
+        self.max_pos = max_pos
+        self.leverage = leverage
+        self.daily_loss_limit = daily_loss_limit
+        
+        # Estado diario
+        self.daily_pnl = 0.0
+        self.daily_start_balance = 0.0
+        self.total_fees = 0.0
+        self.trades_today = 0
+        self.wins_today = 0
+        self.circuit_open = False  # True = bot pausado
+    
     def reset_daily(self, balance: float):
-        self._daily_start_balance = balance
-        self._daily_loss  = 0.0
-        self._trade_count = 0
-        log.info(f"Daily reset. Balance: {balance:.2f} USDT")
-
-    def record_pnl(self, pnl_usdt: float):
-        if pnl_usdt < 0:
-            self._daily_loss += abs(pnl_usdt)
-        self._trade_count += 1
-
-    def is_kill_switch(self, balance: float) -> bool:
-        if self._daily_start_balance is None:
+        self.daily_pnl = 0.0
+        self.daily_start_balance = balance
+        self.total_fees = 0.0
+        self.trades_today = 0
+        self.wins_today = 0
+        self.circuit_open = False
+        log.info(f"📅 Reset diario | Balance: ${balance:.2f}")
+    
+    def _dynamic_risk_pct(self, winrate: float) -> float:
+        """
+        Kelly fraccionario (25% del Kelly completo para seguridad).
+        Kelly = (p*(b+1) - 1) / b  donde p=winrate, b=RR promedio
+        """
+        if winrate <= 0 or winrate >= 1:
+            return self.base_risk_pct
+        
+        rr = 1.5  # RR promedio asumido (conservador)
+        kelly_full = (winrate * (rr + 1) - 1) / rr
+        kelly_frac = kelly_full * 0.25  # 25% del Kelly
+        
+        # Clamp entre 0.5% y 3%
+        return max(0.005, min(0.03, kelly_frac))
+    
+    def can_open_trade(self, open_count: int, balance: float, winrate: float = 0.5) -> bool:
+        if self.circuit_open:
+            log.warning("⚡ Circuit breaker activo — trading pausado")
             return False
-        pct = self._daily_loss / max(self._daily_start_balance, 1)
-        if pct >= DAILY_LOSS_LIMIT:
-            log.warning(f"⛔ KILL SWITCH: {pct*100:.1f}% ≥ {DAILY_LOSS_LIMIT*100:.0f}%")
-            return True
-        return False
-
-    def can_open_trade(self, open_positions: int, balance: float) -> bool:
-        if open_positions >= MAX_POSITIONS:
-            log.info(f"Max posiciones ({MAX_POSITIONS}) alcanzado.")
+        if open_count >= self.max_pos:
             return False
-        if self.is_kill_switch(balance):
+        if balance <= 0:
+            log.error("❌ Balance = $0 — verifica fondos en cuenta Perpetual Futures")
             return False
+        
+        # Check daily loss limit
+        if self.daily_start_balance > 0:
+            daily_loss_pct = -self.daily_pnl / self.daily_start_balance
+            if daily_loss_pct >= self.daily_loss_limit:
+                log.warning(f"🛑 Límite diario alcanzado: {daily_loss_pct:.1%}")
+                self.circuit_open = True
+                return False
+        
         return True
-
+    
     def size_position(
         self,
         symbol: str,
@@ -77,38 +105,92 @@ class RiskManager:
         balance: float,
         qty_precision: int = 3,
         price_precision: int = 4,
+        winrate: float = 0.5,
     ) -> Optional[TradeParams]:
-        risk_usdt = balance * RISK_PER_TRADE
-        sl_dist   = abs(entry - sl)
-        if sl_dist == 0:
-            log.warning("SL = entry price, skip")
+        if balance <= 0 or entry <= 0 or sl <= 0:
             return None
-
-        qty_raw  = risk_usdt / sl_dist
-        qty      = round(qty_raw, qty_precision)
+        
+        sl_dist = abs(entry - sl)
+        if sl_dist < 1e-10:
+            return None
+        
+        # Riesgo dinámico (Kelly fraccionario)
+        risk_pct = self._dynamic_risk_pct(winrate)
+        risk_amount = balance * risk_pct
+        
+        # Cantidad basada en distancia al SL
+        # risk_amount = qty * sl_dist (sin apalancamiento en el riesgo real)
+        qty_raw = risk_amount / sl_dist
+        
+        # Redondear a precisión del símbolo
+        qty = round(qty_raw, qty_precision)
+        
+        # Mínimo razonable
         notional = qty * entry
-
-        if notional < MIN_NOTIONAL:
-            qty      = round(MIN_NOTIONAL / entry, qty_precision)
+        if notional < 5.0:  # mínimo $5 de notional
+            log.debug(f"Notional muy pequeño: ${notional:.2f}")
+            return None
+        
+        # El margen requerido (con apalancamiento)
+        margin_required = notional / self.leverage
+        if margin_required > balance * 0.4:  # max 40% del balance en un trade
+            # Reducir qty
+            max_qty = (balance * 0.4 * self.leverage) / entry
+            qty = round(max_qty, qty_precision)
             notional = qty * entry
-
-        ep  = round(entry, price_precision)
-        slp = round(sl,    price_precision)
-        t1  = round(tp1,   price_precision)
-        t2  = round(tp2,   price_precision)
-        t3  = round(tp3,   price_precision)
-
+        
+        if qty <= 0:
+            return None
+        
+        # Fee estimado (0.05% maker + 0.05% taker = 0.1% round trip)
+        est_fee = notional * 0.001
+        
         log.info(
-            f"Size [{symbol}] {direction} qty={qty} entry={ep} "
-            f"SL={slp} TP1={t1} notional={notional:.2f} risk={risk_usdt:.2f}"
+            f"💰 Sizing {symbol} {direction}: qty={qty} "
+            f"notional=${notional:.2f} margin=${notional/self.leverage:.2f} "
+            f"risk=${risk_amount:.2f} ({risk_pct*100:.1f}%) "
+            f"sl_dist=${sl_dist:.4f}"
         )
+        
         return TradeParams(
-            symbol=symbol, direction=direction,
-            entry_price=ep, sl_price=slp,
-            tp1_price=t1, tp2_price=t2, tp3_price=t3,
-            quantity=qty, leverage=LEVERAGE,
-            notional=notional, risk_usdt=risk_usdt,
+            symbol=symbol,
+            direction=direction,
+            entry_price=round(entry, price_precision),
+            sl_price=round(sl, price_precision),
+            tp1_price=round(tp1, price_precision),
+            tp2_price=round(tp2, price_precision),
+            tp3_price=round(tp3, price_precision),
+            quantity=qty,
+            notional=notional,
+            leverage=self.leverage,
+            est_fee=est_fee,
         )
-
-    def partial_close_qty(self, qty: float, qty_precision: int = 3) -> float:
-        return round(qty * PARTIAL_TP_PCT, qty_precision)
+    
+    def record_pnl(self, pnl: float, fee: float = 0.0):
+        self.daily_pnl += pnl
+        self.total_fees += fee
+        self.trades_today += 1
+        if pnl > 0:
+            self.wins_today += 1
+        
+        # Circuit breaker intraday
+        if self.daily_start_balance > 0:
+            loss_pct = -self.daily_pnl / self.daily_start_balance
+            if loss_pct >= self.daily_loss_limit:
+                log.warning(f"⚡ CIRCUIT BREAKER: pérdida diaria {loss_pct:.1%} ≥ {self.daily_loss_limit:.1%}")
+                self.circuit_open = True
+    
+    def get_winrate(self) -> float:
+        if self.trades_today == 0:
+            return 0.5
+        return self.wins_today / self.trades_today
+    
+    def get_stats(self) -> dict:
+        return {
+            "daily_pnl": self.daily_pnl,
+            "total_fees": self.total_fees,
+            "trades_today": self.trades_today,
+            "wins_today": self.wins_today,
+            "winrate": self.get_winrate(),
+            "circuit_open": self.circuit_open,
+        }

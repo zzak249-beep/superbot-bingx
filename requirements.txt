@@ -1,3 +1,11 @@
-httpx>=0.27.0
+# SuperBot v5 — requirements.txt
+requests>=2.31.0
+numpy>=1.24.0
 pandas>=2.0.0
-numpy>=1.26.0
+
+# Kronos AI (opcional — mejora la calidad de señales)
+# Descomentar para activar el filtro AI:
+# torch>=2.0.0
+# transformers>=4.40.0
+# Luego instalar Kronos:
+# pip install git+https://github.com/shiyu-coder/Kronos.git
