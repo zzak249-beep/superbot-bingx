@@ -174,7 +174,15 @@ class BingXClient:
     # ─── Cuenta ───────────────────────────────
     async def get_balance(self) -> float:
         d = await self._get("/openApi/swap/v3/user/balance", signed=True)
-        for item in d.get("data", {}).get("balance", []):
+        data = d.get("data", [])
+        
+        # Handle both response structures: dict with "balance" key or direct list
+        if isinstance(data, dict):
+            balance_list = data.get("balance", [])
+        else:
+            balance_list = data if isinstance(data, list) else []
+        
+        for item in balance_list:
             if item.get("asset") == "USDT":
                 return float(item.get("availableMargin", 0))
         return 0.0
