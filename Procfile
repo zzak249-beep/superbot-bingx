@@ -1,1 +1,1 @@
-worker: python main.py
+worker: python institutional_bot_v4.py
