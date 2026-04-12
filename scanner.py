@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional
 
-from strategy.signals import Signal, generate_signal
+from signals import Signal, generate_signal
 
 log = logging.getLogger("Scanner")
 
