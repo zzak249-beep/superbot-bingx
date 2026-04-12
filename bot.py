@@ -29,6 +29,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlencode
 
 import httpx
 import numpy as np
@@ -122,7 +123,7 @@ class BingXClient:
         self._c = httpx.AsyncClient(timeout=15, limits=limits)
 
     def _sign(self, params: dict) -> str:
-        qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        qs = urlencode(sorted(params.items()))
         return hmac.new(Config.API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
 
     def _h(self) -> dict:
@@ -174,15 +175,7 @@ class BingXClient:
     # ─── Cuenta ───────────────────────────────
     async def get_balance(self) -> float:
         d = await self._get("/openApi/swap/v3/user/balance", signed=True)
-        data = d.get("data", [])
-        
-        # Handle both response structures: dict with "balance" key or direct list
-        if isinstance(data, dict):
-            balance_list = data.get("balance", [])
-        else:
-            balance_list = data if isinstance(data, list) else []
-        
-        for item in balance_list:
+        for item in d.get("data", {}).get("balance", []):
             if item.get("asset") == "USDT":
                 return float(item.get("availableMargin", 0))
         return 0.0
