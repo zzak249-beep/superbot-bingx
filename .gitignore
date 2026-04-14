@@ -1,45 +1,10 @@
-# Secrets — NUNCA subir
 .env
-*.key
-*.secret
-
-# Python
+*.pyc
 __pycache__/
-*.py[cod]
-*.pyo
-*.pyd
 *.egg-info/
 dist/
-build/
-.eggs/
-*.egg
-
-# Entornos virtuales
+.DS_Store
+*.log
+data/
 .venv/
 venv/
-env/
-ENV/
-
-# Datos del bot (estado local)
-/tmp/
-*.json
-!.env.example
-
-# Logs
-*.log
-logs/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-.DS_Store
-Thumbs.db
-
-# Jupyter
-.ipynb_checkpoints/
-*.ipynb
-
-# Docker
-.dockerignore
