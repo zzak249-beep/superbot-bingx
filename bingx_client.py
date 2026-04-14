@@ -1,22 +1,12 @@
 """
 BingX Perpetual Futures API Client — bingx_client.py
-Class-based wrapper for bot.py / SuperBot v4.
+SuperBot v4 — fixed signature + Scanner compatibility
 
-Methods expected by bot.py:
-  get_balance()
-  get_positions()
-  get_symbol_info(symbol)
-  get_ticker(symbol)
-  get_open_orders()
-  set_margin_type(symbol, margin_type)
-  set_leverage(symbol, leverage)
-  place_order(symbol, side, position_side, order_type, quantity,
-              stop_loss, take_profit, client_order_id)
-  place_trailing_stop(symbol, side, position_side, quantity,
-                      activation_price, price_rate)
-  close_position_partial(symbol, direction, qty)
-  update_sl(symbol, direction, new_sl)
-  cancel_order(symbol, order_id)
+FIXES:
+  - Signature: NO sorted() — BingX signs params in insertion order
+  - POST: params go in query string (not form body) per BingX v2 spec
+  - Added get_symbols() for Scanner compatibility
+  - Robust get_balance() handling multiple response shapes
 """
 
 import time
@@ -32,38 +22,32 @@ BASE_URL = "https://open-api.bingx.com"
 
 
 class BingXClient:
-    def __init__(self, api_key: str, api_secret: str,
-                 mode: str = "hedge", recv_window: int = 5000):
-        """
-        mode: "hedge" (LONG/SHORT positionSide) or "oneway" (BOTH)
-        """
+    def __init__(self, api_key: str, api_secret: str, mode: str = "hedge"):
         self.api_key    = api_key
         self.api_secret = api_secret
         self.mode       = mode.lower().strip()
-        self.recv_window = recv_window
         self._session   = requests.Session()
         self._session.headers.update({"X-BX-APIKEY": self.api_key})
 
-    # ── Auth helpers ──────────────────────────────────────────────────────────
+    # ── Auth ──────────────────────────────────────────────────────────────────
 
     def _sign(self, params: dict) -> str:
-        query = urlencode(sorted(params.items()))
+        # CRITICAL: do NOT sort — BingX signs params in insertion order
+        query = urlencode(params)
         return hmac.new(
             self.api_secret.encode(), query.encode(), hashlib.sha256
         ).hexdigest()
 
     def _get(self, path: str, params: dict = None) -> dict:
-        params = dict(params or {})
-        params["timestamp"]  = int(time.time() * 1000)
-        params["recvWindow"] = self.recv_window
-        params["signature"]  = self._sign(params)
+        p = dict(params or {})
+        p["timestamp"] = int(time.time() * 1000)
+        p["signature"] = self._sign(p)
         try:
-            r = self._session.get(BASE_URL + path, params=params, timeout=10)
+            r = self._session.get(BASE_URL + path, params=p, timeout=10)
             r.raise_for_status()
             data = r.json()
             if isinstance(data, list):
-                # Some BingX endpoints wrap in list by mistake — unwrap
-                log.warning(f"GET {path} returned list, expected dict: {data}")
+                log.warning(f"GET {path} returned list: {str(data)[:120]}")
                 return {}
             return data
         except Exception as e:
@@ -71,16 +55,16 @@ class BingXClient:
             raise
 
     def _post(self, path: str, payload: dict = None) -> dict:
-        payload = dict(payload or {})
-        payload["timestamp"]  = int(time.time() * 1000)
-        payload["recvWindow"] = self.recv_window
-        payload["signature"]  = self._sign(payload)
+        # BingX v2: ALL params (including signature) go in query string
+        p = dict(payload or {})
+        p["timestamp"] = int(time.time() * 1000)
+        p["signature"] = self._sign(p)
         try:
-            r = self._session.post(BASE_URL + path, data=payload, timeout=10)
+            r = self._session.post(BASE_URL + path, params=p, timeout=10)
             r.raise_for_status()
             data = r.json()
             if isinstance(data, list):
-                log.warning(f"POST {path} returned list, expected dict: {data}")
+                log.warning(f"POST {path} returned list: {str(data)[:120]}")
                 return {}
             return data
         except Exception as e:
@@ -88,85 +72,124 @@ class BingXClient:
             raise
 
     def _pos_side(self, direction: str) -> str:
-        """Return positionSide based on account mode."""
-        if self.mode == "oneway":
-            return "BOTH"
-        return direction  # "LONG" or "SHORT"
+        return "BOTH" if self.mode == "oneway" else direction
+
+    # ── Market data (no auth needed) ──────────────────────────────────────────
+
+    def get_symbols(self) -> list:
+        """All active USDT perpetual symbols. Called by Scanner."""
+        try:
+            res = requests.get(
+                BASE_URL + "/openApi/swap/v2/quote/contracts", timeout=10
+            ).json()
+            if res.get("code") != 0:
+                return []
+            return [
+                c["symbol"] for c in res.get("data", [])
+                if c.get("symbol", "").endswith("-USDT")
+                and c.get("status", 0) == 1
+            ]
+        except Exception as e:
+            log.error(f"get_symbols error: {e}")
+            return []
+
+    def get_klines(self, symbol: str, interval: str = "15m",
+                   limit: int = 200) -> list:
+        try:
+            res = requests.get(
+                BASE_URL + "/openApi/swap/v3/quote/klines",
+                params={"symbol": symbol, "interval": interval, "limit": limit},
+                timeout=10,
+            ).json()
+            return res.get("data", []) if res.get("code") == 0 else []
+        except Exception as e:
+            log.error(f"get_klines {symbol}: {e}")
+            return []
+
+    def get_ticker(self, symbol: str) -> dict:
+        try:
+            res = requests.get(
+                BASE_URL + "/openApi/swap/v2/quote/price",
+                params={"symbol": symbol}, timeout=5,
+            ).json()
+            if res.get("code") == 0:
+                d = res.get("data", {})
+                if "price" in d and "lastPrice" not in d:
+                    d["lastPrice"] = d["price"]
+                return d
+        except Exception as e:
+            log.error(f"get_ticker {symbol}: {e}")
+        return {}
+
+    def get_funding_rate(self, symbol: str) -> float:
+        try:
+            res = requests.get(
+                BASE_URL + "/openApi/swap/v2/quote/premiumIndex",
+                params={"symbol": symbol}, timeout=5,
+            ).json()
+            if res.get("code") == 0:
+                return float(res["data"].get("lastFundingRate", 0))
+        except Exception:
+            pass
+        return 0.0
+
+    def get_symbol_info(self, symbol: str) -> dict:
+        try:
+            res = requests.get(
+                BASE_URL + "/openApi/swap/v2/quote/contracts", timeout=10
+            ).json()
+            for c in res.get("data", []):
+                if c.get("symbol") == symbol:
+                    return c
+        except Exception as e:
+            log.error(f"get_symbol_info {symbol}: {e}")
+        return {}
 
     # ── Account ───────────────────────────────────────────────────────────────
 
     def get_balance(self) -> float:
-        """Returns available margin (USDT) for perpetual futures."""
         res = self._get("/openApi/swap/v2/user/balance")
         try:
-            # Typical structure: res["data"]["balance"]["availableMargin"]
             data = res.get("data", {})
-            # BingX sometimes nests differently depending on account type
             if isinstance(data, dict):
                 bal = data.get("balance", data)
                 if isinstance(bal, dict):
-                    for key in ("availableMargin", "available", "availableBalance", "equity"):
-                        val = bal.get(key)
-                        if val is not None:
-                            return float(val)
-                # Flat: data = {"availableMargin": "123.45", ...}
-                for key in ("availableMargin", "available", "availableBalance", "equity"):
-                    val = data.get(key)
-                    if val is not None:
-                        return float(val)
-            log.warning(f"get_balance: unexpected structure: {res}")
+                    for key in ("availableMargin", "available",
+                                "availableBalance", "equity"):
+                        v = bal.get(key)
+                        if v is not None:
+                            return float(v)
+                for key in ("availableMargin", "available",
+                            "availableBalance", "equity"):
+                    v = data.get(key)
+                    if v is not None:
+                        return float(v)
+            log.warning(f"get_balance unexpected: {res}")
             return 0.0
         except Exception as e:
             log.error(f"get_balance parse error: {e} | raw={res}")
             return 0.0
 
     def get_positions(self) -> list:
-        """Returns all open perpetual positions."""
         res = self._get("/openApi/swap/v2/user/positions")
         try:
             data = res.get("data", [])
-            if isinstance(data, list):
-                return data
-            return []
+            return data if isinstance(data, list) else []
         except Exception as e:
             log.error(f"get_positions error: {e}")
             return []
 
-    def get_symbol_info(self, symbol: str) -> dict:
-        """Returns contract metadata (quantityPrecision, pricePrecision, etc.)"""
-        res = self._get("/openApi/swap/v2/quote/contracts")
-        try:
-            for c in res.get("data", []):
-                if c.get("symbol") == symbol:
-                    return c
-        except Exception as e:
-            log.error(f"get_symbol_info error: {e}")
-        return {}
-
-    def get_ticker(self, symbol: str) -> dict:
-        """Returns latest ticker (lastPrice, etc.)"""
-        res = self._get(
-            "/openApi/swap/v2/quote/price", {"symbol": symbol}
-        )
-        try:
-            data = res.get("data", {})
-            if isinstance(data, dict):
-                return data
-            return {}
-        except Exception as e:
-            log.error(f"get_ticker error: {e}")
-            return {}
-
     def get_open_orders(self) -> list:
-        """Returns all open orders across all symbols."""
-        res = self._get("/openApi/swap/v2/trade/openOrders")
+        res = self._get("/openApi/swap/v2/trade/openOrders", {})
         try:
             data = res.get("data", {})
             if isinstance(data, list):
                 return data
-            # Sometimes nested under "orders"
-            orders = data.get("orders", data.get("list", []))
-            return orders if isinstance(orders, list) else []
+            for key in ("orders", "list"):
+                v = data.get(key)
+                if isinstance(v, list):
+                    return v
+            return []
         except Exception as e:
             log.error(f"get_open_orders error: {e}")
             return []
@@ -174,45 +197,25 @@ class BingXClient:
     # ── Trade setup ───────────────────────────────────────────────────────────
 
     def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED"):
-        """Set margin type: ISOLATED or CROSSED."""
         try:
-            self._post("/openApi/swap/v2/trade/marginType", {
-                "symbol":     symbol,
-                "marginType": margin_type,
-            })
+            self._post("/openApi/swap/v2/trade/marginType",
+                       {"symbol": symbol, "marginType": margin_type})
         except Exception as e:
-            log.debug(f"set_margin_type {symbol}: {e} (non-critical)")
+            log.debug(f"set_margin_type {symbol}: {e}")
 
     def set_leverage(self, symbol: str, leverage: int):
-        """Set leverage for both sides."""
         for side in ("LONG", "SHORT"):
             try:
-                self._post("/openApi/swap/v2/trade/leverage", {
-                    "symbol":   symbol,
-                    "side":     side,
-                    "leverage": leverage,
-                })
+                self._post("/openApi/swap/v2/trade/leverage",
+                           {"symbol": symbol, "side": side, "leverage": leverage})
             except Exception as e:
                 log.debug(f"set_leverage {symbol} {side}: {e}")
 
     # ── Orders ────────────────────────────────────────────────────────────────
 
-    def place_order(
-        self,
-        symbol: str,
-        side: str,
-        position_side: str,
-        order_type: str = "MARKET",
-        quantity: float = 0.0,
-        price: float = None,
-        stop_loss: float = None,
-        take_profit: float = None,
-        client_order_id: str = None,
-    ) -> dict:
-        """
-        Place entry order. Returns raw API response dict.
-        order_type: MARKET | LIMIT
-        """
+    def place_order(self, symbol, side, position_side, order_type="MARKET",
+                    quantity=0.0, price=None, stop_loss=None,
+                    take_profit=None, client_order_id=None) -> dict:
         payload = {
             "symbol":       symbol,
             "side":         side,
@@ -221,7 +224,7 @@ class BingXClient:
             "quantity":     quantity,
         }
         if price and order_type == "LIMIT":
-            payload["price"] = price
+            payload["price"]       = price
             payload["timeInForce"] = "GTC"
         if stop_loss:
             payload["stopLoss"]   = str(stop_loss)
@@ -229,24 +232,10 @@ class BingXClient:
             payload["takeProfit"] = str(take_profit)
         if client_order_id:
             payload["clientOrderID"] = client_order_id
+        return self._post("/openApi/swap/v2/trade/order", payload)
 
-        res = self._post("/openApi/swap/v2/trade/order", payload)
-        log.debug(f"place_order {symbol}: {res}")
-        return res
-
-    def place_trailing_stop(
-        self,
-        symbol: str,
-        side: str,
-        position_side: str,
-        quantity: float,
-        activation_price: float,
-        price_rate: float,
-    ) -> dict:
-        """
-        Place a trailing stop order.
-        price_rate: callback rate as decimal (e.g. 0.025 = 2.5%)
-        """
+    def place_trailing_stop(self, symbol, side, position_side,
+                            quantity, activation_price, price_rate) -> dict:
         payload = {
             "symbol":          symbol,
             "side":            side,
@@ -254,59 +243,37 @@ class BingXClient:
             "type":            "TRAILING_STOP_MARKET",
             "quantity":        quantity,
             "activationPrice": activation_price,
-            "callbackRate":    round(price_rate * 100, 4),  # BingX expects % value
+            "callbackRate":    round(price_rate * 100, 4),
             "reduceOnly":      "true",
         }
-        res = self._post("/openApi/swap/v2/trade/order", payload)
-        log.debug(f"place_trailing_stop {symbol}: {res}")
-        return res
+        return self._post("/openApi/swap/v2/trade/order", payload)
 
-    def close_position_partial(
-        self, symbol: str, direction: str, qty: float
-    ) -> dict:
-        """Close (reduce) part of a position at market price."""
-        close_side = "SELL" if direction == "LONG" else "BUY"
-        payload = {
+    def close_position_partial(self, symbol: str, direction: str,
+                               qty: float) -> dict:
+        return self._post("/openApi/swap/v2/trade/order", {
             "symbol":       symbol,
-            "side":         close_side,
+            "side":         "SELL" if direction == "LONG" else "BUY",
             "positionSide": self._pos_side(direction),
             "type":         "MARKET",
             "quantity":     qty,
             "reduceOnly":   "true",
-        }
-        res = self._post("/openApi/swap/v2/trade/order", payload)
-        log.debug(f"close_position_partial {symbol} {qty}: {res}")
-        return res
+        })
 
     def update_sl(self, symbol: str, direction: str, new_sl: float) -> dict:
-        """
-        Update stop-loss: cancel all open SL orders and place a new STOP_MARKET.
-        """
-        # Cancel existing conditional orders for symbol
         try:
-            self._post("/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
-        except Exception as e:
-            log.debug(f"cancel orders before update_sl {symbol}: {e}")
-
-        close_side = "SELL" if direction == "LONG" else "BUY"
-        payload = {
+            self._post("/openApi/swap/v2/trade/allOpenOrders",
+                       {"symbol": symbol})
+        except Exception:
+            pass
+        return self._post("/openApi/swap/v2/trade/order", {
             "symbol":       symbol,
-            "side":         close_side,
+            "side":         "SELL" if direction == "LONG" else "BUY",
             "positionSide": self._pos_side(direction),
             "type":         "STOP_MARKET",
             "stopPrice":    new_sl,
             "reduceOnly":   "true",
-        }
-        res = self._post("/openApi/swap/v2/trade/order", payload)
-        log.debug(f"update_sl {symbol} → {new_sl}: {res}")
-        return res
+        })
 
     def cancel_order(self, symbol: str, order_id: str) -> dict:
-        """Cancel a specific order by orderId."""
-        payload = {
-            "symbol":  symbol,
-            "orderId": order_id,
-        }
-        res = self._post("/openApi/swap/v2/trade/cancelOrder", payload)
-        log.debug(f"cancel_order {symbol} {order_id}: {res}")
-        return res
+        return self._post("/openApi/swap/v2/trade/cancelOrder",
+                          {"symbol": symbol, "orderId": order_id})
