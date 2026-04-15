@@ -1,101 +1,97 @@
 """
-notifier.py — Notificaciones Telegram para SuperBot v5
-Envía alertas de: inicio, trades abiertos, TP, SL, resumen diario.
+notifier.py — Telegram notifications for SuperBot v4
 
-Configuración en .env:
-    TELEGRAM_BOT_TOKEN=xxx
-    TELEGRAM_CHAT_ID=xxx
-
-Si no está configurado, las notificaciones se loguean pero no se envían.
+Functions used by bot.py:
+  notify_startup(balance, dry_run)
+  notify_trade_opened(symbol, direction, qty, entry, sl, tp1, tp2, notional, dry_run)
+  notify_sl_hit(symbol, sl_price, loss)
+  notify_tp_hit(symbol, tp_num, price, qty, pnl)
 """
-import logging
+
 import os
+import logging
 import requests
-from datetime import datetime
 
-log = logging.getLogger("Notifier")
+log = logging.getLogger("notifier")
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
-ENABLED   = bool(BOT_TOKEN and CHAT_ID)
+TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
-def _send(text: str):
-    if not ENABLED:
-        log.info(f"[NOTIFY] {text[:120]}")
+def _send(msg: str):
+    """Send message to Telegram. Silently skips if not configured."""
+    if not TOKEN or not CHAT_ID:
         return
     try:
         requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=5,
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            timeout=8,
         )
     except Exception as e:
-        log.warning(f"Telegram error: {e}")
+        log.debug(f"Telegram send error: {e}")
 
+
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def notify_startup(balance: float, dry_run: bool):
-    mode = "🔵 PAPER TRADING" if dry_run else "🟢 LIVE TRADING"
-    _send(
-        f"🤖 <b>SuperBot v5 iniciado</b>\n"
+    mode = "🔵 DRY RUN" if dry_run else "🟢 LIVE"
+    msg  = (
+        f"🤖 <b>SuperBot v4 iniciado</b>\n"
         f"Modo: {mode}\n"
-        f"Balance: <b>${balance:.2f} USDT</b>\n"
-        f"Hora: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC"
+        f"💼 Balance: ${balance:.2f}"
     )
+    log.info(f"[notifier] startup balance=${balance:.2f} dry={dry_run}")
+    _send(msg)
 
 
-def notify_trade_opened(symbol: str, direction: str, qty: float,
-                         entry: float, sl: float, tp1: float, tp2: float,
-                         notional: float, dry_run: bool = False):
-    emoji = "📈" if direction == "LONG" else "📉"
-    mode  = "[DRY] " if dry_run else ""
-    _send(
-        f"{emoji} <b>{mode}Trade Abierto</b>\n"
-        f"Par: <b>{symbol}</b> {direction}\n"
-        f"Qty: {qty} | Notional: ${notional:.2f}\n"
-        f"Entry: {entry} | SL: {sl}\n"
-        f"TP1: {tp1} | TP2: {tp2}"
+def notify_trade_opened(
+    symbol: str,
+    direction: str,
+    qty: float,
+    entry: float,
+    sl: float,
+    tp1: float,
+    tp2: float,
+    notional: float,
+    dry_run: bool = False,
+):
+    emoji = "🟢" if direction == "LONG" else "🔴"
+    tag   = " [DRY]" if dry_run else ""
+    msg   = (
+        f"{emoji} <b>ENTRADA{tag} {direction}</b> — {symbol}\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"💰 Qty: {qty}  |  Entry: {entry}\n"
+        f"🛑 SL: {sl}\n"
+        f"✅ TP1: {tp1}  |  TP2: {tp2}\n"
+        f"📦 Notional: ${notional:.2f}"
     )
-
-
-def notify_tp_hit(symbol: str, tp_num: int, price: float,
-                   qty_closed: float, pnl: float):
-    _send(
-        f"💰 <b>TP{tp_num} Alcanzado</b> — {symbol}\n"
-        f"Precio: {price} | Qty cerrada: {qty_closed}\n"
-        f"PnL estimado: <b>${pnl:+.2f}</b>"
-    )
+    log.info(f"[notifier] trade_opened {symbol} {direction} qty={qty} entry={entry}")
+    _send(msg)
 
 
 def notify_sl_hit(symbol: str, sl_price: float, loss: float):
-    _send(
-        f"🛑 <b>SL Tocado</b> — {symbol}\n"
+    msg = (
+        f"🔴 <b>SL HIT</b> — {symbol}\n"
         f"Precio SL: {sl_price}\n"
-        f"Pérdida est.: <b>${loss:.2f}</b>"
+        f"Pérdida est.: ${loss:.2f}"
     )
+    log.info(f"[notifier] sl_hit {symbol} sl={sl_price} loss={loss:.2f}")
+    _send(msg)
 
 
-def notify_circuit_breaker(loss_pct: float, daily_pnl: float):
-    _send(
-        f"⚡ <b>CIRCUIT BREAKER ACTIVADO</b>\n"
-        f"Pérdida diaria: <b>{loss_pct:.1%}</b>\n"
-        f"PnL del día: ${daily_pnl:.2f}\n"
-        f"Bot pausado hasta mañana."
+def notify_tp_hit(symbol: str, tp_num: int, price: float, qty: float, pnl: float):
+    emoji = "💰" if tp_num == 1 else "🎯"
+    msg   = (
+        f"{emoji} <b>TP{tp_num} HIT</b> — {symbol}\n"
+        f"Precio: {price}  |  Qty: {qty}\n"
+        f"PnL neto: ${pnl:.2f}"
     )
+    log.info(f"[notifier] tp{tp_num}_hit {symbol} price={price} pnl={pnl:.2f}")
+    _send(msg)
 
 
-def notify_daily_summary(balance: float, daily_pnl: float,
-                          trades: int, wins: int, fees: float):
-    wr = (wins / trades * 100) if trades > 0 else 0
-    emoji = "📈" if daily_pnl >= 0 else "📉"
-    _send(
-        f"{emoji} <b>Resumen Diario</b>\n"
-        f"Balance: ${balance:.2f}\n"
-        f"PnL: <b>${daily_pnl:+.2f}</b>\n"
-        f"Trades: {trades} | Wins: {wins} ({wr:.0f}%)\n"
-        f"Fees: ${fees:.2f}"
-    )
+# ── Legacy helpers (for old scanner/pos_manager code) ─────────────────────────
 
-
-def notify_error(message: str):
-    _send(f"❌ <b>Error Bot</b>\n{message[:400]}")
+def send(msg: str):
+    _send(msg)
