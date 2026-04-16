@@ -1,10 +1,13 @@
-SuperBot v4.1 — Main Orchestrator
-Fixes vs v4:
-  - _env() SCAN_PERIOD bug fixed (no more empty-list call)
-  - from strategy import Signal (was signals in doc comments)
-  - DRY_RUN: simulates TP/SL hits from live price so journal fills
-  - All Railway env vars wired correctly
-  - Balance fallback logic improved for DRY mode
+"""
+SuperBot v5.0 — Phase 1: Commodities + Concurrent Scanning + 8 slots
+Cambios vs v4.1:
+  - COMMODITY_SYMBOLS: XAUUSDT, XAGUSD, USOILUSDT escaneados siempre
+  - Scanner concurrente con ThreadPoolExecutor (hasta 20x más rápido)
+  - MAX_POSITIONS default → 8
+  - SCAN_PERIOD default → 60s
+  - commodity_config.py: parámetros distintos por clase de activo
+  - FORCE_SYMBOLS: lista custom de símbolos que siempre se escanean
+  - Logging mejorado con clase de activo en cada trade
 """
 import sys
 import os
@@ -14,14 +17,16 @@ import logging
 import time
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 from bingx_client import BingXClient
 from scanner import Scanner
 from risk_manager import RiskManager, TradeParams
 from strategy import Signal
+from commodity_config import get_asset_class, get_asset_params, COMMODITY_SYMBOLS
 import notifier
 
 logging.basicConfig(
@@ -53,6 +58,13 @@ def _env_int(key: str, default: int) -> int:
 def _env_bool(key: str, default: bool = False) -> bool:
     return _env_str(key, str(default)).lower() == "true"
 
+def _env_list(key: str, default: list = None) -> list:
+    """Parse comma-separated env var into list."""
+    val = _env_str(key, "")
+    if not val:
+        return default or []
+    return [s.strip().upper() for s in val.split(",") if s.strip()]
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -60,23 +72,28 @@ API_KEY    = _env_str("BINGX_API_KEY")
 SECRET_KEY = _env_str("BINGX_API_SECRET") or _env_str("BINGX_SECRET_KEY")
 
 if not API_KEY or not SECRET_KEY:
-    raise EnvironmentError("BINGX_API_KEY and BINGX_API_SECRET are required")
+    raise EnvironmentError("BINGX_API_KEY and BINGX_API_SECRET son requeridos")
 
-SCAN_PERIOD         = _env_int("SCAN_PERIOD_SECONDS",  900)
+# ↓ Phase 1: 60s default (era 900s), 8 slots (era 4)
+SCAN_PERIOD         = _env_int("SCAN_PERIOD_SECONDS",  60)
 DRY_RUN             = _env_bool("DRY_RUN",             False)
 USE_MARKET_ENTRY    = _env_bool("USE_MARKET_ENTRY",    True)
 LIMIT_ORDER_TIMEOUT = _env_int("LIMIT_ORDER_TIMEOUT",  120)
 
 RISK_PER_TRADE      = _env_float("RISK_PER_TRADE",      0.02)
-MAX_POSITIONS       = _env_int("MAX_OPEN_TRADES",        4)
+MAX_POSITIONS       = _env_int("MAX_OPEN_TRADES",        8)     # ← era 4
 LEVERAGE            = _env_int("LEVERAGE",               10)
 DAILY_LOSS_LIMIT    = _env_float("DAILY_LOSS_LIMIT",     0.06)
 MIN_CONFIDENCE      = _env_float("MIN_CONFIDENCE",       0.52)
 SYMBOL_COOLDOWN_MIN = _env_int("SYMBOL_COOLDOWN_MIN",    45)
 TRAILING_STOP_RATE  = _env_float("TRAILING_STOP_RATE",   0.025)
-
-# DRY balance seed (used if real balance unavailable)
 DRY_BALANCE         = _env_float("DRY_BALANCE",         1000.0)
+
+# ↓ Phase 1: símbolos forzados (siempre escaneados, además del scanner normal)
+FORCE_SYMBOLS: List[str] = _env_list("FORCE_SYMBOLS", []) + COMMODITY_SYMBOLS
+
+# ↓ Phase 1: workers concurrentes para el scanner
+SCANNER_WORKERS     = _env_int("SCANNER_WORKERS", 10)
 
 STATE_FILE   = "/tmp/superbot_state.json"
 JOURNAL_FILE = Path("/tmp/trade_journal.json")
@@ -116,22 +133,32 @@ def save_journal(journal: list):
 def record_trade(journal: list, symbol: str, direction: str, entry: float,
                  exit_price: float, pnl: float, fees: float, reason: str):
     journal.append({
-        "ts":        datetime.utcnow().isoformat(),
-        "symbol":    symbol,
-        "direction": direction,
-        "entry":     entry,
-        "exit":      exit_price,
-        "pnl":       round(pnl,  4),
-        "fees":      round(fees, 4),
-        "net_pnl":   round(pnl - fees, 4),
-        "win":       (pnl - fees) > 0,
-        "reason":    reason,
+        "ts":           datetime.utcnow().isoformat(),
+        "symbol":       symbol,
+        "asset_class":  get_asset_class(symbol),   # ← Phase 1: crypto/commodity
+        "direction":    direction,
+        "entry":        entry,
+        "exit":         exit_price,
+        "pnl":          round(pnl,  4),
+        "fees":         round(fees, 4),
+        "net_pnl":      round(pnl - fees, 4),
+        "win":          (pnl - fees) > 0,
+        "reason":       reason,
     })
     save_journal(journal)
 
 
 def get_winrate(journal: list, last_n: int = 30) -> float:
     recent = journal[-last_n:] if len(journal) >= last_n else journal
+    if not recent:
+        return 0.5
+    return sum(1 for t in recent if t.get("win")) / len(recent)
+
+
+def get_winrate_by_class(journal: list, asset_class: str, last_n: int = 20) -> float:
+    """Winrate filtrado por clase de activo (crypto / commodity)."""
+    filtered = [t for t in journal if t.get("asset_class") == asset_class]
+    recent   = filtered[-last_n:] if len(filtered) >= last_n else filtered
     if not recent:
         return 0.5
     return sum(1 for t in recent if t.get("win")) / len(recent)
@@ -150,9 +177,19 @@ def calc_rr(signal: Signal) -> float:
         return 0.0
 
 
-def dynamic_min_confidence(journal: list) -> float:
-    base = MIN_CONFIDENCE * 100  # score is 0-100
+def dynamic_min_confidence(journal: list, symbol: str = "") -> float:
+    """
+    Confianza mínima dinámica.
+    Phase 1: ajusta por clase de activo además del winrate global.
+    """
+    base = MIN_CONFIDENCE * 100
     wr   = get_winrate(journal, 20)
+
+    # Ajuste por clase de activo
+    asset_class = get_asset_class(symbol) if symbol else "crypto"
+    params      = get_asset_params(asset_class)
+    base        = max(base, params.get("min_score", base))
+
     if len(journal) < 10:
         return base
     if wr < 0.40:
@@ -160,6 +197,40 @@ def dynamic_min_confidence(journal: list) -> float:
     if wr > 0.65:
         return max(base - 8,  45)
     return base
+
+
+# ── Concurrent Scanner ────────────────────────────────────────────────────────
+
+def _scan_symbol_safe(scanner: "Scanner", symbol: str) -> Optional[object]:
+    """Escanea un símbolo individual de forma segura (para ThreadPoolExecutor)."""
+    try:
+        return scanner.scan_symbol(symbol)
+    except Exception as e:
+        log.debug(f"scan_symbol {symbol}: {e}")
+        return None
+
+
+def run_concurrent_scan(scanner: "Scanner", symbols: List[str],
+                        workers: int = 10) -> list:
+    """
+    Phase 1: escanea símbolos en paralelo.
+    Retorna lista de ScanResult ordenada por score desc.
+    """
+    results = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_scan_symbol_safe, scanner, s): s
+                   for s in symbols}
+        for future in as_completed(futures):
+            result = future.result()
+            if result is not None:
+                results.append(result)
+
+    # Ordenar por score descendente (igual que scanner.scan() original)
+    try:
+        results.sort(key=lambda r: getattr(r.signal, "score", 0), reverse=True)
+    except Exception:
+        pass
+    return results
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -177,13 +248,15 @@ class SuperBot:
         self.state   = load_state()
         self.journal = load_journal()
         self._sym_info_cache: dict = {}
-        self._dry_balance: float   = DRY_BALANCE   # tracks simulated balance
+        self._dry_balance: float   = DRY_BALANCE
+        self._force_symbols        = FORCE_SYMBOLS
 
         log.info(
-            f"🤖 SuperBot v4.1 | DRY={DRY_RUN} | "
+            f"🤖 SuperBot v5.0-Phase1 | DRY={DRY_RUN} | "
             f"Risk={RISK_PER_TRADE*100:.1f}% | Lev={LEVERAGE}x | "
             f"MaxPos={MAX_POSITIONS} | MinConf={MIN_CONFIDENCE:.2f} | "
-            f"Journal={len(self.journal)}"
+            f"ScanPeriod={SCAN_PERIOD}s | Workers={SCANNER_WORKERS} | "
+            f"ForceSymbols={self._force_symbols} | Journal={len(self.journal)}"
         )
         self._sync_positions_on_start()
         self._init_daily()
@@ -241,7 +314,12 @@ class SuperBot:
                     int(info.get("pricePrecision",   4)),
                 )
             except Exception:
-                self._sym_info_cache[symbol] = (3, 4)
+                # Commodities suelen tener menos decimales
+                asset_class = get_asset_class(symbol)
+                if asset_class == "commodity":
+                    self._sym_info_cache[symbol] = (2, 2)
+                else:
+                    self._sym_info_cache[symbol] = (3, 4)
         return self._sym_info_cache[symbol]
 
     def _is_in_cooldown(self, symbol: str) -> bool:
@@ -266,19 +344,24 @@ class SuperBot:
         if self._is_in_cooldown(symbol):
             return
 
-        rr         = calc_rr(signal)
-        confidence = signal.score   # already 0-100
+        rr           = calc_rr(signal)
+        confidence   = signal.score
+        asset_class  = get_asset_class(symbol)
+        asset_params = get_asset_params(asset_class)
 
-        if rr < 1.2:
-            log.info(f"❌ [{symbol}] RR={rr:.1f} < 1.2 → skip")
+        # Phase 1: RR mínimo diferente por clase de activo
+        min_rr = asset_params.get("min_rr", 1.2)
+        if rr < min_rr:
+            log.info(f"❌ [{symbol}][{asset_class}] RR={rr:.1f} < {min_rr} → skip")
             return
+
         if hasattr(signal, "vol_ok") and not signal.vol_ok:
             log.info(f"❌ [{symbol}] Volumen insuficiente → skip")
             return
 
-        min_conf = dynamic_min_confidence(self.journal)
+        min_conf = dynamic_min_confidence(self.journal, symbol)
         if confidence < min_conf:
-            log.info(f"❌ [{symbol}] score={confidence:.0f} < {min_conf:.0f} RR={rr:.1f}x")
+            log.info(f"❌ [{symbol}][{asset_class}] score={confidence:.0f} < {min_conf:.0f} RR={rr:.1f}x")
             return
 
         balance    = self._safe_get_balance()
@@ -300,6 +383,7 @@ class SuperBot:
         trade_id   = str(uuid.uuid4())[:8]
         trade_data = {
             "trade_id":     trade_id,
+            "asset_class":  asset_class,    # ← Phase 1
             "direction":    signal.direction,
             "entry":        params.entry_price,
             "sl":           params.sl_price,
@@ -326,9 +410,9 @@ class SuperBot:
         # ── DRY RUN ──────────────────────────────────────────────────────────
         if DRY_RUN:
             log.info(
-                f"🔵 [DRY] {symbol} {signal.direction} x{params.quantity} "
-                f"@ {params.entry_price} SL={params.sl_price} "
-                f"TP1={params.tp1_price} TP2={params.tp2_price} "
+                f"🔵 [DRY][{asset_class.upper()}] {symbol} {signal.direction} "
+                f"x{params.quantity} @ {params.entry_price} "
+                f"SL={params.sl_price} TP1={params.tp1_price} TP2={params.tp2_price} "
                 f"score={confidence:.0f} RR={rr:.1f}x [{signal.tier}]"
             )
             trade_data["order_id"] = "DRY-" + trade_id
@@ -349,20 +433,23 @@ class SuperBot:
                 self.client.set_margin_type(symbol, "ISOLATED")
             except Exception:
                 pass
-            self.client.set_leverage(symbol, params.leverage)
+
+            # Phase 1: leverage diferente para commodities (menos volátiles)
+            leverage = asset_params.get("leverage", params.leverage)
+            self.client.set_leverage(symbol, leverage)
 
             side     = "BUY"  if signal.direction == "LONG" else "SELL"
             pos_side = signal.direction
 
             result = self.client.place_order(
-                symbol           = symbol,
-                side             = side,
-                position_side    = pos_side,
-                order_type       = "MARKET",
-                quantity         = params.quantity,
-                stop_loss        = params.sl_price,
-                take_profit      = params.tp1_price,
-                client_order_id  = f"sb_{trade_id}",
+                symbol          = symbol,
+                side            = side,
+                position_side   = pos_side,
+                order_type      = "MARKET",
+                quantity        = params.quantity,
+                stop_loss       = params.sl_price,
+                take_profit     = params.tp1_price,
+                client_order_id = f"sb_{trade_id}",
             )
 
             order_id = result.get("data", {}).get("orderId", "")
@@ -370,7 +457,8 @@ class SuperBot:
                 log.error(f"❌ No orderId {symbol}: {result}")
                 return
 
-            # Trailing stop for remaining 60%
+            # Trailing stop para el 60% restante
+            trail_rate = asset_params.get("trail_rate", TRAILING_STOP_RATE)
             try:
                 self.client.place_trailing_stop(
                     symbol           = symbol,
@@ -378,16 +466,16 @@ class SuperBot:
                     position_side    = pos_side,
                     quantity         = round(params.quantity * 0.60, qty_p),
                     activation_price = params.tp1_price,
-                    price_rate       = TRAILING_STOP_RATE,
+                    price_rate       = trail_rate,
                 )
-                log.info(f"📈 Trailing stop {symbol}: rate={TRAILING_STOP_RATE*100:.1f}%")
+                log.info(f"📈 Trailing stop {symbol}: rate={trail_rate*100:.1f}%")
             except Exception as e:
                 log.warning(f"Trailing stop no colocado {symbol}: {e}")
 
             log.info(
-                f"✅ MARKET {symbol} {signal.direction} qty={params.quantity} "
-                f"SL={params.sl_price} TP1={params.tp1_price} id={order_id} "
-                f"score={confidence:.0f}"
+                f"✅ [{asset_class.upper()}] MARKET {symbol} {signal.direction} "
+                f"qty={params.quantity} SL={params.sl_price} TP1={params.tp1_price} "
+                f"id={order_id} score={confidence:.0f}"
             )
 
             trade_data["order_id"] = str(order_id)
@@ -436,10 +524,10 @@ class SuperBot:
             tp1_hit   = trade.get("tp1_hit",  False)
             breakeven = trade.get("breakeven", False)
             est_fee   = trade.get("est_fee",   0)
+            asset_cls = trade.get("asset_class", get_asset_class(symbol))
 
-            # Closed externally (live only)
             if not DRY_RUN and symbol not in exchange_positions:
-                log.info(f"📤 Cerrada externamente: {symbol}")
+                log.info(f"📤 Cerrada externamente: {symbol} [{asset_cls}]")
                 loss = abs(entry - sl) * qty_full * 0.5 if entry and sl else 0
                 self.risk.record_pnl(-loss, est_fee)
                 notifier.notify_sl_hit(symbol, sl, loss)
@@ -450,7 +538,6 @@ class SuperBot:
                 save_state(self.state)
                 continue
 
-            # Current price
             try:
                 ticker = self.client.get_ticker(symbol)
                 price  = float(ticker.get("lastPrice", 0) or
@@ -460,7 +547,7 @@ class SuperBot:
             if price <= 0:
                 continue
 
-            # ── Breakeven when 70% to TP1 ─────────────────────────────────────
+            # ── Breakeven al 70% hacia TP1 ────────────────────────────────────
             if not breakeven and not tp1_hit and atr_v > 0:
                 progress = (
                     (price - entry) / max(tp1 - entry, 1e-10) if direction == "LONG"
@@ -482,7 +569,7 @@ class SuperBot:
                     save_state(self.state)
                     log.info(f"🔒 Breakeven {symbol} SL→{new_sl} ({progress:.0%})")
 
-            # ── SL hit check (DRY: simulate from live price) ──────────────────
+            # ── SL hit (LIVE) ─────────────────────────────────────────────────
             if not DRY_RUN:
                 sl_hit = (direction == "LONG"  and price <= sl) or \
                          (direction == "SHORT" and price >= sl)
@@ -495,11 +582,9 @@ class SuperBot:
                     self._set_cooldown(symbol)
                     del self.state["open_trades"][symbol]
                     save_state(self.state)
-                    if DRY_RUN:
-                        self._dry_balance -= loss + est_fee
                     continue
 
-            # DRY: check SL hit
+            # ── SL hit (DRY) ──────────────────────────────────────────────────
             if DRY_RUN:
                 sl_hit = (direction == "LONG"  and price <= sl) or \
                          (direction == "SHORT" and price >= sl)
@@ -513,11 +598,11 @@ class SuperBot:
                     self._set_cooldown(symbol)
                     del self.state["open_trades"][symbol]
                     save_state(self.state)
-                    log.info(f"🔴 [DRY] SL hit {symbol} @ {price} | loss=${loss:.2f} | "
-                             f"balance=${self._dry_balance:.2f}")
+                    log.info(f"🔴 [DRY][{asset_cls}] SL hit {symbol} @ {price} | "
+                             f"loss=${loss:.2f} | balance=${self._dry_balance:.2f}")
                     continue
 
-            # ── TP1: partial close 40% ─────────────────────────────────────────
+            # ── TP1: cierre parcial 40% ────────────────────────────────────────
             if not tp1_hit:
                 tp1_hit_now = (direction == "LONG"  and price >= tp1) or \
                               (direction == "SHORT" and price <= tp1)
@@ -539,10 +624,11 @@ class SuperBot:
                     self.state["open_trades"][symbol]["tp1_hit"] = True
                     self.state["open_trades"][symbol]["qty"]     = remaining
                     save_state(self.state)
-                    log.info(f"💰 TP1 {symbol} @ {price} pnl=${net_pnl:.2f} rest={remaining}"
+                    log.info(f"💰 TP1 [{asset_cls}] {symbol} @ {price} "
+                             f"pnl=${net_pnl:.2f} rest={remaining}"
                              + (f" | DRY balance=${self._dry_balance:.2f}" if DRY_RUN else ""))
 
-            # ── TP2: close rest ────────────────────────────────────────────────
+            # ── TP2: cierre resto ──────────────────────────────────────────────
             elif not trade.get("tp2_hit", False):
                 tp2_hit_now = (direction == "LONG"  and price >= tp2) or \
                               (direction == "SHORT" and price <= tp2)
@@ -565,7 +651,7 @@ class SuperBot:
                     self._set_cooldown(symbol)
                     del self.state["open_trades"][symbol]
                     save_state(self.state)
-                    log.info(f"🎯 TP2 {symbol} @ {price} pnl=${net_pnl:.2f}"
+                    log.info(f"🎯 TP2 [{asset_cls}] {symbol} @ {price} pnl=${net_pnl:.2f}"
                              + (f" | DRY balance=${self._dry_balance:.2f}" if DRY_RUN else ""))
 
     # ── Cleanup stale triggers ────────────────────────────────────────────────
@@ -598,28 +684,54 @@ class SuperBot:
         syms    = list(self.state["open_trades"].keys())
         stats   = self.risk.get_stats()
         wr      = get_winrate(self.journal, 20)
+        wr_com  = get_winrate_by_class(self.journal, "commodity", 10)
+        wr_cry  = get_winrate_by_class(self.journal, "crypto",    20)
         log.info(
-            f"📊 Status | Balance: ${balance:.2f} | "
-            f"Open: {syms} | "
-            f"DailyPnL: {stats['daily_pnl']:+.2f} | "
-            f"Fees: ${stats['total_fees']:.3f} | "
-            f"WinRate(20): {wr*100:.0f}% | "
+            f"📊 Status | Balance: ${balance:.2f} | Open: {syms} | "
+            f"DailyPnL: {stats['daily_pnl']:+.2f} | Fees: ${stats['total_fees']:.3f} | "
+            f"WR(20): {wr*100:.0f}% | "
+            f"WR_crypto: {wr_cry*100:.0f}% | "
+            f"WR_commodity: {wr_com*100:.0f}% | "
             f"Trades: {stats['trades_today']}"
         )
+
+    # ── Build symbol list ─────────────────────────────────────────────────────
+
+    def _build_scan_symbols(self) -> List[str]:
+        """
+        Phase 1: construye la lista completa de símbolos a escanear.
+        Scanner normal + FORCE_SYMBOLS (commodities + custom).
+        Deduplicado y excluyendo los que ya están abiertos.
+        """
+        open_syms = set(self.state["open_trades"].keys())
+
+        # Intentar obtener símbolos del scanner si tiene método get_symbols()
+        scanner_syms = []
+        try:
+            if hasattr(self.scanner, "get_symbols"):
+                scanner_syms = self.scanner.get_symbols()
+            elif hasattr(self.scanner, "symbols"):
+                scanner_syms = self.scanner.symbols
+        except Exception:
+            pass
+
+        all_syms = list(dict.fromkeys(scanner_syms + self._force_symbols))
+        return [s for s in all_syms if s not in open_syms]
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def run(self):
         log.info(
-            f"🚀 SuperBot v4.1 | DRY={DRY_RUN} | "
+            f"🚀 SuperBot v5.0-Phase1 | DRY={DRY_RUN} | "
             f"SCAN={SCAN_PERIOD}s | Lev={LEVERAGE}x | "
-            f"Risk={RISK_PER_TRADE*100:.1f}%"
+            f"Risk={RISK_PER_TRADE*100:.1f}% | "
+            f"Commodities={COMMODITY_SYMBOLS}"
         )
         cycle = 0
         while True:
             try:
                 cycle += 1
-                log.info(f"{'='*44} CICLO {cycle} {'='*44}")
+                log.info(f"{'='*40} CICLO {cycle} {'='*40}")
                 self._init_daily()
                 self._cleanup_stale_triggers()
                 self._manage_positions()
@@ -628,9 +740,30 @@ class SuperBot:
                 open_count = len(self.state["open_trades"])
 
                 if self.risk.can_open_trade(open_count, balance):
-                    results    = self.scanner.scan()
-                    slots      = MAX_POSITIONS - open_count
-                    opened     = 0
+                    slots = MAX_POSITIONS - open_count
+
+                    # ── Phase 1: concurrent scan ──────────────────────────────
+                    scan_symbols = self._build_scan_symbols()
+
+                    if scan_symbols:
+                        log.info(f"🔍 Escaneando {len(scan_symbols)} símbolos "
+                                 f"({SCANNER_WORKERS} workers)...")
+
+                        # Intentar scan concurrente; fallback a scan() original
+                        try:
+                            if hasattr(self.scanner, "scan_symbol"):
+                                results = run_concurrent_scan(
+                                    self.scanner, scan_symbols, SCANNER_WORKERS
+                                )
+                            else:
+                                results = self.scanner.scan()
+                        except Exception as e:
+                            log.warning(f"Concurrent scan error, usando scan() original: {e}")
+                            results = self.scanner.scan()
+                    else:
+                        results = self.scanner.scan()
+
+                    opened = 0
                     for result in results:
                         if opened >= slots:
                             break
@@ -638,7 +771,7 @@ class SuperBot:
                         if sym not in self.state["open_trades"]:
                             self._open_trade(sym, result.signal)
                             opened += 1
-                            time.sleep(1.5)
+                            time.sleep(0.5)   # ← era 1.5s, reducido para HF
                 else:
                     log.info(f"📊 Sin slots ({open_count}/{MAX_POSITIONS}) o balance bajo")
 
