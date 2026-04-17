@@ -1,14 +1,23 @@
+#!/usr/bin/env python3
 """
-main.py — Entry point SuperBot v5
-Punto de entrada para Railway, Docker y ejecución local.
+SuperBot v5.0 — Simons Quant Edition
+Entry point para Railway / Docker
 """
-import sys
-import os
 
-# Asegurar que /app está en el path (necesario en Docker)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
+import asyncio
+import logging
 from bot import SuperBot
 
+log = logging.getLogger('main')
+
+
+async def main():
+    bot = SuperBot()
+    await bot.run()
+
+
 if __name__ == "__main__":
-    SuperBot().run()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("👋 SuperBot v5.0 terminado")

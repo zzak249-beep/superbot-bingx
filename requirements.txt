@@ -1,9 +1,2 @@
-requests==2.31.0
-python-dateutil==2.8.2
-numpy==1.26.4
-pandas==2.2.2
-ccxt
-pandas
-numpy
-scikit-learn
-python-dotenv
+requests>=2.31.0
+python-dotenv>=1.0.0
