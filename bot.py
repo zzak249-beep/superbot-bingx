@@ -97,6 +97,22 @@ SESSION_OK   = {7, 8, 9, 10, 11, 12}                       # Pre-Londres UTC
 CVD_LOOKBACK  = _env('CVD_LOOKBACK_BARS', '20', 'int')
 CVD_THRESHOLD = _env('CVD_THRESHOLD', '1.2', 'float')
 
+# ── AlphaX Impulse Bands ──────────────────────────────────────────────────────
+AX_TREND_LEN     = _env('AX_TREND_LEN',     '19',   'int')    # EMA base
+AX_IMPULSE_LEN   = _env('AX_IMPULSE_LEN',   '5',    'int')    # Lookback impulso
+AX_DECAY_RATE    = _env('AX_DECAY_RATE',     '0.97', 'float') # Decaimiento freshness
+AX_MAD_LEN       = _env('AX_MAD_LEN',       '20',   'int')    # MAD length
+AX_BAND_MIN      = _env('AX_BAND_MIN',       '1.5',  'float') # Multiplicador banda tight
+AX_BAND_MAX      = _env('AX_BAND_MAX',       '2.2',  'float') # Multiplicador banda wide
+AX_WPR_FAST      = _env('AX_WPR_FAST',       '8',    'int')   # WPR rápido
+AX_WPR_MED       = _env('AX_WPR_MED',        '21',   'int')   # WPR medio
+AX_WPR_SLOW      = _env('AX_WPR_SLOW',       '55',   'int')   # WPR lento
+AX_WPR_OS        = _env('AX_WPR_OS',        '-82',   'float') # WPR oversold threshold
+AX_WPR_OB        = _env('AX_WPR_OB',        '-18',   'float') # WPR overbought threshold
+AX_MIN_CONF      = _env('AX_MIN_CONFIDENCE', '25',   'float') # Confianza mínima AlphaX (%)
+AX_REQUIRE_WPR   = _env('AX_REQUIRE_WPR',   'true',  'bool')  # Requerir confirmación WPR
+AX_ENABLED       = _env('AX_ENABLED',        'true',  'bool') # Activar filtro AlphaX
+
 # ── Circuit Breaker ───────────────────────────────────────────────────────────
 CIRCUIT_BREAKER_PCT = _env('CIRCUIT_BREAKER_PCT', '3.0', 'float')
 MAX_LOSING_STREAK   = _env('MAX_LOSING_STREAK', '3', 'int')
@@ -231,18 +247,24 @@ class QuantEngine:
     @staticmethod
     def detect_absorption(volumes: List[float], highs: List[float],
                           lows: List[float], opens: List[float],
-                          z_vol: float) -> Tuple[bool, str]:
+                          z_vol: float,
+                          closes: List[float] = None) -> Tuple[bool, str]:
         """
         Absorción: volumen anómalo + rango estrecho = manos fuertes acumulando.
         Señal clásica de Wyckoff / Simons Order-Flow.
         """
         if len(volumes) < 5:
             return False, "insufficient"
-        last_range_pct = (highs[-1] - lows[-1]) / opens[-1] if opens[-1] > 0 else 1
-        body_pct       = abs(closes[-1] - opens[-1]) / opens[-1] if opens[-1] > 0 else 1 \
-                         if 'closes' in dir() else 0
-        # Absorción: Z >2.5 y rango pequeño
-        if z_vol > 2.5 and last_range_pct < (ABSORPTION_RANGE / 100):
+        if opens[-1] <= 0:
+            return False, "invalid_open"
+        last_range_pct = (highs[-1] - lows[-1]) / opens[-1]
+        body_pct = (abs(closes[-1] - opens[-1]) / opens[-1]
+                    if closes is not None and len(closes) > 0
+                    else last_range_pct)
+        # Absorción: Z >2.5, rango estrecho Y cuerpo pequeño (doji/spinning top)
+        # ABSORPTION_RANGE está en fracción (ej: 0.08 = 0.08%), convertir correctamente
+        threshold = ABSORPTION_RANGE / 100  # 0.08 / 100 = 0.0008
+        if z_vol > 2.5 and last_range_pct < threshold and body_pct < threshold * 1.5:
             return True, f"absorption_z{z_vol:.1f}"
         return False, "no_absorption"
 
@@ -454,8 +476,307 @@ Q = QuantEngine
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN 5: FILTROS INSTITUCIONALES
+# SECCIÓN 4b: ALPHAX IMPULSE BANDS — Adaptive Trend Engine
+# Portado de Pine Script a Python. Lógica 1:1 con el indicador original.
 # ══════════════════════════════════════════════════════════════════════════════
+
+class AlphaXEngine:
+    """
+    Motor AlphaX Impulse Bands.
+    Combina bandas adaptativas MAD + impulso ATR-normalizado + WPR multi-período.
+    Genera un confidence score 0-100 para señales BULL / BEAR.
+    """
+
+    # ── Helpers estadísticos ─────────────────────────────────────────────────
+    @staticmethod
+    def _ema(prices: List[float], period: int) -> List[float]:
+        """EMA completa sobre una serie, devuelve lista del mismo tamaño."""
+        if not prices or period <= 0:
+            return prices
+        k   = 2 / (period + 1)
+        out = [prices[0]]
+        for p in prices[1:]:
+            out.append(p * k + out[-1] * (1 - k))
+        return out
+
+    @staticmethod
+    def _sma(prices: List[float], period: int) -> List[float]:
+        """SMA rolling completa."""
+        out = []
+        for i in range(len(prices)):
+            if i < period - 1:
+                out.append(sum(prices[:i+1]) / (i + 1))
+            else:
+                out.append(sum(prices[i-period+1:i+1]) / period)
+        return out
+
+    @staticmethod
+    def _atr_series(highs: List[float], lows: List[float],
+                    closes: List[float], period: int = 14) -> List[float]:
+        """ATR rolling completo."""
+        trs  = [highs[0] - lows[0]]
+        for i in range(1, len(closes)):
+            trs.append(max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i-1]),
+                abs(lows[i]  - closes[i-1]),
+            ))
+        # Wilder smoothing (EMA con k=1/period)
+        k   = 1 / period
+        atr = [trs[0]]
+        for tr in trs[1:]:
+            atr.append(tr * k + atr[-1] * (1 - k))
+        return atr
+
+    @staticmethod
+    def _wpr(highs: List[float], lows: List[float],
+             closes: List[float], period: int) -> List[float]:
+        """Williams %R rolling completo. Rango [-100, 0]."""
+        out = []
+        for i in range(len(closes)):
+            start = max(0, i - period + 1)
+            h = max(highs[start:i+1])
+            l = min(lows[start:i+1])
+            if h == l:
+                out.append(-50.0)
+            else:
+                out.append((closes[i] - h) / (h - l) * 100)
+        return out
+
+    # ── Cálculo principal ─────────────────────────────────────────────────────
+    @classmethod
+    def compute(cls,
+                closes:  List[float],
+                highs:   List[float],
+                lows:    List[float],
+                opens:   List[float],
+                volumes: List[float]) -> dict:
+        """
+        Calcula todas las señales AlphaX Impulse Bands sobre las velas dadas.
+        Devuelve dict con el estado en la última barra.
+        """
+        n = len(closes)
+        if n < max(AX_TREND_LEN, AX_MAD_LEN, AX_WPR_SLOW, AX_IMPULSE_LEN) + 5:
+            return {'valid': False}
+
+        # ── Basis EMAs ────────────────────────────────────────────────────────
+        basis_c = cls._ema(closes, AX_TREND_LEN)
+        atr_ser = cls._atr_series(highs, lows, closes, 14)
+
+        # ── MAD (Mean Absolute Deviation) ─────────────────────────────────────
+        mean_c = cls._sma(closes, AX_MAD_LEN)
+        abs_dev = [abs(closes[i] - mean_c[i]) for i in range(n)]
+        mad    = cls._sma(abs_dev, AX_MAD_LEN)
+
+        # ── Impulso normalizado por ATR (stateful decay) ───────────────────────
+        impulse     = 0.0
+        impulse_dir = 0
+        freshness_s = []
+        imp_thresh  = 1.0
+        for i in range(n):
+            if i < AX_IMPULSE_LEN:
+                freshness_s.append(0.0)
+                continue
+            raw = (atr_ser[i] > 0
+                   and (closes[i] - closes[i - AX_IMPULSE_LEN]) / atr_ser[i]
+                   or 0.0)
+            if abs(raw) > imp_thresh:
+                impulse     = abs(raw)
+                impulse_dir = 1 if raw > 0 else -1
+            else:
+                impulse *= AX_DECAY_RATE
+            freshness_s.append(min(impulse / 2.5, 1.0))
+
+        # Values at last bar
+        freshness    = freshness_s[-1]
+        # Recompute impulse_dir at last bar (stateful — use last 5 bars)
+        last_raw = (atr_ser[-1] > 0
+                    and (closes[-1] - closes[-1 - AX_IMPULSE_LEN]) / atr_ser[-1]
+                    or 0.0)
+        impulse_dir  = 1 if last_raw > imp_thresh else (-1 if last_raw < -imp_thresh else impulse_dir)
+
+        # impulse momentum (ROC of freshness)
+        imp_momentum = (freshness_s[-1] - freshness_s[-4]) if n >= 4 else 0.0
+
+        # ── Adaptive bands ────────────────────────────────────────────────────
+        band_mult  = AX_BAND_MAX - (AX_BAND_MAX - AX_BAND_MIN) * freshness
+        band_upper = basis_c[-1] + mad[-1] * band_mult
+        band_lower = basis_c[-1] - mad[-1] * band_mult
+
+        # ── Trend direction (crossover logic) ─────────────────────────────────
+        trend_dir = 0
+        for i in range(1, n):
+            bu = basis_c[i] + mad[i] * (AX_BAND_MAX - (AX_BAND_MAX - AX_BAND_MIN) * freshness_s[i])
+            bl = basis_c[i] - mad[i] * (AX_BAND_MAX - (AX_BAND_MAX - AX_BAND_MIN) * freshness_s[i])
+            if closes[i] > bu:
+                trend_dir = 1
+            elif closes[i] < bl:
+                trend_dir = -1
+        # Flip detection: compare last two
+        prev_trend = 0
+        for i in range(1, n - 1):
+            bu = basis_c[i] + mad[i] * AX_BAND_MAX
+            bl = basis_c[i] - mad[i] * AX_BAND_MAX
+            if closes[i] > bu:
+                prev_trend = 1
+            elif closes[i] < bl:
+                prev_trend = -1
+        trend_flip_up   = trend_dir == 1  and prev_trend == -1
+        trend_flip_down = trend_dir == -1 and prev_trend == 1
+
+        # ── WPR multi-período ─────────────────────────────────────────────────
+        wpr_fast_s = cls._wpr(highs, lows, closes, AX_WPR_FAST)
+        wpr_med_s  = cls._wpr(highs, lows, closes, AX_WPR_MED)
+        wpr_slow_s = cls._wpr(highs, lows, closes, AX_WPR_SLOW)
+
+        wf = wpr_fast_s[-1];  wf1 = wpr_fast_s[-2] if n >= 2 else wf
+        wm = wpr_med_s[-1]
+        ws = wpr_slow_s[-1]
+
+        wpr_fast_os      = wf < AX_WPR_OS
+        wpr_fast_ob      = wf > AX_WPR_OB
+        wpr_med_os       = wm < AX_WPR_OS
+        wpr_med_ob       = wm > AX_WPR_OB
+        wpr_fast_cross_up   = wf  > AX_WPR_OS and wf1 <= AX_WPR_OS
+        wpr_fast_cross_down = wf  < AX_WPR_OB and wf1 >= AX_WPR_OB
+        wpr_fast_vel        = wf  - wf1
+        wpr_fast_accel      = wpr_fast_vel - (wpr_fast_s[-2] - wpr_fast_s[-3]
+                                               if n >= 3 else 0.0)
+        wpr_bull_align      = ws > -65 and wm > -60
+        wpr_bear_align      = ws < -35 and wm < -40
+        wpr_bull_recovery   = (wf > wpr_fast_s[-2] and wf > wpr_fast_s[-3]
+                                if n >= 3 else False)
+        wpr_bear_recovery   = (wf < wpr_fast_s[-2] and wf < wpr_fast_s[-3]
+                                if n >= 3 else False)
+        wpr_triple_os       = wf < AX_WPR_OS and wm < -70 and ws < -60
+        wpr_triple_ob       = wf > AX_WPR_OB and wm > -30 and ws > -40
+
+        # WPR confirmation gate
+        wpr_bull_ok = (not AX_REQUIRE_WPR or
+                       wpr_fast_os or wpr_fast_cross_up or
+                       wpr_bull_recovery or wpr_bull_align)
+        wpr_bear_ok = (not AX_REQUIRE_WPR or
+                       wpr_fast_ob or wpr_fast_cross_down or
+                       wpr_bear_recovery or wpr_bear_align)
+
+        # ── Volume & candle context ───────────────────────────────────────────
+        vol_sma   = cls._sma(volumes, 20)
+        vol_ratio = volumes[-1] / vol_sma[-1] if vol_sma[-1] > 0 else 1.0
+        candle_body  = abs(closes[-1] - opens[-1])
+        candle_range = highs[-1] - lows[-1]
+        body_ratio   = candle_body / candle_range if candle_range > 0 else 0.0
+
+        # ── Confidence scoring ────────────────────────────────────────────────
+        def bull_confidence() -> float:
+            c = 0.0
+            c += 25.0 if trend_flip_up else 0.0
+            c += (20.0 if freshness > 0.8 else 15.0 if freshness > 0.6 else
+                  10.0 if freshness > 0.4 else 5.0  if freshness > 0.2 else 0.0)
+            c += 10.0 if impulse_dir == 1 else 0.0
+            c += (15.0 if wf < -95 else 12.0 if wf < -90 else
+                  9.0  if wf < -85 else 5.0  if wf < -80  else 0.0)
+            c += (10.0 if wpr_fast_cross_up   else
+                  7.0  if wpr_fast_vel > 3    else
+                  4.0  if wpr_bull_recovery   else 0.0)
+            c += 8.0 if wpr_triple_os else 5.0 if wpr_med_os else 0.0
+            c += 5.0 if wpr_bull_align else 2.0 if ws > -55 else 0.0
+            c += (5.0 if closes[-1] > opens[-1] and body_ratio > 0.5
+                  else 2.0 if closes[-1] > opens[-1] else 0.0)
+            c += 5.0 if vol_ratio > 1.5 else 2.0 if vol_ratio > 1.0 else 0.0
+            c += 5.0 if imp_momentum > 0.5 else 2.0 if imp_momentum > 0.2 else 0.0
+            # Penalties
+            c -= 8.0 if ws > -30 else 0.0
+            c -= 5.0 if wf > -20 else 0.0
+            c -= 10.0 if freshness < 0.1 else 0.0
+            c -= 5.0 if abs(wpr_fast_vel) > 30 else 0.0
+            return max(0.0, min(100.0, c))
+
+        def bear_confidence() -> float:
+            c = 0.0
+            c += 25.0 if trend_flip_down else 0.0
+            c += (20.0 if freshness > 0.8 else 15.0 if freshness > 0.6 else
+                  10.0 if freshness > 0.4 else 5.0  if freshness > 0.2 else 0.0)
+            c += 10.0 if impulse_dir == -1 else 0.0
+            c += (15.0 if wf > -5  else 12.0 if wf > -10 else
+                  9.0  if wf > -15 else 5.0  if wf > -20  else 0.0)
+            c += (10.0 if wpr_fast_cross_down  else
+                  7.0  if wpr_fast_vel < -3    else
+                  4.0  if wpr_bear_recovery    else 0.0)
+            c += 8.0 if wpr_triple_ob else 5.0 if wpr_med_ob else 0.0
+            c += 5.0 if wpr_bear_align else 2.0 if ws < -45 else 0.0
+            c += (5.0 if closes[-1] < opens[-1] and body_ratio > 0.5
+                  else 2.0 if closes[-1] < opens[-1] else 0.0)
+            c += 5.0 if vol_ratio > 1.5 else 2.0 if vol_ratio > 1.0 else 0.0
+            c += 5.0 if imp_momentum > 0.5 else 2.0 if imp_momentum > 0.2 else 0.0
+            c -= 8.0 if ws < -70 else 0.0
+            c -= 5.0 if wf < -80 else 0.0
+            c -= 10.0 if freshness < 0.1 else 0.0
+            c -= 5.0 if abs(wpr_fast_vel) > 30 else 0.0
+            return max(0.0, min(100.0, c))
+
+        bull_conf = bull_confidence()
+        bear_conf = bear_confidence()
+
+        # ── Tier classification ────────────────────────────────────────────────
+        bull_tier = "S" if bull_conf >= 70 else "A" if bull_conf >= 55 else "B"
+        bear_tier = "S" if bear_conf >= 70 else "A" if bear_conf >= 55 else "B"
+
+        # ── Band width squeeze indicator ───────────────────────────────────────
+        band_width_pct = (band_upper - band_lower) / closes[-1] * 100 if closes[-1] > 0 else 0.0
+
+        return {
+            'valid':          True,
+            # Impulse
+            'freshness':      freshness,
+            'impulse_dir':    impulse_dir,
+            'imp_momentum':   imp_momentum,
+            # Bands
+            'band_upper':     band_upper,
+            'band_lower':     band_lower,
+            'band_width_pct': band_width_pct,
+            'basis_ema':      basis_c[-1],
+            'band_mult':      band_mult,
+            # Trend
+            'trend_dir':      trend_dir,
+            'trend_flip_up':  trend_flip_up,
+            'trend_flip_down': trend_flip_down,
+            # WPR
+            'wpr_fast':       wf,
+            'wpr_med':        wm,
+            'wpr_slow':       ws,
+            'wpr_fast_vel':   wpr_fast_vel,
+            'wpr_bull_align': wpr_bull_align,
+            'wpr_bear_align': wpr_bear_align,
+            'wpr_triple_os':  wpr_triple_os,
+            'wpr_triple_ob':  wpr_triple_ob,
+            'wpr_bull_ok':    wpr_bull_ok,
+            'wpr_bear_ok':    wpr_bear_ok,
+            # Volume
+            'vol_ratio':      vol_ratio,
+            # Confidence
+            'bull_conf':      bull_conf,
+            'bear_conf':      bear_conf,
+            'bull_tier':      bull_tier,
+            'bear_tier':      bear_tier,
+        }
+
+    @classmethod
+    def bull_signal(cls, ax: dict) -> bool:
+        """True si AlphaX da señal alcista válida."""
+        if not ax.get('valid'):
+            return True  # si no hay datos suficientes, no bloquear
+        return (ax['bull_conf'] >= AX_MIN_CONF and
+                ax['wpr_bull_ok'] and
+                ax['trend_dir'] >= 0 and          # no en tendencia bajista
+                ax['freshness'] > 0.1 and          # no completamente estale
+                ax['impulse_dir'] >= 0)            # impulso no activamente bajista
+
+    @classmethod
+    def squeeze_warning(cls, ax: dict) -> bool:
+        """True si hay squeeze de bandas (potencial breakout inminente)."""
+        return ax.get('valid') and ax.get('band_width_pct', 99) < 2.0
+
+
 
 class Filters:
     def __init__(self):
@@ -807,7 +1128,7 @@ class SuperBot:
         z_price = Q.z_score_price(closes, 20)
 
         # Absorción institucional
-        abs_ok, abs_str = Q.detect_absorption(volumes, highs, lows, opens, z_vol)
+        abs_ok, abs_str = Q.detect_absorption(volumes, highs, lows, opens, z_vol, closes)
 
         # Momentum multi-período
         mom_score, mom_str = Q.momentum_signal(closes)
@@ -817,6 +1138,14 @@ class SuperBot:
 
         # CVD
         cvd_val, cvd_str = Q.cvd(volumes, closes, opens)
+
+        # ── AlphaX Impulse Bands ───────────────────────────────────────────────
+        ax = AlphaXEngine.compute(closes, highs, lows, opens, volumes)
+        if AX_ENABLED and ax.get('valid'):
+            if not AlphaXEngine.bull_signal(ax):
+                log.debug(f"{symbol}: ✗ AlphaX bull_conf={ax['bull_conf']:.0f} "
+                          f"trend={ax['trend_dir']} fresh={ax['freshness']:.2f}")
+                return None
 
         # Patrones clásicos
         vcp_ok,  vcp_str  = Q.detect_vcp(closes, volumes, VCP_LOOKBACK)
@@ -835,7 +1164,7 @@ class SuperBot:
         # ── Score Ensemble (Simons) ────────────────────────────────────────────
         ensemble = Q.ensemble_score(z_vol, z_price, mom_score, mr_score, cvd_val)
 
-        # ── Score Total (Ensemble + Patrones + Filtros) ───────────────────────
+        # ── Score Total (Ensemble + Patrones + Filtros + AlphaX) ─────────────
         score   = ensemble   # base: ensemble cuantitativo
         reasons = [f"Ensemble({ensemble:.0f})"]
 
@@ -892,6 +1221,30 @@ class SuperBot:
         if oi_reason == "oi_breakout_confirmed":
             score += 5; reasons.append("OI_Break(+5)")
 
+        # ── AlphaX Impulse bonus ───────────────────────────────────────────────
+        if ax.get('valid'):
+            bc = ax['bull_conf']
+            # S/A/B tier bonuses
+            if bc >= 70:
+                score += 18; reasons.append(f"AX_S({bc:.0f}%)(+18)")
+            elif bc >= 55:
+                score += 12; reasons.append(f"AX_A({bc:.0f}%)(+12)")
+            elif bc >= AX_MIN_CONF:
+                score += 6;  reasons.append(f"AX_B({bc:.0f}%)(+6)")
+            # Sub-señales adicionales
+            if ax['wpr_triple_os']:
+                score += 8; reasons.append("AX_TripleOS(+8)")
+            elif ax['wpr_med'] < AX_WPR_OS:
+                score += 4; reasons.append("AX_MedOS(+4)")
+            if ax['trend_flip_up']:
+                score += 10; reasons.append("AX_TrendFlip(+10)")
+            if ax['freshness'] > 0.7:
+                score += 5; reasons.append(f"AX_Fresh({ax['freshness']:.0%})(+5)")
+            if AlphaXEngine.squeeze_warning(ax):
+                score += 6; reasons.append(f"AX_Squeeze(bw={ax['band_width_pct']:.1f}%)(+6)")
+            if ax['wpr_bull_align']:
+                score += 4; reasons.append("AX_WPRAlign(+4)")
+
         # ── Gestión de riesgo dinámica ─────────────────────────────────────────
         sl_atr  = price - atr_v * SL_ATR_MULT
         sl_pct  = (price - sl_atr) / price * 100
@@ -928,8 +1281,11 @@ class SuperBot:
             'cvd_val':     cvd_val,
             'cvd_signal':  cvd_str,
             'absorption':  abs_ok,
+            'absorption_str': abs_str,
             'vcp':         vcp_ok,
+            'vcp_str':     vcp_str,
             'flag':        flag_ok,
+            'flag_str':    flag_str,
             'vol_ratio':   vol_ratio,
             'rsi':         rsi_v,
             'regime':      regime,
@@ -937,6 +1293,19 @@ class SuperBot:
             'funding_rate': fund_rate,
             'oi_change':   oi_chg,
             'ma10': ma10, 'ma20': ma20, 'ema9': e9, 'ema50': e50,
+            # AlphaX Impulse Bands
+            'ax_valid':       ax.get('valid', False),
+            'ax_bull_conf':   ax.get('bull_conf', 0.0),
+            'ax_bull_tier':   ax.get('bull_tier', '?'),
+            'ax_freshness':   ax.get('freshness', 0.0),
+            'ax_trend_dir':   ax.get('trend_dir', 0),
+            'ax_trend_flip':  ax.get('trend_flip_up', False),
+            'ax_wpr_fast':    ax.get('wpr_fast', -50.0),
+            'ax_wpr_slow':    ax.get('wpr_slow', -50.0),
+            'ax_triple_os':   ax.get('wpr_triple_os', False),
+            'ax_squeeze':     AlphaXEngine.squeeze_warning(ax),
+            'ax_band_width':  ax.get('band_width_pct', 0.0),
+            'ax_impulse_dir': ax.get('impulse_dir', 0),
         }
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -955,7 +1324,21 @@ class SuperBot:
                 f"Z-Vol:{sig['z_vol']:.2f} | Edge:{sig['edge_ratio']:.1f}× | "
                 f"Regime:{sig['regime']}"
             )
-            return False
+            # Track paper position so monitor_positions can simulate exits
+            sl_pct = sig['sl_pct']
+            tp1 = sig['price'] * (1 + sl_pct * TP1_RR / 100)
+            tp2 = sig['price'] * (1 + sl_pct * TP2_RR / 100)
+            qty_paper = (POSITION_SIZE * LEVERAGE) / sig['price']
+            self.positions[symbol] = self._build_pos(
+                entry=sig['price'], qty=qty_paper,
+                tp1=tp1, tp2=tp2,
+                sl=sig['sl_price'], sl_pct=sl_pct,
+                atr=sig['atr'], score=sig['score'], sig=sig
+            )
+            self.daily_trades += 1
+            self.stats['z_vol_avg'].append(sig['z_vol'])
+            self.stats['ensemble_avg'].append(sig['ensemble'])
+            return True
 
         if symbol not in self.contracts_info:
             log.error(f"❌ {symbol}: sin info de contrato")
@@ -1035,13 +1418,23 @@ class SuperBot:
             "Flag"      if sig.get('flag')        else "",
         ])) or "Momentum_Quant"
 
+        ax_line = ""
+        if sig.get('ax_valid'):
+            ax_line = (f"\n🌊 AlphaX: {sig['ax_bull_tier']}-Tier "
+                       f"({sig['ax_bull_conf']:.0f}%) | "
+                       f"Fresh:{sig['ax_freshness']:.0%} | "
+                       f"WPR:{sig['ax_wpr_fast']:.0f}/{sig['ax_wpr_slow']:.0f}"
+                       + (" | TripleOS🔥" if sig.get('ax_triple_os') else "")
+                       + (" | SQUEEZE⚡" if sig.get('ax_squeeze') else ""))
+
         log.info(f"✓ LONG {symbol} @ ${fill_price:.6f} | SL:{'OK' if sl_ok else '⚠️'}")
         self._notify(
             f"<b>🟢 LONG ABIERTO — SIMONS QUANT</b>\n\n"
             f"<b>{symbol}</b> | {patterns}\n\n"
             f"🔬 Ensemble: {sig['ensemble']:.0f} | Score: {sig['score']:.0f}\n"
             f"📊 Z-Vol: {sig['z_vol']:.2f} | Z-Price: {sig['z_price']:.2f}\n"
-            f"⚡ Momentum: {sig['mom_score']*100:.2f}% | CVD: {sig['cvd_signal']}\n"
+            f"⚡ Momentum: {sig['mom_score']*100:.2f}% | CVD: {sig['cvd_signal']}"
+            f"{ax_line}\n"
             f"💱 Funding: {sig['funding_rate']:.3f}% | OI: {sig['oi_change']:+.1f}%\n\n"
             f"📍 Entrada: ${fill_price:.6f}\n"
             f"🎯 TP1: ${tp1:.6f} (+{real_sl_pct * TP1_RR:.2f}%)\n"
@@ -1136,6 +1529,16 @@ class SuperBot:
                 'symbol': symbol, 'side': 'SELL', 'type': 'MARKET',
                 'quantity': str(qty), 'positionSide': 'LONG',
             })
+            # Cancel open SL/TP orders to avoid orphan orders on exchange
+            try:
+                open_orders = api_request('GET', '/openApi/swap/v2/trade/openOrders', {'symbol': symbol})
+                for o in open_orders.get('data', {}).get('orders', []):
+                    oid = o.get('orderId')
+                    if oid:
+                        api_request('DELETE', '/openApi/swap/v2/trade/order',
+                                    {'symbol': symbol, 'orderId': str(oid)})
+            except Exception as e:
+                log.warning(f"Cancel orphan orders [{symbol}]: {e}")
         pnl_final = self._calc_pnl(pos['entry'], price, qty, symbol)
         total_pnl = pos['pnl_realized'] + pnl_final
         hold_min  = int((datetime.now() - pos['opened_at']).total_seconds() / 60)
@@ -1347,10 +1750,19 @@ class SuperBot:
                                 "VCP"       if sig.get('vcp')        else "",
                                 "Flag"      if sig.get('flag')        else "",
                             ])) or "Quant"
+                            ax_info = ""
+                            if sig.get('ax_valid'):
+                                ax_info = (f" | AX:{sig['ax_bull_tier']}"
+                                           f"({sig['ax_bull_conf']:.0f}%)"
+                                           f" Fresh:{sig['ax_freshness']:.0%}"
+                                           f" WPR:{sig['ax_wpr_fast']:.0f}"
+                                           + (" 🌊TOS" if sig.get('ax_triple_os') else "")
+                                           + (" 🔧SQZ" if sig.get('ax_squeeze') else ""))
                             log.info(
                                 f"💡 {symbol} | "
                                 f"Score:{sig['score']:.0f} | Ensemble:{sig['ensemble']:.0f} | "
                                 f"ZVol:{sig['z_vol']:.2f} | {patterns} | {sig['regime']}"
+                                f"{ax_info}"
                             )
                             if self.open_position(sig):
                                 await asyncio.sleep(3)
