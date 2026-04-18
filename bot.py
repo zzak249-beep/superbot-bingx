@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║          SUPERBOT v5.0 — Simons Quant Edition                              ║
+║          SUPERBOT v5.1 — Simons Quant Edition                              ║
 ║          BingX Futures · USDT Perps · Multi-Signal Ensemble                ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  Filosofía: "No predecimos el futuro, explotamos patrones estadísticos."   ║
 ║  Inspirado en Renaissance Technologies / Medallion Fund                    ║
 ║                                                                              ║
 ║  SEÑALES:  Z-Score(Vol/Price/ATR) · Momentum · Mean-Reversion · CVD       ║
-║  PATRONES: VCP · Flag · Absorción · Breakout Estadístico                  ║
-║  FILTROS:  Market Regime · BTC Guard · Funding · OI · Sesión · Correlation ║
-║  RIESGO:   Kelly Sizing · Circuit Breaker · Trailing ATR · Max Hold        ║
+║  PATRONES: VCP · Flag · Absorción · AlphaX Impulse Bands                 ║
+║  FILTROS:  MTF 15m · Beta BTC · Swing-SL · Regime · BTC Guard · Sesión   ║
+║  RIESGO:   Kelly · Circuit Breaker · Trailing TP1+TP2 · Runner · CSV Log  ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 import os, asyncio, logging, requests, hmac, hashlib, time, sys, math, re, json
-import statistics, traceback
+import statistics, traceback, csv
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 from collections import defaultdict, deque
@@ -98,20 +98,45 @@ CVD_LOOKBACK  = _env('CVD_LOOKBACK_BARS', '20', 'int')
 CVD_THRESHOLD = _env('CVD_THRESHOLD', '1.2', 'float')
 
 # ── AlphaX Impulse Bands ──────────────────────────────────────────────────────
-AX_TREND_LEN     = _env('AX_TREND_LEN',     '19',   'int')    # EMA base
-AX_IMPULSE_LEN   = _env('AX_IMPULSE_LEN',   '5',    'int')    # Lookback impulso
-AX_DECAY_RATE    = _env('AX_DECAY_RATE',     '0.97', 'float') # Decaimiento freshness
-AX_MAD_LEN       = _env('AX_MAD_LEN',       '20',   'int')    # MAD length
-AX_BAND_MIN      = _env('AX_BAND_MIN',       '1.5',  'float') # Multiplicador banda tight
-AX_BAND_MAX      = _env('AX_BAND_MAX',       '2.2',  'float') # Multiplicador banda wide
-AX_WPR_FAST      = _env('AX_WPR_FAST',       '8',    'int')   # WPR rápido
-AX_WPR_MED       = _env('AX_WPR_MED',        '21',   'int')   # WPR medio
-AX_WPR_SLOW      = _env('AX_WPR_SLOW',       '55',   'int')   # WPR lento
-AX_WPR_OS        = _env('AX_WPR_OS',        '-82',   'float') # WPR oversold threshold
-AX_WPR_OB        = _env('AX_WPR_OB',        '-18',   'float') # WPR overbought threshold
-AX_MIN_CONF      = _env('AX_MIN_CONFIDENCE', '25',   'float') # Confianza mínima AlphaX (%)
-AX_REQUIRE_WPR   = _env('AX_REQUIRE_WPR',   'true',  'bool')  # Requerir confirmación WPR
-AX_ENABLED       = _env('AX_ENABLED',        'true',  'bool') # Activar filtro AlphaX
+AX_TREND_LEN     = _env('AX_TREND_LEN',     '19',   'int')
+AX_IMPULSE_LEN   = _env('AX_IMPULSE_LEN',   '5',    'int')
+AX_DECAY_RATE    = _env('AX_DECAY_RATE',     '0.97', 'float')
+AX_MAD_LEN       = _env('AX_MAD_LEN',       '20',   'int')
+AX_BAND_MIN      = _env('AX_BAND_MIN',       '1.5',  'float')
+AX_BAND_MAX      = _env('AX_BAND_MAX',       '2.2',  'float')
+AX_WPR_FAST      = _env('AX_WPR_FAST',       '8',    'int')
+AX_WPR_MED       = _env('AX_WPR_MED',        '21',   'int')
+AX_WPR_SLOW      = _env('AX_WPR_SLOW',       '55',   'int')
+AX_WPR_OS        = _env('AX_WPR_OS',        '-82',   'float')
+AX_WPR_OB        = _env('AX_WPR_OB',        '-18',   'float')
+AX_MIN_CONF      = _env('AX_MIN_CONFIDENCE', '25',   'float')
+AX_REQUIRE_WPR   = _env('AX_REQUIRE_WPR',   'true',  'bool')
+AX_ENABLED       = _env('AX_ENABLED',        'true',  'bool')
+
+# ── Multi-Timeframe Confirmation ──────────────────────────────────────────────
+MTF_ENABLED      = _env('MTF_ENABLED',       'true',  'bool')  # Confirmar con 15m
+MTF_REQUIRE_BULL = _env('MTF_REQUIRE_BULL',  'true',  'bool')  # Requerir momentum alcista en 15m
+MTF_RSI_MIN      = _env('MTF_RSI_MIN',       '40',   'float')  # RSI mínimo en 15m (no sobrecomprado)
+MTF_RSI_MAX      = _env('MTF_RSI_MAX',       '72',   'float')  # RSI máximo en 15m (no sobreextendido)
+
+# ── Beta Filter (vs BTC) ──────────────────────────────────────────────────────
+BETA_FILTER      = _env('BETA_FILTER',      'true',  'bool')   # Filtrar por beta
+BETA_MIN         = _env('BETA_MIN',          '0.8',  'float')  # Beta mínima vs BTC
+BETA_MAX         = _env('BETA_MAX',          '3.5',  'float')  # Beta máxima (evitar too volatile)
+BETA_LOOKBACK    = _env('BETA_LOOKBACK',     '48',   'int')    # Horas de lookback para beta
+
+# ── Structural SL (swing-low) ─────────────────────────────────────────────────
+STRUCT_SL        = _env('STRUCT_SL_ENABLED', 'true',  'bool')  # SL estructural vs ATR
+STRUCT_SL_BARS   = _env('STRUCT_SL_LOOKBACK','20',    'int')   # Barras atrás para swing low
+STRUCT_SL_BUFFER = _env('STRUCT_SL_BUFFER',  '0.15',  'float') # % buffer debajo del swing
+
+# ── Pattern Guard ─────────────────────────────────────────────────────────────
+MIN_PATTERNS     = _env('MIN_PATTERNS',       '1',    'int')   # Mínimo patrones (VCP/Flag/Abs/AX)
+TRAILING_FROM_TP1= _env('TRAILING_FROM_TP1', 'true',  'bool') # Trailing activo desde TP1 (no solo TP2)
+TRAIL_TP1_MULT   = _env('TRAIL_TP1_ATR_MULT','1.0',  'float') # ATR mult para trailing desde TP1
+
+# ── Trade Log CSV ─────────────────────────────────────────────────────────────
+TRADE_LOG_CSV    = _env('TRADE_LOG_CSV', '/app/trades.csv', 'str')  # Path CSV de trades
 
 # ── Circuit Breaker ───────────────────────────────────────────────────────────
 CIRCUIT_BREAKER_PCT = _env('CIRCUIT_BREAKER_PCT', '3.0', 'float')
@@ -458,6 +483,80 @@ class QuantEngine:
                mr_n      * weights['mr']      +
                cvd_n     * weights['cvd'])
         return round(raw * 100, 1)
+
+    # ── Swing-Low Structural SL ───────────────────────────────────────────────
+    @staticmethod
+    def swing_low_sl(lows: List[float], closes: List[float],
+                     lookback: int = 20, buffer_pct: float = 0.15) -> Optional[float]:
+        """
+        Encuentra el swing-low más reciente en los últimos `lookback` barras.
+        Coloca el SL `buffer_pct`% debajo de ese mínimo.
+        Más resistente a stop-hunting que el SL basado en ATR.
+        Retorna None si no hay swing válido.
+        """
+        if len(lows) < lookback + 2:
+            return None
+        window = lows[-(lookback + 1):-1]   # excluir la vela actual
+        sl_raw = min(window)
+        sl     = sl_raw * (1 - buffer_pct / 100)
+        # Guard: el SL no puede estar a más del SL_MAX_PCT del cierre actual
+        if closes[-1] > 0 and (closes[-1] - sl) / closes[-1] * 100 > SL_MAX_PCT:
+            return None   # swing demasiado lejano → usar ATR
+        if closes[-1] > 0 and (closes[-1] - sl) / closes[-1] * 100 < SL_MIN_PCT:
+            return None   # swing demasiado cercano → usar ATR
+        return sl
+
+    # ── Beta vs BTC ───────────────────────────────────────────────────────────
+    @staticmethod
+    def beta_vs_btc(sym_closes: List[float], btc_closes: List[float],
+                    lookback: int = 48) -> float:
+        """
+        Calcula la beta del símbolo respecto a BTC usando retornos logarítmicos.
+        Beta > 1 = se mueve más que BTC (amplificador de tendencia).
+        """
+        if len(sym_closes) < lookback + 1 or len(btc_closes) < lookback + 1:
+            return 1.0
+        sc  = sym_closes[-(lookback + 1):]
+        bc  = btc_closes[-(lookback + 1):]
+        sym_ret = [math.log(sc[i] / sc[i-1]) for i in range(1, len(sc)) if sc[i-1] > 0]
+        btc_ret = [math.log(bc[i] / bc[i-1]) for i in range(1, len(bc)) if bc[i-1] > 0]
+        n = min(len(sym_ret), len(btc_ret))
+        if n < 10:
+            return 1.0
+        sym_ret, btc_ret = sym_ret[-n:], btc_ret[-n:]
+        mean_b = sum(btc_ret) / n
+        mean_s = sum(sym_ret) / n
+        cov    = sum((btc_ret[i] - mean_b) * (sym_ret[i] - mean_s) for i in range(n)) / n
+        var_b  = sum((r - mean_b) ** 2 for r in btc_ret) / n
+        return cov / var_b if var_b > 1e-12 else 1.0
+
+    # ── MTF (Multi-TimeFrame) Confirmation ────────────────────────────────────
+    @staticmethod
+    def mtf_confirm(closes_15m: List[float], highs_15m: List[float],
+                    lows_15m:  List[float]) -> Tuple[bool, str]:
+        """
+        Confirmación de tendencia en 15m para señales generadas en 5m.
+        Requiere: precio > EMA20(15m) + RSI entre 40-72 + momentum positivo.
+        Retorna (ok, reason).
+        """
+        if len(closes_15m) < 22:
+            return True, "insufficient_15m"   # sin datos → no bloquear
+        ema20 = QuantEngine.ema(closes_15m, 20)
+        ema9  = QuantEngine.ema(closes_15m, 9)
+        rsi   = QuantEngine.rsi(closes_15m, 14)
+        mom   = (closes_15m[-1] - closes_15m[-6]) / closes_15m[-6] * 100 if closes_15m[-6] > 0 else 0
+        price = closes_15m[-1]
+
+        if rsi > MTF_RSI_MAX:
+            return False, f"15m_RSI_overbought({rsi:.0f})"
+        if rsi < MTF_RSI_MIN:
+            return False, f"15m_RSI_weak({rsi:.0f})"
+        if MTF_REQUIRE_BULL:
+            if price < ema20:
+                return False, f"15m_below_EMA20"
+            if mom < -0.3:
+                return False, f"15m_mom_neg({mom:.2f}%)"
+        return True, f"15m_ok(RSI={rsi:.0f},mom={mom:.2f}%)"
 
     # ── Kelly Sizing ──────────────────────────────────────────────────────────
     @staticmethod
@@ -877,7 +976,12 @@ class SuperBot:
             # Métricas Simons
             'z_vol_avg': [],    # Z-vol promedio en entradas
             'ensemble_avg': [], # Score ensemble promedio
+            # Métricas por patrón (para feedback loop)
+            'pattern_pnl': defaultdict(list),   # {pattern: [pnl1, pnl2...]}
+            'tier_pnl':    defaultdict(list),   # {ax_tier: [pnl1...]}
+            'sl_type_pnl': defaultdict(list),   # {'atr': [...], 'structural': [...]}
         }
+        self._beta_cache: Dict[str, Tuple[float, float]] = {}  # {sym: (beta, ts)}
 
         self._banner()
         ok = self._connect()
@@ -888,22 +992,28 @@ class SuperBot:
         self._refresh_symbols()
         self._recover_positions()
         self._notify(
-            f"<b>🚀 SUPERBOT v5.0 — SIMONS QUANT</b>\n\n"
+            f"<b>🚀 SUPERBOT v5.1 — SIMONS QUANT</b>\n\n"
             f"Capital: ${POSITION_SIZE} × {MAX_POSITIONS} | Lev: {LEVERAGE}×\n"
             f"Circuit: {CIRCUIT_BREAKER_PCT}% | Min score: {MIN_QUANT_SCORE}\n"
-            f"Z-Vol: {Z_VOL_THRESHOLD} | Z-Price: {Z_PRICE_THRESHOLD}\n"
+            f"Z-Vol: {Z_VOL_THRESHOLD} | Patterns≥{MIN_PATTERNS}\n"
+            f"MTF 15m: {'✓' if MTF_ENABLED else '✗'} | Beta: {'✓' if BETA_FILTER else '✗'} [{BETA_MIN}-{BETA_MAX}]\n"
+            f"SL: {'Estructural' if STRUCT_SL else 'ATR'} | Trail desde TP1: {'✓' if TRAILING_FROM_TP1 else '✗'}\n"
+            f"AlphaX: {'✓' if AX_ENABLED else '✗'} | CSV log: ✓\n"
             f"Modo: {'REAL 💸' if AUTO_TRADING else 'PAPER 📝'}"
         )
 
     # ── Banner ────────────────────────────────────────────────────────────────
     def _banner(self):
         log.info("=" * 78)
-        log.info("  SUPERBOT v5.0 — Simons Quant Edition")
+        log.info("  SUPERBOT v5.1 — Simons Quant Edition")
         log.info("  'No predecimos el futuro, explotamos patrones estadísticos.'")
         log.info("=" * 78)
         log.info(f"  Capital: ${POSITION_SIZE}/pos × {MAX_POSITIONS} | Leverage: {LEVERAGE}×")
-        log.info(f"  SL: {SL_ATR_MULT}×ATR | TP1: {TP1_RR}R | TP2: {TP2_RR}R | Trail: {RUNNER_TRAIL}×ATR")
-        log.info(f"  Z-Vol: {Z_VOL_THRESHOLD} | Z-Price: {Z_PRICE_THRESHOLD} | Min Score: {MIN_QUANT_SCORE}")
+        log.info(f"  SL: {'Estructural+ATR' if STRUCT_SL else 'ATR'} | TP1: {TP1_RR}R | TP2: {TP2_RR}R | Trail: {RUNNER_TRAIL}×ATR")
+        log.info(f"  Trailing desde TP1: {'✓' if TRAILING_FROM_TP1 else '✗'} ({TRAIL_TP1_MULT}×ATR)")
+        log.info(f"  MTF 15m: {'✓' if MTF_ENABLED else '✗'} | Beta filter: {'✓' if BETA_FILTER else '✗'} [{BETA_MIN}-{BETA_MAX}]")
+        log.info(f"  Min patterns: {MIN_PATTERNS} | AlphaX: {'✓' if AX_ENABLED else '✗'}")
+        log.info(f"  Z-Vol: {Z_VOL_THRESHOLD} | Min Score: {MIN_QUANT_SCORE} | CSV: {TRADE_LOG_CSV}")
         log.info(f"  Auto-trading: {'ENABLED 💸' if AUTO_TRADING else 'PAPER MODE 📝'}")
         log.info("=" * 78)
 
@@ -1077,6 +1187,13 @@ class SuperBot:
         if not closes or len(closes) < 50:
             return None
 
+        # ── Multi-Timeframe: fetch 15m candles ────────────────────────────────
+        closes_15m, highs_15m, lows_15m = [], [], []
+        if MTF_ENABLED:
+            c15, h15, l15, _, _ = self._klines(symbol, '15m', 60)
+            if c15 and len(c15) >= 22:
+                closes_15m, highs_15m, lows_15m = c15, h15, l15
+
         tick = self._ticker(symbol)
         if not tick or tick['price'] <= 0:
             return None
@@ -1118,6 +1235,28 @@ class SuperBot:
         if not sess_ok:
             log.debug(f"{symbol}: ✗ {sess_name}")
             return None
+
+        # ── 5. Beta vs BTC filter ─────────────────────────────────────────────
+        if BETA_FILTER and symbol != 'BTC-USDT':
+            now_ts = time.time()
+            cached  = self._beta_cache.get(symbol)
+            if cached and now_ts - cached[1] < 1800:   # cache 30 min
+                beta = cached[0]
+            else:
+                btc_c, _, _, _, _ = self._klines('BTC-USDT', '1h', BETA_LOOKBACK + 2)
+                sym_c, _, _, _, _ = self._klines(symbol,     '1h', BETA_LOOKBACK + 2)
+                beta = Q.beta_vs_btc(sym_c, btc_c, BETA_LOOKBACK) if btc_c and sym_c else 1.0
+                self._beta_cache[symbol] = (beta, now_ts)
+            if beta < BETA_MIN or beta > BETA_MAX:
+                log.debug(f"{symbol}: ✗ beta={beta:.2f} fuera de [{BETA_MIN},{BETA_MAX}]")
+                return None
+
+        # ── 6. Multi-Timeframe confirmation ───────────────────────────────────
+        if MTF_ENABLED and closes_15m:
+            mtf_ok, mtf_reason = Q.mtf_confirm(closes_15m, highs_15m, lows_15m)
+            if not mtf_ok:
+                log.debug(f"{symbol}: ✗ MTF {mtf_reason}")
+                return None
 
         # ══════════════════════════════════════════════════════════════════════
         # SEÑALES CUANTITATIVAS — NÚCLEO SIMONS
@@ -1246,13 +1385,38 @@ class SuperBot:
                 score += 4; reasons.append("AX_WPRAlign(+4)")
 
         # ── Gestión de riesgo dinámica ─────────────────────────────────────────
-        sl_atr  = price - atr_v * SL_ATR_MULT
-        sl_pct  = (price - sl_atr) / price * 100
-        sl_pct  = max(SL_MIN_PCT, min(SL_MAX_PCT, sl_pct))
-        sl_price   = price * (1 - sl_pct / 100)
+        # Structural SL: swing-low debajo del mínimo reciente (menos cazable)
+        struct_sl = None
+        if STRUCT_SL:
+            struct_sl = Q.swing_low_sl(lows, closes, STRUCT_SL_BARS, STRUCT_SL_BUFFER)
+
+        if struct_sl:
+            sl_price = struct_sl
+            sl_pct   = (price - sl_price) / price * 100
+            sl_pct   = max(SL_MIN_PCT, min(SL_MAX_PCT, sl_pct))
+            sl_price = price * (1 - sl_pct / 100)
+        else:
+            # Fallback: ATR-based SL
+            sl_atr   = price - atr_v * SL_ATR_MULT
+            sl_pct   = (price - sl_atr) / price * 100
+            sl_pct   = max(SL_MIN_PCT, min(SL_MAX_PCT, sl_pct))
+            sl_price = price * (1 - sl_pct / 100)
+
         tp1_price  = price * (1 + sl_pct * TP1_RR / 100)
         tp2_price  = price * (1 + sl_pct * TP2_RR / 100)
         edge_ratio = (sl_pct * TP1_RR) / (TOTAL_COST * 100)
+
+        # ── Pattern guard: ≥ MIN_PATTERNS confirmados ─────────────────────────
+        pattern_count = sum([
+            bool(vcp_ok),
+            bool(flag_ok),
+            bool(abs_ok),
+            bool(ax.get('valid') and ax.get('trend_flip_up')),
+            bool(ax.get('valid') and ax.get('wpr_triple_os')),
+        ])
+        if pattern_count < MIN_PATTERNS:
+            log.debug(f"{symbol}: ✗ Patterns={pattern_count} < {MIN_PATTERNS}")
+            return None
 
         if edge_ratio < MIN_EDGE:
             log.debug(f"{symbol}: ✗ Edge {edge_ratio:.1f}×")
@@ -1306,6 +1470,9 @@ class SuperBot:
             'ax_squeeze':     AlphaXEngine.squeeze_warning(ax),
             'ax_band_width':  ax.get('band_width_pct', 0.0),
             'ax_impulse_dir': ax.get('impulse_dir', 0),
+            # Signal meta
+            'pattern_count':  pattern_count,
+            'sl_type':        'structural' if struct_sl else 'atr',
         }
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1468,23 +1635,34 @@ class SuperBot:
                 if not pos['tp1_hit'] and cp >= pos.get('tp1_price', 1e18):
                     self._close_partial(symbol, pos['qty_tp1'], cp, "TP1")
                     pos['tp1_hit']  = True
-                    pos['sl_price'] = pos['entry'] * 1.001
+                    pos['sl_price'] = pos['entry'] * 1.001   # move SL to breakeven+
                     continue
+
+                # Trailing desde TP1 (NUEVO): protege ganancias antes de TP2
+                if pos['tp1_hit'] and not pos['tp2_hit'] and TRAILING_FROM_TP1:
+                    sig_ref  = pos.get('signal') or {}
+                    atr_val  = sig_ref.get('atr', pos['entry'] * 0.005)
+                    trail_sl = cp - atr_val * TRAIL_TP1_MULT
+                    be_floor = pos['entry'] * 1.001   # nunca bajar debajo de breakeven
+                    new_sl   = max(trail_sl, be_floor)
+                    if new_sl > pos['sl_price']:
+                        pos['sl_price'] = new_sl
+                        log.debug(f"⬆ Trail[TP1] {symbol}: SL → ${new_sl:.6f}")
 
                 # TP2
                 if pos['tp1_hit'] and not pos['tp2_hit'] and cp >= pos.get('tp2_price', 1e18):
                     self._close_partial(symbol, pos['qty_tp2'], cp, "TP2")
                     pos['tp2_hit'] = True
-                    sig     = pos.get('signal') or {}
-                    atr_val = sig.get('atr', pos['entry'] * 0.005)
+                    sig_ref  = pos.get('signal') or {}
+                    atr_val  = sig_ref.get('atr', pos['entry'] * 0.005)
                     pos['sl_price'] = max(pos['sl_price'], cp - atr_val * RUNNER_TRAIL)
                     continue
 
-                # Runner trailing
+                # Runner trailing (post-TP2): ATR trail más agresivo
                 if pos['tp2_hit']:
-                    sig     = pos.get('signal') or {}
-                    atr_val = sig.get('atr', pos['entry'] * 0.005)
-                    new_sl  = cp - atr_val * RUNNER_TRAIL
+                    sig_ref  = pos.get('signal') or {}
+                    atr_val  = sig_ref.get('atr', pos['entry'] * 0.005)
+                    new_sl   = cp - atr_val * RUNNER_TRAIL
                     if new_sl > pos['sl_price']:
                         pos['sl_price'] = new_sl
 
@@ -1571,6 +1749,21 @@ class SuperBot:
             f"Racha pérdidas: {self.losing_streak}"
         )
         del self.positions[symbol]
+        # ── CSV Trade Log ─────────────────────────────────────────────────────
+        self._log_trade(symbol, pos, price, total_pnl, hold_min, reason, win)
+        # ── Feedback loop stats ────────────────────────────────────────────────
+        sig = pos.get('signal', {})
+        for pat in ('vcp', 'flag', 'absorption'):
+            if sig.get(pat):
+                self.stats['pattern_pnl'][pat].append(total_pnl)
+        tier = sig.get('ax_bull_tier', '?')
+        self.stats['tier_pnl'][tier].append(total_pnl)
+        sl_t = sig.get('sl_type', 'atr')
+        self.stats['sl_type_pnl'][sl_t].append(total_pnl)
+        # Log pattern stats cada 10 trades
+        total_t = self.stats['wins'] + self.stats['losses']
+        if total_t > 0 and total_t % 10 == 0:
+            self._log_pattern_stats()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     def _calc_pnl(self, entry: float, exit_p: float, qty: float, symbol: str = '') -> float:
@@ -1580,6 +1773,88 @@ class SuperBot:
         gross    = (exit_p - entry) / entry * notional * LEVERAGE
         fees     = notional * (FEE_TAKER + FEE_MAKER)
         return gross - fees
+
+    def _log_trade(self, symbol: str, pos: dict, exit_price: float,
+                   pnl: float, hold_min: int, reason: str, win: bool):
+        """
+        Guarda cada trade cerrado en CSV para análisis de feedback loop.
+        Columnas: todas las métricas de señal + resultado real.
+        """
+        sig = pos.get('signal', {})
+        row = {
+            'timestamp':    datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+            'symbol':       symbol,
+            'entry':        pos.get('entry', 0),
+            'exit':         exit_price,
+            'qty':          pos.get('qty', 0),
+            'pnl_usd':      round(pnl, 4),
+            'hold_min':     hold_min,
+            'reason':       reason,
+            'win':          int(win),
+            # Score metrics
+            'score':        sig.get('score', pos.get('score', 0)),
+            'ensemble':     sig.get('ensemble', 0),
+            'z_vol':        round(sig.get('z_vol', 0), 3),
+            'z_price':      round(sig.get('z_price', 0), 3),
+            'rsi':          round(sig.get('rsi', 0), 1),
+            'vol_ratio':    round(sig.get('vol_ratio', 0), 2),
+            'edge_ratio':   round(sig.get('edge_ratio', 0), 2),
+            'atr_pct':      round(sig.get('atr_pct', 0), 4),
+            # Patterns
+            'vcp':          int(bool(sig.get('vcp'))),
+            'flag':         int(bool(sig.get('flag'))),
+            'absorption':   int(bool(sig.get('absorption'))),
+            'pattern_count':sig.get('pattern_count', 0),
+            'sl_type':      sig.get('sl_type', 'atr'),
+            # AlphaX
+            'ax_tier':      sig.get('ax_bull_tier', '?'),
+            'ax_conf':      round(sig.get('ax_bull_conf', 0), 1),
+            'ax_freshness': round(sig.get('ax_freshness', 0), 2),
+            'ax_triple_os': int(bool(sig.get('ax_triple_os'))),
+            'ax_squeeze':   int(bool(sig.get('ax_squeeze'))),
+            'ax_wpr_fast':  round(sig.get('ax_wpr_fast', 0), 1),
+            # Context
+            'regime':       sig.get('regime', ''),
+            'session':      sig.get('session', ''),
+            'funding_rate': round(sig.get('funding_rate', 0), 4),
+            'oi_change':    round(sig.get('oi_change', 0), 2),
+            'sl_pct':       round(sig.get('sl_pct', 0), 3),
+            'tp1_hit':      int(bool(pos.get('tp1_hit'))),
+            'tp2_hit':      int(bool(pos.get('tp2_hit'))),
+            'mode':         'REAL' if AUTO_TRADING else 'PAPER',
+        }
+        try:
+            path    = TRADE_LOG_CSV
+            is_new  = not os.path.exists(path)
+            with open(path, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=row.keys())
+                if is_new:
+                    writer.writeheader()
+                writer.writerow(row)
+        except Exception as e:
+            log.warning(f"CSV log error: {e}")
+
+    def _log_pattern_stats(self):
+        """Imprime análisis de rendimiento por patrón/tier cada 10 trades."""
+        lines = ["📊 FEEDBACK LOOP — Rendimiento por patrón:"]
+        for pat, pnls in self.stats['pattern_pnl'].items():
+            if not pnls: continue
+            wr  = sum(1 for p in pnls if p > 0) / len(pnls) * 100
+            avg = sum(pnls) / len(pnls)
+            lines.append(f"  {pat.upper():12s}: WR={wr:.0f}% | avg=${avg:+.4f} | n={len(pnls)}")
+        for tier, pnls in self.stats['tier_pnl'].items():
+            if not pnls: continue
+            wr  = sum(1 for p in pnls if p > 0) / len(pnls) * 100
+            avg = sum(pnls) / len(pnls)
+            lines.append(f"  AX-{tier}-Tier   : WR={wr:.0f}% | avg=${avg:+.4f} | n={len(pnls)}")
+        for slt, pnls in self.stats['sl_type_pnl'].items():
+            if not pnls: continue
+            wr  = sum(1 for p in pnls if p > 0) / len(pnls) * 100
+            avg = sum(pnls) / len(pnls)
+            lines.append(f"  SL-{slt:10s}: WR={wr:.0f}% | avg=${avg:+.4f} | n={len(pnls)}")
+        msg = "\n".join(lines)
+        log.info(msg)
+        self._notify(f"<b>📊 Feedback Loop</b>\n<pre>{msg}</pre>")
 
     def _calc_qty(self, symbol: str, price: float, sl_price: float,
                   pos_size: float = None) -> Optional[float]:
