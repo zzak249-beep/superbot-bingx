@@ -1,25 +1,17 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║        INSTITUTIONAL BOT v4.0 — Phoenix Trader Edition                     ║
-║        BingX Futures · USDT Perps · LONG Only                              ║
+║          SUPERBOT v5.0 — Simons Quant Edition                              ║
+║          BingX Futures · USDT Perps · Multi-Signal Ensemble                ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  Filosofía: "Precio + Volumen es todo. Estructura, no indicadores tardíos." ║
+║  Filosofía: "No predecimos el futuro, explotamos patrones estadísticos."   ║
+║  Inspirado en Renaissance Technologies / Medallion Fund                    ║
 ║                                                                              ║
-║  INDICADORES: MA10 · MA20 · EMA9 · EMA50 · ATR · RSI · CVD                ║
-║  PATRONES:    VCP (Volatility Contraction) · Flag/Banderín                 ║
-║  FILTROS:     Market Regime · BTC Guard · Funding · OI · Sesión            ║
-║  RIESGO:      Kelly Sizing · Circuit Breaker · Trailing Stop               ║
+║  SEÑALES:  Z-Score(Vol/Price/ATR) · Momentum · Mean-Reversion · CVD       ║
+║  PATRONES: VCP · Flag · Absorción · Breakout Estadístico                  ║
+║  FILTROS:  Market Regime · BTC Guard · Funding · OI · Sesión · Correlation ║
+║  RIESGO:   Kelly Sizing · Circuit Breaker · Trailing ATR · Max Hold        ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
-
-  NUEVO en v4.0:
-  ─ Soporte SHORT opcional (configurable)
-  ─ Max hold time (cierre automático en N horas)
-  ─ Breakeven automático más inteligente
-  ─ Mejor scoring con normalización
-  ─ Cooldown por símbolo (evita re-entrar en perdedor reciente)
-  ─ Stats ampliadas: avg hold time, profit factor, max drawdown
-  ─ Todos los fixes de v3.1 incorporados de base (sin bugs heredados)
 """
 
 import os, asyncio, logging, requests, hmac, hashlib, time, sys, math, re, json
@@ -34,7 +26,6 @@ from typing import Dict, List, Optional, Tuple
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _env(key: str, default, typ='str'):
-    """Lee variable de entorno con limpieza de comillas y conversión de tipo."""
     v = os.getenv(key, str(default)).strip().strip('"').strip("'")
     if typ == 'int':
         m = re.match(r'^-?\d+', v.replace(',', '.'))
@@ -46,86 +37,103 @@ def _env(key: str, default, typ='str'):
         return v.lower() in ('true', '1', 'yes')
     return v
 
-# ── API Credentials ───────────────────────────────────────────────────────────
+# ── API ───────────────────────────────────────────────────────────────────────
 API_KEY    = _env('BINGX_API_KEY', '')
 API_SECRET = _env('BINGX_API_SECRET', '')
 TG_TOKEN   = _env('TELEGRAM_BOT_TOKEN', '')
 TG_CHAT    = _env('TELEGRAM_CHAT_ID', '')
 BASE_URL   = "https://open-api.bingx.com"
 
-# ── Trading Mode ──────────────────────────────────────────────────────────────
-AUTO_TRADING  = _env('AUTO_TRADING_ENABLED', 'false', 'bool')   # ⚠️ false = PAPER MODE
-ALLOW_SHORTS  = _env('ALLOW_SHORTS', 'false', 'bool')           # SHORT trades (experimental)
+# ── Modo ──────────────────────────────────────────────────────────────────────
+AUTO_TRADING = _env('AUTO_TRADING_ENABLED', 'false', 'bool')  # false = PAPER
 
-# ── Capital Management ────────────────────────────────────────────────────────
-POSITION_SIZE  = _env('POSITION_SIZE_USD', '10', 'float')       # USD por posición
-LEVERAGE       = min(_env('LEVERAGE', '2', 'int'), 5)           # Nunca superar 5×
-MAX_POSITIONS  = _env('MAX_POSITIONS', '2', 'int')              # Posiciones simultáneas
-ACCOUNT_EQUITY = _env('ACCOUNT_EQUITY', '100', 'float')         # Equity inicial
-RISK_PER_TRADE = _env('RISK_PCT_PER_TRADE', '1.0', 'float')     # % equity en riesgo/trade
+# ── Capital ───────────────────────────────────────────────────────────────────
+POSITION_SIZE  = _env('POSITION_SIZE_USD', '10', 'float')
+LEVERAGE       = min(_env('LEVERAGE', '3', 'int'), 5)
+MAX_POSITIONS  = _env('MAX_POSITIONS', '3', 'int')
+ACCOUNT_EQUITY = _env('ACCOUNT_EQUITY', '100', 'float')
+RISK_PER_TRADE = _env('RISK_PCT_PER_TRADE', '1.0', 'float')
 
-# ── Stop Loss & Take Profit ───────────────────────────────────────────────────
+# ── SL / TP ───────────────────────────────────────────────────────────────────
 SL_ATR_MULT  = _env('SL_ATR_MULTIPLIER', '1.5', 'float')
 SL_MIN_PCT   = _env('SL_MIN_PCT', '0.8', 'float')
-SL_MAX_PCT   = _env('SL_MAX_PCT', '2.0', 'float')
-TP1_PCT      = _env('TP1_PERCENTAGE', '40', 'float')            # % cantidad en TP1
-TP2_PCT      = _env('TP2_PERCENTAGE', '40', 'float')            # % cantidad en TP2
+SL_MAX_PCT   = _env('SL_MAX_PCT', '2.5', 'float')
+TP1_PCT      = _env('TP1_PERCENTAGE', '40', 'float')   # % qty en TP1
+TP2_PCT      = _env('TP2_PERCENTAGE', '40', 'float')   # % qty en TP2
 TP1_RR       = _env('TP1_RISK_REWARD', '1.5', 'float')
 TP2_RR       = _env('TP2_RISK_REWARD', '2.5', 'float')
 RUNNER_TRAIL = _env('RUNNER_TRAIL_ATR', '2.0', 'float')
-MIN_EDGE     = _env('MIN_EDGE_RATIO', '4.0', 'float')
-MAX_HOLD_H   = _env('MAX_HOLD_HOURS', '24', 'float')            # Cierre forzado en N horas
+MIN_EDGE     = _env('MIN_EDGE_RATIO', '3.5', 'float')
+MAX_HOLD_H   = _env('MAX_HOLD_HOURS', '24', 'float')
 
-# ── Market Filters ────────────────────────────────────────────────────────────
+# ── Señales Simons (Quant Thresholds) ─────────────────────────────────────────
+Z_VOL_THRESHOLD    = _env('Z_VOL_THRESHOLD', '2.0', 'float')    # Z-score volumen
+Z_PRICE_THRESHOLD  = _env('Z_PRICE_THRESHOLD', '1.5', 'float')  # Z-score precio
+ABSORPTION_RANGE   = _env('ABSORPTION_RANGE_PCT', '0.08', 'float')  # % rango para absorción
+MOM_PERIOD         = _env('MOMENTUM_PERIOD', '14', 'int')
+MEAN_REV_PERIOD    = _env('MEAN_REVERSION_PERIOD', '30', 'int')
+MIN_QUANT_SCORE    = _env('MIN_QUANT_SCORE', '65', 'float')
+
+# ── Filtros ───────────────────────────────────────────────────────────────────
 MIN_VOLUME_24H       = _env('MIN_VOLUME_24H', '2000000', 'float')
-MAX_SYMBOLS          = _env('MAX_SYMBOLS', '30', 'int')
-MIN_SCORE            = _env('MIN_ENTRY_SCORE', '75', 'float')
+MAX_SYMBOLS          = _env('MAX_SYMBOLS', '40', 'int')
 VOLUME_BREAKOUT_MULT = _env('VOLUME_BREAKOUT_MULT', '1.8', 'float')
-REGIME_ATR_MIN_PCT   = _env('REGIME_ATR_MIN_PCT', '0.5', 'float')
-REGIME_ATR_MAX_PCT   = _env('REGIME_ATR_MAX_PCT', '3.5', 'float')
+REGIME_ATR_MIN_PCT   = _env('REGIME_ATR_MIN_PCT', '0.4', 'float')
+REGIME_ATR_MAX_PCT   = _env('REGIME_ATR_MAX_PCT', '4.0', 'float')
 VCP_LOOKBACK         = _env('VCP_LOOKBACK', '20', 'int')
 MAX_CORR_LONGS       = _env('MAX_CORR_LONGS', '1', 'int')
-EMA9_REQUIRED        = _env('EMA9_REQUIRED', 'true', 'bool')
 
-# ── Funding & OI Filters ──────────────────────────────────────────────────────
-FUNDING_ENABLED    = _env('FUNDING_FILTER', 'true', 'bool')
+# ── Funding / OI ──────────────────────────────────────────────────────────────
 FUNDING_LONG_OK    = _env('FUNDING_LONG_OK', '0.03', 'float')
-FUNDING_LONG_SKIP  = _env('FUNDING_LONG_SKIP', '0.05', 'float')
-OI_ENABLED         = _env('OI_FILTER', 'true', 'bool')
+FUNDING_LONG_SKIP  = _env('FUNDING_LONG_SKIP', '0.06', 'float')
 OI_BREAKOUT_MIN    = _env('OI_BREAKOUT_MIN', '1.5', 'float')
 OI_WEAK_THRESHOLD  = _env('OI_WEAK_THRESHOLD', '0.5', 'float')
 
-# ── Session Filter ────────────────────────────────────────────────────────────
-SESSION_FILTER_ENABLED = _env('SESSION_FILTER', 'true', 'bool')
-SESSION_BEST  = {13, 14, 15, 16, 17, 18, 19, 20, 21, 22}   # Londres + NY (UTC)
-SESSION_OK    = {7, 8, 9, 10, 11, 12}                        # Pre-Londres (UTC)
+# ── Sesión ────────────────────────────────────────────────────────────────────
+SESSION_BEST = {13, 14, 15, 16, 17, 18, 19, 20, 21, 22}  # Londres+NY UTC
+SESSION_OK   = {7, 8, 9, 10, 11, 12}                       # Pre-Londres UTC
 
 # ── CVD ───────────────────────────────────────────────────────────────────────
 CVD_LOOKBACK  = _env('CVD_LOOKBACK_BARS', '20', 'int')
-CVD_THRESHOLD = _env('CVD_THRESHOLD', '1.5', 'float')
+CVD_THRESHOLD = _env('CVD_THRESHOLD', '1.2', 'float')
+
+# ── AlphaX Impulse Bands ──────────────────────────────────────────────────────
+AX_TREND_LEN     = _env('AX_TREND_LEN',     '19',   'int')    # EMA base
+AX_IMPULSE_LEN   = _env('AX_IMPULSE_LEN',   '5',    'int')    # Lookback impulso
+AX_DECAY_RATE    = _env('AX_DECAY_RATE',     '0.97', 'float') # Decaimiento freshness
+AX_MAD_LEN       = _env('AX_MAD_LEN',       '20',   'int')    # MAD length
+AX_BAND_MIN      = _env('AX_BAND_MIN',       '1.5',  'float') # Multiplicador banda tight
+AX_BAND_MAX      = _env('AX_BAND_MAX',       '2.2',  'float') # Multiplicador banda wide
+AX_WPR_FAST      = _env('AX_WPR_FAST',       '8',    'int')   # WPR rápido
+AX_WPR_MED       = _env('AX_WPR_MED',        '21',   'int')   # WPR medio
+AX_WPR_SLOW      = _env('AX_WPR_SLOW',       '55',   'int')   # WPR lento
+AX_WPR_OS        = _env('AX_WPR_OS',        '-82',   'float') # WPR oversold threshold
+AX_WPR_OB        = _env('AX_WPR_OB',        '-18',   'float') # WPR overbought threshold
+AX_MIN_CONF      = _env('AX_MIN_CONFIDENCE', '25',   'float') # Confianza mínima AlphaX (%)
+AX_REQUIRE_WPR   = _env('AX_REQUIRE_WPR',   'true',  'bool')  # Requerir confirmación WPR
+AX_ENABLED       = _env('AX_ENABLED',        'true',  'bool') # Activar filtro AlphaX
 
 # ── Circuit Breaker ───────────────────────────────────────────────────────────
 CIRCUIT_BREAKER_PCT = _env('CIRCUIT_BREAKER_PCT', '3.0', 'float')
 MAX_LOSING_STREAK   = _env('MAX_LOSING_STREAK', '3', 'int')
-MAX_DAILY_TRADES    = _env('MAX_DAILY_TRADES', '8', 'int')
+MAX_DAILY_TRADES    = _env('MAX_DAILY_TRADES', '10', 'int')
 
 # ── Timing ────────────────────────────────────────────────────────────────────
 SCAN_INTERVAL    = _env('SCAN_INTERVAL_SEC', '90', 'int')
 MONITOR_INTERVAL = _env('MONITOR_INTERVAL_SEC', '20', 'int')
-SYMBOL_COOLDOWN  = _env('SYMBOL_COOLDOWN_MIN', '60', 'int')     # Minutos entre re-entries
+SYMBOL_COOLDOWN  = _env('SYMBOL_COOLDOWN_MIN', '60', 'int')
 
-# ── Costs ─────────────────────────────────────────────────────────────────────
+# ── Costes ────────────────────────────────────────────────────────────────────
 FEE_TAKER  = 0.001
 FEE_MAKER  = 0.0002
 SLIPPAGE   = 0.0003
 TOTAL_COST = FEE_TAKER + FEE_MAKER + SLIPPAGE
 
-# ── Excluded Symbols ──────────────────────────────────────────────────────────
 EXCLUDE_SYMBOLS = {
     'DOW', 'SP500', 'GOLD', 'SILVER', 'XAU', 'OIL', 'BRENT',
     'EUR', 'GBP', 'JPY', 'TSLA', 'AAPL', 'MSFT', 'GOOGL',
     'AMZN', 'META', 'NVDA', 'COIN', 'MSTR', 'PAXG', 'XAUT',
-    'Q-USDT', 'BEAT-USDT',  # Problemáticos en v3.0
+    'Q-USDT', 'BEAT-USDT',
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -138,10 +146,10 @@ logging.basicConfig(
     datefmt='%H:%M:%S',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('/tmp/bot_v4.log', mode='a'),
+        logging.FileHandler('/tmp/superbot_v5.log', mode='a'),
     ]
 )
-log = logging.getLogger('bot_v4')
+log = logging.getLogger('superbot_v5')
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECCIÓN 3: UTILIDADES API
@@ -156,36 +164,32 @@ def safe_float(val, default: float = 0.0) -> float:
         return default
 
 def api_request(method: str, endpoint: str, params: dict = None, retries: int = 3) -> dict:
-    """Llamada firmada a BingX con retry exponencial."""
     params = params or {}
     last_error = None
     for attempt in range(retries + 1):
         try:
             p = {**{k: str(v) for k, v in params.items()},
                  'timestamp': str(int(time.time() * 1000))}
-            query  = urlencode(sorted(p.items()))
-            sig    = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
-            url    = f"{BASE_URL}{endpoint}?{query}&signature={sig}"
-            hdrs   = {'X-BX-APIKEY': API_KEY, 'Content-Type': 'application/x-www-form-urlencoded'}
-            resp   = getattr(requests, method.lower())(url, headers=hdrs, timeout=15)
-            data   = resp.json()
+            query = urlencode(sorted(p.items()))
+            sig   = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+            url   = f"{BASE_URL}{endpoint}?{query}&signature={sig}"
+            hdrs  = {'X-BX-APIKEY': API_KEY, 'Content-Type': 'application/x-www-form-urlencoded'}
+            resp  = getattr(requests, method.lower())(url, headers=hdrs, timeout=15)
+            data  = resp.json()
             if data.get('code') not in (0, None):
-                log.warning(f"API [{endpoint}] code={data.get('code')} msg={data.get('msg')} params={params}")
+                log.warning(f"API [{endpoint}] code={data.get('code')} msg={data.get('msg')}")
             return data
         except requests.exceptions.Timeout as e:
             last_error = f"Timeout: {e}"
-        except requests.exceptions.ConnectionError as e:
-            last_error = f"ConnError: {e}"
         except Exception as e:
             last_error = f"Exception: {e}"
-            log.error(f"API [{endpoint}] attempt {attempt}: {e}\n{traceback.format_exc()}")
+            log.error(f"API [{endpoint}] attempt {attempt}: {e}")
         if attempt < retries:
             time.sleep(2 ** attempt)
     log.error(f"API [{endpoint}] FAILED after {retries+1} attempts: {last_error}")
     return {'code': -1, 'msg': last_error}
 
 def public_request(path: str, params: dict = None) -> dict:
-    """Llamada pública (sin firma) a BingX."""
     try:
         resp = requests.get(f"{BASE_URL}{path}", params=params or {}, timeout=10)
         return resp.json()
@@ -194,7 +198,6 @@ def public_request(path: str, params: dict = None) -> dict:
         return {'code': -1, 'msg': str(e)}
 
 def extract_equity(data: dict) -> float:
-    """Extrae equity de la respuesta /user/balance (estructura variable según plan)."""
     if data.get('code') != 0:
         return 0.0
     raw = data.get('data', {})
@@ -206,164 +209,581 @@ def extract_equity(data: dict) -> float:
     return 0.0
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN 4: INDICADORES TÉCNICOS
+# SECCIÓN 4: MOTOR CUANTITATIVO — ESTRATEGIA SIMONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def ema(prices: List[float], period: int) -> float:
-    if not prices:
-        return 0.0
-    k = 2 / (period + 1)
-    val = prices[0]
-    for p in prices[1:]:
-        val = p * k + val * (1 - k)
-    return val
+class QuantEngine:
+    """
+    Motor de señales inspirado en Renaissance Technologies.
+    Principio: explotar anomalías estadísticas repetibles y predecibles.
+    No predicciones — probabilidades y exploración de patrones.
+    """
 
-def sma(prices: List[float], period: int) -> float:
-    if not prices:
-        return 0.0
-    tail = prices[-period:] if len(prices) >= period else prices
-    return sum(tail) / len(tail)
+    # ── Z-Score de Volumen (La Huella de la Ballena) ──────────────────────────
+    @staticmethod
+    def z_score_volume(volumes: List[float], period: int = 30) -> float:
+        """Z-score del volumen actual vs ventana rodante. >2.0 = evento inusual."""
+        if len(volumes) < period + 1:
+            return 0.0
+        window = volumes[-period-1:-1]
+        mean   = sum(window) / len(window)
+        var    = sum((v - mean) ** 2 for v in window) / len(window)
+        std    = math.sqrt(var) if var > 0 else 1e-10
+        return (volumes[-1] - mean) / std
 
-def atr_calc(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
-    if len(closes) < 2:
-        return 0.0
-    trs = []
-    for i in range(1, min(len(closes), period + 1)):
-        trs.append(max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1])
-        ))
-    return sum(trs) / len(trs) if trs else 0.0
+    # ── Z-Score de Precio (Momentum Estadístico) ──────────────────────────────
+    @staticmethod
+    def z_score_price(closes: List[float], period: int = 20) -> float:
+        """Z-score del precio. Positivo=momentum alcista, negativo=presión bajista."""
+        if len(closes) < period + 1:
+            return 0.0
+        window = closes[-period-1:-1]
+        mean   = sum(window) / len(window)
+        var    = sum((c - mean) ** 2 for c in window) / len(window)
+        std    = math.sqrt(var) if var > 0 else 1e-10
+        return (closes[-1] - mean) / std
 
-def rsi_calc(prices: List[float], period: int = 14) -> float:
-    if len(prices) < period + 1:
-        return 50.0
-    gains  = [max(prices[i] - prices[i - 1], 0) for i in range(1, len(prices))]
-    losses = [max(prices[i - 1] - prices[i], 0) for i in range(1, len(prices))]
-    ag = sum(gains[-period:]) / period
-    al = sum(losses[-period:]) / period
-    return 100 - (100 / (1 + ag / al)) if al > 0 else 100.0
+    # ── Absorción Institucional ───────────────────────────────────────────────
+    @staticmethod
+    def detect_absorption(volumes: List[float], highs: List[float],
+                          lows: List[float], opens: List[float],
+                          z_vol: float,
+                          closes: List[float] = None) -> Tuple[bool, str]:
+        """
+        Absorción: volumen anómalo + rango estrecho = manos fuertes acumulando.
+        Señal clásica de Wyckoff / Simons Order-Flow.
+        """
+        if len(volumes) < 5:
+            return False, "insufficient"
+        if opens[-1] <= 0:
+            return False, "invalid_open"
+        last_range_pct = (highs[-1] - lows[-1]) / opens[-1]
+        body_pct = (abs(closes[-1] - opens[-1]) / opens[-1]
+                    if closes is not None and len(closes) > 0
+                    else last_range_pct)
+        # Absorción: Z >2.5, rango estrecho Y cuerpo pequeño (doji/spinning top)
+        # ABSORPTION_RANGE está en fracción (ej: 0.08 = 0.08%), convertir correctamente
+        threshold = ABSORPTION_RANGE / 100  # 0.08 / 100 = 0.0008
+        if z_vol > 2.5 and last_range_pct < threshold and body_pct < threshold * 1.5:
+            return True, f"absorption_z{z_vol:.1f}"
+        return False, "no_absorption"
 
-def volume_avg(volumes: List[float], period: int = 20) -> float:
-    tail = volumes[-period:] if len(volumes) >= period else volumes
-    return sum(tail) / len(tail) if tail else 0.0
+    # ── Momentum Multi-Período ────────────────────────────────────────────────
+    @staticmethod
+    def momentum_signal(closes: List[float]) -> Tuple[float, str]:
+        """
+        Momentum en 3 períodos: corto (5), medio (14), largo (21).
+        Retorna score normalizado [-1, 1] y etiqueta.
+        """
+        if len(closes) < 22:
+            return 0.0, "insufficient"
+        m5  = (closes[-1] - closes[-6])  / closes[-6]  if closes[-6]  > 0 else 0
+        m14 = (closes[-1] - closes[-15]) / closes[-15] if closes[-15] > 0 else 0
+        m21 = (closes[-1] - closes[-22]) / closes[-22] if closes[-22] > 0 else 0
+        # Alineación de momentum: todos positivos = señal fuerte
+        score = (m5 * 0.5 + m14 * 0.3 + m21 * 0.2)
+        label = "mom_strong" if score > 0.01 else ("mom_weak" if score > 0 else "mom_negative")
+        return score, label
 
-def cvd_calc(volumes: List[float], closes: List[float], opens: List[float]) -> float:
-    cvd = 0.0
-    for i in range(len(volumes)):
-        sign = 1 if closes[i] > opens[i] else (-1 if closes[i] < opens[i] else 0)
-        cvd += volumes[i] * sign
-    return cvd
+    # ── Mean Reversion Score ──────────────────────────────────────────────────
+    @staticmethod
+    def mean_reversion_score(closes: List[float], period: int = 30) -> Tuple[float, str]:
+        """
+        ¿Cuántas desviaciones estándar está el precio de su media?
+        Simons usaba este principio: precio bajo vs media histórica = rebote probable.
+        """
+        if len(closes) < period:
+            return 0.0, "insufficient"
+        window = closes[-period:]
+        mean   = sum(window) / period
+        std    = statistics.stdev(window) if period > 1 else 1e-10
+        z      = (closes[-1] - mean) / std
+        # Para LONG: queremos que el precio sea positivo pero no extremo
+        # z entre -0.5 y +1.5 = zona de rebote / continuación
+        if -0.5 <= z <= 1.5:
+            return 1.0 - abs(z) / 2, "mean_rev_zone"
+        elif z > 1.5:
+            return 0.0, "overextended"
+        else:
+            return 0.0, "below_mean"
 
-def kelly_size(win_rate: float, avg_win: float, avg_loss: float, equity: float) -> float:
-    """Half-Kelly con límite de 2% del equity."""
-    if avg_loss <= 0 or win_rate <= 0:
-        return POSITION_SIZE
-    R = avg_win / avg_loss
-    kelly = win_rate - (1 - win_rate) / R
-    half  = max(0.005, min(0.02, kelly / 2))
-    return min(equity * half, POSITION_SIZE)
+    # ── ATR Normalizado (Volatility Regime) ───────────────────────────────────
+    @staticmethod
+    def volatility_regime(highs: List[float], lows: List[float],
+                          closes: List[float]) -> Tuple[str, float]:
+        """Clasifica el régimen de volatilidad para ajustar señales."""
+        if len(closes) < 15:
+            return "unknown", 0.0
+        atr_v = QuantEngine.atr(highs, lows, closes, 14)
+        atr_p = (atr_v / closes[-1] * 100) if closes[-1] > 0 else 0
+        if atr_p > REGIME_ATR_MAX_PCT:    return "volatile_extreme",  atr_p
+        if atr_p < REGIME_ATR_MIN_PCT:    return "ranging_quiet",     atr_p
+        ma10  = sum(closes[-10:]) / 10
+        ma20  = sum(closes[-20:]) / 20 if len(closes) >= 20 else ma10
+        ma20p = sum(closes[-25:-5]) / 20 if len(closes) >= 25 else ma20
+        rising = ma20 > ma20p
+        cur    = closes[-1]
+        if cur > ma10 and cur > ma20 and ma10 > ma20 and rising:
+            return "trending_bullish",  atr_p
+        if cur > ma20 and rising:
+            return "trending_moderate", atr_p
+        if not rising and cur < ma20:
+            return "bearish",           atr_p
+        return "ranging", atr_p
+
+    # ── Indicadores Clásicos ──────────────────────────────────────────────────
+    @staticmethod
+    def ema(prices: List[float], period: int) -> float:
+        if not prices:
+            return 0.0
+        k = 2 / (period + 1)
+        val = prices[0]
+        for p in prices[1:]:
+            val = p * k + val * (1 - k)
+        return val
+
+    @staticmethod
+    def atr(highs: List[float], lows: List[float], closes: List[float],
+            period: int = 14) -> float:
+        if len(closes) < 2:
+            return 0.0
+        trs = []
+        for i in range(1, min(len(closes), period + 1)):
+            trs.append(max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1])
+            ))
+        return sum(trs) / len(trs) if trs else 0.0
+
+    @staticmethod
+    def rsi(prices: List[float], period: int = 14) -> float:
+        if len(prices) < period + 1:
+            return 50.0
+        gains  = [max(prices[i] - prices[i-1], 0) for i in range(1, len(prices))]
+        losses = [max(prices[i-1] - prices[i], 0) for i in range(1, len(prices))]
+        ag = sum(gains[-period:]) / period
+        al = sum(losses[-period:]) / period
+        return 100 - (100 / (1 + ag / al)) if al > 0 else 100.0
+
+    @staticmethod
+    def cvd(volumes: List[float], closes: List[float],
+            opens: List[float]) -> Tuple[float, str]:
+        """Cumulative Volume Delta: presión compradora vs vendedora."""
+        if len(volumes) < CVD_LOOKBACK:
+            return 0.0, "insufficient"
+        rv = volumes[-CVD_LOOKBACK:]
+        rc = closes[-CVD_LOOKBACK:]
+        ro = opens[-CVD_LOOKBACK:]
+        raw = sum(rv[i] * (1 if rc[i] > ro[i] else -1 if rc[i] < ro[i] else 0)
+                  for i in range(len(rv)))
+        total = sum(rv) or 1
+        cvd_n = raw / total
+        bars  = [rv[i] * (1 if rc[i] > ro[i] else -1) for i in range(len(rv))]
+        try:
+            std = statistics.stdev(bars) if len(bars) > 1 else 1
+            if abs(cvd_n) * total > CVD_THRESHOLD * std:
+                return cvd_n, "bullish_cvd" if cvd_n > 0 else "bearish_cvd"
+        except Exception:
+            pass
+        return cvd_n, "cvd_neutral"
+
+    # ── VCP (Volatility Contraction Pattern) ──────────────────────────────────
+    @staticmethod
+    def detect_vcp(closes: List[float], volumes: List[float],
+                   lookback: int = 20) -> Tuple[bool, str]:
+        if len(closes) < lookback:
+            return False, "insufficient"
+        rc = closes[-lookback:]
+        rv = volumes[-lookback:]
+        contractions = []
+        for i in range(2, len(rc) - 2):
+            if rc[i] < rc[i-1] and rc[i] < rc[i+1]:
+                depth = (rc[i-1] - rc[i]) / rc[i-1] * 100
+                contractions.append((depth, rv[i]))
+        if len(contractions) < 2:
+            return False, "no_contractions"
+        depths = [c[0] for c in contractions[-3:]]
+        contracting = all(depths[j] < depths[j-1] * 1.15 for j in range(1, len(depths)))
+        near_high   = rc[-1] >= max(rc) * 0.90
+        return (True, f"vcp_{len(contractions)}c") if contracting and near_high \
+               else (False, "no_vcp")
+
+    # ── Bull Flag ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def detect_flag(closes: List[float], volumes: List[float],
+                    highs: List[float], lows: List[float]) -> Tuple[bool, str]:
+        if len(closes) < 15:
+            return False, "insufficient"
+        pole_w, flag_w = 7, 5
+        pc = closes[-(pole_w + flag_w):-flag_w]
+        fc = closes[-flag_w:]
+        fv = volumes[-flag_w:]
+        pv = volumes[-(pole_w + flag_w):-flag_w]
+        pole_move  = (pc[-1] - pc[0]) / pc[0] * 100
+        flag_range = (max(fc) - min(fc)) / min(fc) * 100
+        vol_ratio  = (sum(fv)/len(fv)) / (sum(pv)/len(pv)) if pv else 1
+        retrace    = (pc[-1] - min(fc)) / (pc[-1] - pc[0] + 1e-10) * 100
+        return (True, f"flag_{pole_move:.1f}pct") \
+               if pole_move > 3.5 and flag_range < 4.0 and vol_ratio < 0.85 and retrace < 55 \
+               else (False, "no_flag")
+
+    # ── Ensemble Score (núcleo Simons) ────────────────────────────────────────
+    @staticmethod
+    def ensemble_score(z_vol: float, z_price: float, mom_score: float,
+                       mr_score: float, cvd_val: float) -> float:
+        """
+        Combina señales independientes con pesos calibrados.
+        Principio Simons: ninguna señal sola; el ensemble decide.
+        Retorna score 0-100.
+        """
+        # Normalizar cada señal a [0, 1]
+        z_vol_n   = min(max(z_vol / 4.0, 0), 1)        # Z-vol: 0..4 → 0..1
+        z_price_n = min(max(z_price / 3.0, 0), 1)      # Z-price: 0..3 → 0..1
+        mom_n     = min(max(mom_score * 50, 0), 1)      # mom: 0..0.02 → 0..1
+        mr_n      = min(max(mr_score, 0), 1)            # ya está en 0..1
+        cvd_n     = min(max(cvd_val * 5, 0), 1) if cvd_val > 0 else 0  # CVD positivo
+
+        # Pesos del ensemble (suman 1.0)
+        weights = {
+            'z_vol':   0.25,   # Volumen inusual (la huella)
+            'z_price': 0.20,   # Momentum de precio
+            'mom':     0.20,   # Momentum multi-período
+            'mr':      0.15,   # Zona de mean-reversion
+            'cvd':     0.20,   # Presión compradora
+        }
+        raw = (z_vol_n   * weights['z_vol']   +
+               z_price_n * weights['z_price'] +
+               mom_n     * weights['mom']     +
+               mr_n      * weights['mr']      +
+               cvd_n     * weights['cvd'])
+        return round(raw * 100, 1)
+
+    # ── Kelly Sizing ──────────────────────────────────────────────────────────
+    @staticmethod
+    def kelly_size(win_rate: float, avg_win: float, avg_loss: float,
+                   equity: float) -> float:
+        if avg_loss <= 0 or win_rate <= 0:
+            return POSITION_SIZE
+        R      = avg_win / avg_loss
+        kelly  = win_rate - (1 - win_rate) / R
+        half   = max(0.005, min(0.02, kelly / 2))
+        return min(equity * half, POSITION_SIZE)
+
+
+# Alias de conveniencia
+Q = QuantEngine
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN 5: DETECCIÓN DE PATRONES
+# SECCIÓN 4b: ALPHAX IMPULSE BANDS — Adaptive Trend Engine
+# Portado de Pine Script a Python. Lógica 1:1 con el indicador original.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def detect_vcp(closes: List[float], volumes: List[float], lookback: int = 20) -> Tuple[bool, str]:
-    """Volatility Contraction Pattern — compresión progresiva con volumen decreciente."""
-    if len(closes) < lookback:
-        return False, "insufficient_data"
-    rc = closes[-lookback:]
-    rv = volumes[-lookback:]
-    contractions = []
-    for i in range(2, len(rc) - 2):
-        if rc[i] < rc[i - 1] and rc[i] < rc[i + 1]:
-            depth = (rc[i - 1] - rc[i]) / rc[i - 1] * 100
-            contractions.append((depth, rv[i]))
-    if len(contractions) < 2:
-        return False, "no_contractions"
-    depths = [c[0] for c in contractions[-3:]]
-    contracting = all(depths[j] < depths[j - 1] * 1.1 for j in range(1, len(depths)))
-    near_high   = rc[-1] >= max(rc) * 0.92
-    if contracting and near_high:
-        return True, f"vcp_{len(contractions)}c"
-    return False, "no_vcp"
+class AlphaXEngine:
+    """
+    Motor AlphaX Impulse Bands.
+    Combina bandas adaptativas MAD + impulso ATR-normalizado + WPR multi-período.
+    Genera un confidence score 0-100 para señales BULL / BEAR.
+    """
 
-def detect_flag(closes: List[float], volumes: List[float],
-                highs: List[float], lows: List[float]) -> Tuple[bool, str]:
-    """Bull Flag — mástil fuerte seguido de consolidación con volumen bajo."""
-    if len(closes) < 15:
-        return False, "insufficient_data"
-    pole_w, flag_w = 7, 5
-    if len(closes) < pole_w + flag_w:
-        return False, "insufficient_data"
-    pc = closes[-(pole_w + flag_w):-flag_w]
-    fc = closes[-flag_w:]
-    fv = volumes[-flag_w:]
-    pv = volumes[-(pole_w + flag_w):-flag_w]
-    pole_move  = (pc[-1] - pc[0]) / pc[0] * 100
-    flag_range = (max(fc) - min(fc)) / min(fc) * 100
-    vol_ratio  = (sum(fv) / len(fv)) / (sum(pv) / len(pv)) if pv else 1
-    retrace    = (pc[-1] - min(fc)) / (pc[-1] - pc[0] + 1e-10) * 100
-    if pole_move > 4.0 and flag_range < 3.5 and vol_ratio < 0.8 and retrace < 50:
-        return True, f"flag_pole{pole_move:.1f}pct"
-    return False, "no_flag"
+    # ── Helpers estadísticos ─────────────────────────────────────────────────
+    @staticmethod
+    def _ema(prices: List[float], period: int) -> List[float]:
+        """EMA completa sobre una serie, devuelve lista del mismo tamaño."""
+        if not prices or period <= 0:
+            return prices
+        k   = 2 / (period + 1)
+        out = [prices[0]]
+        for p in prices[1:]:
+            out.append(p * k + out[-1] * (1 - k))
+        return out
 
-def market_regime(closes: List[float], highs: List[float],
-                  lows: List[float], volumes: List[float]) -> Tuple[str, float]:
-    """Clasifica el régimen actual: trending_bullish, trending_moderate, ranging, bearish, volatile."""
-    if len(closes) < 30:
-        return "unknown", 0.0
-    cur    = closes[-1]
-    ma10   = sma(closes, 10)
-    ma20   = sma(closes, 20)
-    ma20p  = sma(closes[:-5], 20) if len(closes) > 25 else ma20
-    atr_v  = atr_calc(highs, lows, closes, 14)
-    atr_p  = (atr_v / cur * 100) if cur > 0 else 0
-    if atr_p > REGIME_ATR_MAX_PCT:    return "volatile_extreme", atr_p
-    if atr_p < REGIME_ATR_MIN_PCT:    return "ranging_quiet",    atr_p
-    rising = ma20 > ma20p
-    if cur > ma10 and cur > ma20 and ma10 > ma20 and rising: return "trending_bullish",  atr_p
-    if cur > ma20 and rising:                                 return "trending_moderate", atr_p
-    if not rising and cur < ma20:                             return "bearish",           atr_p
-    return "ranging", atr_p
+    @staticmethod
+    def _sma(prices: List[float], period: int) -> List[float]:
+        """SMA rolling completa."""
+        out = []
+        for i in range(len(prices)):
+            if i < period - 1:
+                out.append(sum(prices[:i+1]) / (i + 1))
+            else:
+                out.append(sum(prices[i-period+1:i+1]) / period)
+        return out
 
-def swing_zones(highs: List[float], lows: List[float], lookback: int = 100) -> Dict:
-    """Encuentra zonas de soporte/resistencia por swing highs y lows."""
-    if len(highs) < lookback:
-        return {'res': [], 'sup': []}
-    rh = highs[-lookback:]
-    rl = lows[-lookback:]
-    sh = [rh[i] for i in range(2, len(rh) - 2)
-          if rh[i] > rh[i-1] and rh[i] > rh[i-2] and rh[i] > rh[i+1] and rh[i] > rh[i+2]]
-    sl = [rl[i] for i in range(2, len(rl) - 2)
-          if rl[i] < rl[i-1] and rl[i] < rl[i-2] and rl[i] < rl[i+1] and rl[i] < rl[i+2]]
-    return {'res': sorted(sh, reverse=True)[:5], 'sup': sorted(sl)[:5]}
+    @staticmethod
+    def _atr_series(highs: List[float], lows: List[float],
+                    closes: List[float], period: int = 14) -> List[float]:
+        """ATR rolling completo."""
+        trs  = [highs[0] - lows[0]]
+        for i in range(1, len(closes)):
+            trs.append(max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i-1]),
+                abs(lows[i]  - closes[i-1]),
+            ))
+        # Wilder smoothing (EMA con k=1/period)
+        k   = 1 / period
+        atr = [trs[0]]
+        for tr in trs[1:]:
+            atr.append(tr * k + atr[-1] * (1 - k))
+        return atr
 
-def ema9_setup(closes: List[float], price: float) -> Tuple[bool, str]:
-    """Detecta setups de entrada respecto a EMA9."""
-    if len(closes) < 2:
-        return False, "insufficient"
-    e9  = ema(closes, 9)
-    e9p = ema(closes[:-1], 9)
-    if closes[-2] <= e9p and price > e9:
-        return True, "ema9_fresh_cross"
-    if price > e9:
-        return True, "above_ema9"
-    return False, "below_ema9"
+    @staticmethod
+    def _wpr(highs: List[float], lows: List[float],
+             closes: List[float], period: int) -> List[float]:
+        """Williams %R rolling completo. Rango [-100, 0]."""
+        out = []
+        for i in range(len(closes)):
+            start = max(0, i - period + 1)
+            h = max(highs[start:i+1])
+            l = min(lows[start:i+1])
+            if h == l:
+                out.append(-50.0)
+            else:
+                out.append((closes[i] - h) / (h - l) * 100)
+        return out
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN 6: FILTROS INSTITUCIONALES
-# ══════════════════════════════════════════════════════════════════════════════
+    # ── Cálculo principal ─────────────────────────────────────────────────────
+    @classmethod
+    def compute(cls,
+                closes:  List[float],
+                highs:   List[float],
+                lows:    List[float],
+                opens:   List[float],
+                volumes: List[float]) -> dict:
+        """
+        Calcula todas las señales AlphaX Impulse Bands sobre las velas dadas.
+        Devuelve dict con el estado en la última barra.
+        """
+        n = len(closes)
+        if n < max(AX_TREND_LEN, AX_MAD_LEN, AX_WPR_SLOW, AX_IMPULSE_LEN) + 5:
+            return {'valid': False}
+
+        # ── Basis EMAs ────────────────────────────────────────────────────────
+        basis_c = cls._ema(closes, AX_TREND_LEN)
+        atr_ser = cls._atr_series(highs, lows, closes, 14)
+
+        # ── MAD (Mean Absolute Deviation) ─────────────────────────────────────
+        mean_c = cls._sma(closes, AX_MAD_LEN)
+        abs_dev = [abs(closes[i] - mean_c[i]) for i in range(n)]
+        mad    = cls._sma(abs_dev, AX_MAD_LEN)
+
+        # ── Impulso normalizado por ATR (stateful decay) ───────────────────────
+        impulse     = 0.0
+        impulse_dir = 0
+        freshness_s = []
+        imp_thresh  = 1.0
+        for i in range(n):
+            if i < AX_IMPULSE_LEN:
+                freshness_s.append(0.0)
+                continue
+            raw = (atr_ser[i] > 0
+                   and (closes[i] - closes[i - AX_IMPULSE_LEN]) / atr_ser[i]
+                   or 0.0)
+            if abs(raw) > imp_thresh:
+                impulse     = abs(raw)
+                impulse_dir = 1 if raw > 0 else -1
+            else:
+                impulse *= AX_DECAY_RATE
+            freshness_s.append(min(impulse / 2.5, 1.0))
+
+        # Values at last bar
+        freshness    = freshness_s[-1]
+        # Recompute impulse_dir at last bar (stateful — use last 5 bars)
+        last_raw = (atr_ser[-1] > 0
+                    and (closes[-1] - closes[-1 - AX_IMPULSE_LEN]) / atr_ser[-1]
+                    or 0.0)
+        impulse_dir  = 1 if last_raw > imp_thresh else (-1 if last_raw < -imp_thresh else impulse_dir)
+
+        # impulse momentum (ROC of freshness)
+        imp_momentum = (freshness_s[-1] - freshness_s[-4]) if n >= 4 else 0.0
+
+        # ── Adaptive bands ────────────────────────────────────────────────────
+        band_mult  = AX_BAND_MAX - (AX_BAND_MAX - AX_BAND_MIN) * freshness
+        band_upper = basis_c[-1] + mad[-1] * band_mult
+        band_lower = basis_c[-1] - mad[-1] * band_mult
+
+        # ── Trend direction (crossover logic) ─────────────────────────────────
+        trend_dir = 0
+        for i in range(1, n):
+            bu = basis_c[i] + mad[i] * (AX_BAND_MAX - (AX_BAND_MAX - AX_BAND_MIN) * freshness_s[i])
+            bl = basis_c[i] - mad[i] * (AX_BAND_MAX - (AX_BAND_MAX - AX_BAND_MIN) * freshness_s[i])
+            if closes[i] > bu:
+                trend_dir = 1
+            elif closes[i] < bl:
+                trend_dir = -1
+        # Flip detection: compare last two
+        prev_trend = 0
+        for i in range(1, n - 1):
+            bu = basis_c[i] + mad[i] * AX_BAND_MAX
+            bl = basis_c[i] - mad[i] * AX_BAND_MAX
+            if closes[i] > bu:
+                prev_trend = 1
+            elif closes[i] < bl:
+                prev_trend = -1
+        trend_flip_up   = trend_dir == 1  and prev_trend == -1
+        trend_flip_down = trend_dir == -1 and prev_trend == 1
+
+        # ── WPR multi-período ─────────────────────────────────────────────────
+        wpr_fast_s = cls._wpr(highs, lows, closes, AX_WPR_FAST)
+        wpr_med_s  = cls._wpr(highs, lows, closes, AX_WPR_MED)
+        wpr_slow_s = cls._wpr(highs, lows, closes, AX_WPR_SLOW)
+
+        wf = wpr_fast_s[-1];  wf1 = wpr_fast_s[-2] if n >= 2 else wf
+        wm = wpr_med_s[-1]
+        ws = wpr_slow_s[-1]
+
+        wpr_fast_os      = wf < AX_WPR_OS
+        wpr_fast_ob      = wf > AX_WPR_OB
+        wpr_med_os       = wm < AX_WPR_OS
+        wpr_med_ob       = wm > AX_WPR_OB
+        wpr_fast_cross_up   = wf  > AX_WPR_OS and wf1 <= AX_WPR_OS
+        wpr_fast_cross_down = wf  < AX_WPR_OB and wf1 >= AX_WPR_OB
+        wpr_fast_vel        = wf  - wf1
+        wpr_fast_accel      = wpr_fast_vel - (wpr_fast_s[-2] - wpr_fast_s[-3]
+                                               if n >= 3 else 0.0)
+        wpr_bull_align      = ws > -65 and wm > -60
+        wpr_bear_align      = ws < -35 and wm < -40
+        wpr_bull_recovery   = (wf > wpr_fast_s[-2] and wf > wpr_fast_s[-3]
+                                if n >= 3 else False)
+        wpr_bear_recovery   = (wf < wpr_fast_s[-2] and wf < wpr_fast_s[-3]
+                                if n >= 3 else False)
+        wpr_triple_os       = wf < AX_WPR_OS and wm < -70 and ws < -60
+        wpr_triple_ob       = wf > AX_WPR_OB and wm > -30 and ws > -40
+
+        # WPR confirmation gate
+        wpr_bull_ok = (not AX_REQUIRE_WPR or
+                       wpr_fast_os or wpr_fast_cross_up or
+                       wpr_bull_recovery or wpr_bull_align)
+        wpr_bear_ok = (not AX_REQUIRE_WPR or
+                       wpr_fast_ob or wpr_fast_cross_down or
+                       wpr_bear_recovery or wpr_bear_align)
+
+        # ── Volume & candle context ───────────────────────────────────────────
+        vol_sma   = cls._sma(volumes, 20)
+        vol_ratio = volumes[-1] / vol_sma[-1] if vol_sma[-1] > 0 else 1.0
+        candle_body  = abs(closes[-1] - opens[-1])
+        candle_range = highs[-1] - lows[-1]
+        body_ratio   = candle_body / candle_range if candle_range > 0 else 0.0
+
+        # ── Confidence scoring ────────────────────────────────────────────────
+        def bull_confidence() -> float:
+            c = 0.0
+            c += 25.0 if trend_flip_up else 0.0
+            c += (20.0 if freshness > 0.8 else 15.0 if freshness > 0.6 else
+                  10.0 if freshness > 0.4 else 5.0  if freshness > 0.2 else 0.0)
+            c += 10.0 if impulse_dir == 1 else 0.0
+            c += (15.0 if wf < -95 else 12.0 if wf < -90 else
+                  9.0  if wf < -85 else 5.0  if wf < -80  else 0.0)
+            c += (10.0 if wpr_fast_cross_up   else
+                  7.0  if wpr_fast_vel > 3    else
+                  4.0  if wpr_bull_recovery   else 0.0)
+            c += 8.0 if wpr_triple_os else 5.0 if wpr_med_os else 0.0
+            c += 5.0 if wpr_bull_align else 2.0 if ws > -55 else 0.0
+            c += (5.0 if closes[-1] > opens[-1] and body_ratio > 0.5
+                  else 2.0 if closes[-1] > opens[-1] else 0.0)
+            c += 5.0 if vol_ratio > 1.5 else 2.0 if vol_ratio > 1.0 else 0.0
+            c += 5.0 if imp_momentum > 0.5 else 2.0 if imp_momentum > 0.2 else 0.0
+            # Penalties
+            c -= 8.0 if ws > -30 else 0.0
+            c -= 5.0 if wf > -20 else 0.0
+            c -= 10.0 if freshness < 0.1 else 0.0
+            c -= 5.0 if abs(wpr_fast_vel) > 30 else 0.0
+            return max(0.0, min(100.0, c))
+
+        def bear_confidence() -> float:
+            c = 0.0
+            c += 25.0 if trend_flip_down else 0.0
+            c += (20.0 if freshness > 0.8 else 15.0 if freshness > 0.6 else
+                  10.0 if freshness > 0.4 else 5.0  if freshness > 0.2 else 0.0)
+            c += 10.0 if impulse_dir == -1 else 0.0
+            c += (15.0 if wf > -5  else 12.0 if wf > -10 else
+                  9.0  if wf > -15 else 5.0  if wf > -20  else 0.0)
+            c += (10.0 if wpr_fast_cross_down  else
+                  7.0  if wpr_fast_vel < -3    else
+                  4.0  if wpr_bear_recovery    else 0.0)
+            c += 8.0 if wpr_triple_ob else 5.0 if wpr_med_ob else 0.0
+            c += 5.0 if wpr_bear_align else 2.0 if ws < -45 else 0.0
+            c += (5.0 if closes[-1] < opens[-1] and body_ratio > 0.5
+                  else 2.0 if closes[-1] < opens[-1] else 0.0)
+            c += 5.0 if vol_ratio > 1.5 else 2.0 if vol_ratio > 1.0 else 0.0
+            c += 5.0 if imp_momentum > 0.5 else 2.0 if imp_momentum > 0.2 else 0.0
+            c -= 8.0 if ws < -70 else 0.0
+            c -= 5.0 if wf < -80 else 0.0
+            c -= 10.0 if freshness < 0.1 else 0.0
+            c -= 5.0 if abs(wpr_fast_vel) > 30 else 0.0
+            return max(0.0, min(100.0, c))
+
+        bull_conf = bull_confidence()
+        bear_conf = bear_confidence()
+
+        # ── Tier classification ────────────────────────────────────────────────
+        bull_tier = "S" if bull_conf >= 70 else "A" if bull_conf >= 55 else "B"
+        bear_tier = "S" if bear_conf >= 70 else "A" if bear_conf >= 55 else "B"
+
+        # ── Band width squeeze indicator ───────────────────────────────────────
+        band_width_pct = (band_upper - band_lower) / closes[-1] * 100 if closes[-1] > 0 else 0.0
+
+        return {
+            'valid':          True,
+            # Impulse
+            'freshness':      freshness,
+            'impulse_dir':    impulse_dir,
+            'imp_momentum':   imp_momentum,
+            # Bands
+            'band_upper':     band_upper,
+            'band_lower':     band_lower,
+            'band_width_pct': band_width_pct,
+            'basis_ema':      basis_c[-1],
+            'band_mult':      band_mult,
+            # Trend
+            'trend_dir':      trend_dir,
+            'trend_flip_up':  trend_flip_up,
+            'trend_flip_down': trend_flip_down,
+            # WPR
+            'wpr_fast':       wf,
+            'wpr_med':        wm,
+            'wpr_slow':       ws,
+            'wpr_fast_vel':   wpr_fast_vel,
+            'wpr_bull_align': wpr_bull_align,
+            'wpr_bear_align': wpr_bear_align,
+            'wpr_triple_os':  wpr_triple_os,
+            'wpr_triple_ob':  wpr_triple_ob,
+            'wpr_bull_ok':    wpr_bull_ok,
+            'wpr_bear_ok':    wpr_bear_ok,
+            # Volume
+            'vol_ratio':      vol_ratio,
+            # Confidence
+            'bull_conf':      bull_conf,
+            'bear_conf':      bear_conf,
+            'bull_tier':      bull_tier,
+            'bear_tier':      bear_tier,
+        }
+
+    @classmethod
+    def bull_signal(cls, ax: dict) -> bool:
+        """True si AlphaX da señal alcista válida."""
+        if not ax.get('valid'):
+            return True  # si no hay datos suficientes, no bloquear
+        return (ax['bull_conf'] >= AX_MIN_CONF and
+                ax['wpr_bull_ok'] and
+                ax['trend_dir'] >= 0 and          # no en tendencia bajista
+                ax['freshness'] > 0.1 and          # no completamente estale
+                ax['impulse_dir'] >= 0)            # impulso no activamente bajista
+
+    @classmethod
+    def squeeze_warning(cls, ax: dict) -> bool:
+        """True si hay squeeze de bandas (potencial breakout inminente)."""
+        return ax.get('valid') and ax.get('band_width_pct', 99) < 2.0
+
+
 
 class Filters:
-    """Cache y lógica de filtros externos: funding, OI, sesión, CVD, BTC health."""
     def __init__(self):
-        self._cache: Dict[str, tuple] = {}   # key → (value, timestamp)
+        self._cache: Dict[str, tuple] = {}
         self.btc_history = deque(maxlen=10)
 
     def _cached(self, key: str, ttl: int = 300):
-        """Devuelve valor cacheado o None si expiró."""
         if key in self._cache:
             val, ts = self._cache[key]
             if time.time() - ts < ttl:
@@ -371,9 +791,7 @@ class Filters:
         return None
 
     def funding_rate(self, symbol: str) -> Tuple[bool, str, float]:
-        if not FUNDING_ENABLED:
-            return True, "disabled", 0.0
-        key = f"fr_{symbol}"
+        key    = f"fr_{symbol}"
         cached = self._cached(key)
         if cached is not None:
             rate = cached
@@ -388,9 +806,7 @@ class Filters:
         return rate < FUNDING_LONG_OK, "funding_ok" if rate < FUNDING_LONG_OK else "funding_neutral", rate
 
     def open_interest(self, symbol: str, price_chg: float) -> Tuple[bool, str, float]:
-        if not OI_ENABLED:
-            return True, "disabled", 0.0
-        key = f"oi_{symbol}"
+        key  = f"oi_{symbol}"
         data = public_request('/openApi/swap/v2/quote/openInterest', {'symbol': symbol})
         if data.get('code') != 0 or not data.get('data'):
             return True, "oi_unknown", 0.0
@@ -407,31 +823,10 @@ class Filters:
         return True, "oi_neutral", change
 
     def session(self) -> Tuple[bool, str]:
-        if not SESSION_FILTER_ENABLED:
-            return True, "disabled"
         h = datetime.utcnow().hour
-        if h in SESSION_BEST:   return True,  "us_session"
-        if h in SESSION_OK:     return True,  "london_session"
+        if h in SESSION_BEST:  return True,  "us_session"
+        if h in SESSION_OK:    return True,  "london_session"
         return False, "asia_session_avoid"
-
-    def cvd_quality(self, volumes: List[float],
-                    closes: List[float], opens: List[float]) -> Tuple[float, str]:
-        if len(volumes) < CVD_LOOKBACK:
-            return 0.0, "insufficient"
-        rv = volumes[-CVD_LOOKBACK:]
-        rc = closes[-CVD_LOOKBACK:]
-        ro = opens[-CVD_LOOKBACK:]
-        raw = cvd_calc(rv, rc, ro)
-        total = sum(rv) or 1
-        cvd_n = raw / total
-        bars  = [rv[i] * (1 if rc[i] > ro[i] else -1) for i in range(len(rv))]
-        try:
-            std = statistics.stdev(bars) if len(bars) > 1 else 1
-            if abs(cvd_n) * total > CVD_THRESHOLD * std:
-                return cvd_n, "bullish_cvd" if cvd_n > 0 else "bearish_cvd"
-        except Exception:
-            pass
-        return cvd_n, "cvd_neutral"
 
     def btc_health(self) -> Tuple[bool, str]:
         data = public_request('/openApi/swap/v2/quote/ticker', {'symbol': 'BTC-USDT'})
@@ -439,43 +834,52 @@ class Filters:
             t   = data['data']
             chg = safe_float(t.get('priceChangePercent', 0))
             self.btc_history.append(safe_float(t.get('lastPrice', 0)))
-            if chg < -2.0:
+            if chg < -2.5:
                 return False, f"btc_falling_{chg:.1f}pct"
             return True, "btc_positive" if chg > 0 else "btc_neutral"
         return True, "btc_unknown"
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN 7: CLASE PRINCIPAL — InstitutionalBot v4
+# SECCIÓN 6: SUPERBOT — CLASE PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
 
-class InstitutionalBot:
+class SuperBot:
+    """
+    SuperBot v5.0 — Simons Quant Edition.
+    Nombre de clase expuesto para compatibilidad con main.py:
+        from bot import SuperBot
+    """
 
     def __init__(self):
-        # Estado
-        self.symbols:        List[str]         = []
-        self.positions:      Dict[str, dict]   = {}
-        self.contracts_info: Dict[str, dict]   = {}
-        self.symbol_cooldown: Dict[str, float] = {}   # símbolo → timestamp último cierre
-        self.filters   = Filters()
-        self.equity    = ACCOUNT_EQUITY
+        self.symbols:         List[str]         = []
+        self.positions:       Dict[str, dict]   = {}
+        self.contracts_info:  Dict[str, dict]   = {}
+        self.symbol_cooldown: Dict[str, float]  = {}
+        self.filters  = Filters()
+        self.q        = Q()
+        self.equity   = ACCOUNT_EQUITY
 
         # Circuit Breaker
-        self.circuit_active  = False
-        self.circuit_until:  Optional[datetime] = None
-        self.daily_pnl       = 0.0
-        self.daily_date      = datetime.utcnow().date()
-        self.daily_trades    = 0
-        self.losing_streak   = 0
+        self.circuit_active = False
+        self.circuit_until: Optional[datetime] = None
+        self.daily_pnl    = 0.0
+        self.daily_date   = datetime.utcnow().date()
+        self.daily_trades = 0
+        self.losing_streak = 0
 
-        # Stats v4 — ampliadas
+        # Stats
         self.stats = {
             'wins': 0, 'losses': 0, 'total_pnl': 0.0,
             'win_amounts': [], 'loss_amounts': [],
             'best_trade': 0.0, 'worst_trade': 0.0,
-            'hold_times': [],   # minutos
+            'hold_times': [],
+            # Métricas Simons
+            'z_vol_avg': [],    # Z-vol promedio en entradas
+            'ensemble_avg': [], # Score ensemble promedio
         }
 
-        self._print_banner()
+        self._banner()
         ok = self._connect()
         if not ok and AUTO_TRADING:
             log.error("❌ Conexión fallida. Abortando.")
@@ -484,23 +888,23 @@ class InstitutionalBot:
         self._refresh_symbols()
         self._recover_positions()
         self._notify(
-            f"<b>🚀 BOT v4.0 INICIADO</b>\n\n"
+            f"<b>🚀 SUPERBOT v5.0 — SIMONS QUANT</b>\n\n"
             f"Capital: ${POSITION_SIZE} × {MAX_POSITIONS} | Lev: {LEVERAGE}×\n"
-            f"Circuit: {CIRCUIT_BREAKER_PCT}% | Min score: {MIN_SCORE}\n"
+            f"Circuit: {CIRCUIT_BREAKER_PCT}% | Min score: {MIN_QUANT_SCORE}\n"
+            f"Z-Vol: {Z_VOL_THRESHOLD} | Z-Price: {Z_PRICE_THRESHOLD}\n"
             f"Modo: {'REAL 💸' if AUTO_TRADING else 'PAPER 📝'}"
         )
 
-    # ── Banner de inicio ──────────────────────────────────────────────────────
-    def _print_banner(self):
+    # ── Banner ────────────────────────────────────────────────────────────────
+    def _banner(self):
         log.info("=" * 78)
-        log.info("  INSTITUTIONAL BOT v4.0 — Phoenix Trader Edition")
+        log.info("  SUPERBOT v5.0 — Simons Quant Edition")
+        log.info("  'No predecimos el futuro, explotamos patrones estadísticos.'")
         log.info("=" * 78)
-        log.info(f"  Capital: ${POSITION_SIZE}/pos × {MAX_POSITIONS} pos | Leverage: {LEVERAGE}×")
-        log.info(f"  SL: {SL_ATR_MULT}×ATR ({SL_MIN_PCT}-{SL_MAX_PCT}%) | "
-                 f"TP1: {TP1_RR}R | TP2: {TP2_RR}R | Trail: {RUNNER_TRAIL}×ATR")
-        log.info(f"  Min Score: {MIN_SCORE} | Min Edge: {MIN_EDGE}× | Max hold: {MAX_HOLD_H}h")
-        log.info(f"  Circuit: {CIRCUIT_BREAKER_PCT}% loss / {MAX_LOSING_STREAK} streak / {MAX_DAILY_TRADES} trades")
-        log.info(f"  Auto-trading: {'ENABLED 💸' if AUTO_TRADING else 'DISABLED — PAPER MODE 📝'}")
+        log.info(f"  Capital: ${POSITION_SIZE}/pos × {MAX_POSITIONS} | Leverage: {LEVERAGE}×")
+        log.info(f"  SL: {SL_ATR_MULT}×ATR | TP1: {TP1_RR}R | TP2: {TP2_RR}R | Trail: {RUNNER_TRAIL}×ATR")
+        log.info(f"  Z-Vol: {Z_VOL_THRESHOLD} | Z-Price: {Z_PRICE_THRESHOLD} | Min Score: {MIN_QUANT_SCORE}")
+        log.info(f"  Auto-trading: {'ENABLED 💸' if AUTO_TRADING else 'PAPER MODE 📝'}")
         log.info("=" * 78)
 
     # ── Conexión ──────────────────────────────────────────────────────────────
@@ -523,7 +927,7 @@ class InstitutionalBot:
         AUTO_TRADING = False
         return False
 
-    # ── Cargar contratos ──────────────────────────────────────────────────────
+    # ── Contratos ─────────────────────────────────────────────────────────────
     def _load_contracts(self):
         data = public_request('/openApi/swap/v2/quote/contracts')
         if data.get('code') == 0:
@@ -531,20 +935,18 @@ class InstitutionalBot:
                 s = c.get('symbol', '')
                 if s:
                     self.contracts_info[s] = {
-                        'min_qty':        safe_float(c.get('tradeMinQuantity', 1)),
-                        'qty_precision':  int(c.get('quantityPrecision', 2)),
-                        'contract_size':  safe_float(c.get('contractSize', 1)),
+                        'min_qty':       safe_float(c.get('tradeMinQuantity', 1)),
+                        'qty_precision': int(c.get('quantityPrecision', 2)),
+                        'contract_size': safe_float(c.get('contractSize', 1)),
                     }
-            log.info(f"✓ Contratos cargados: {len(self.contracts_info)}")
-        else:
-            log.warning(f"⚠️ Contratos no cargados: {data.get('msg')}")
+            log.info(f"✓ Contratos: {len(self.contracts_info)}")
 
-    # ── Refresh de símbolos ───────────────────────────────────────────────────
+    # ── Refresh símbolos ──────────────────────────────────────────────────────
     def _refresh_symbols(self):
         data = public_request('/openApi/swap/v2/quote/ticker')
         if data.get('code') != 0:
             self.symbols = ['BTC-USDT', 'ETH-USDT', 'SOL-USDT']
-            log.warning("⚠️ Usando fallback de símbolos")
+            log.warning("⚠️ Usando fallback")
             return
         candidates = []
         for t in data.get('data', []):
@@ -564,14 +966,12 @@ class InstitutionalBot:
         self.symbols = [c['symbol'] for c in candidates[:MAX_SYMBOLS]]
         log.info(f"✓ Símbolos activos: {len(self.symbols)}")
 
-    # ── Recuperar posiciones abiertas ─────────────────────────────────────────
+    # ── Recuperar posiciones ──────────────────────────────────────────────────
     def _recover_positions(self):
-        """Recupera posiciones abiertas con TODOS los campos inicializados."""
         if not AUTO_TRADING:
             return
         data = api_request('GET', '/openApi/swap/v2/user/positions')
         if data.get('code') != 0:
-            log.warning(f"⚠️ No se pudieron recuperar posiciones: {data.get('msg')}")
             return
         recovered = 0
         for pos in data.get('data', []):
@@ -584,49 +984,46 @@ class InstitutionalBot:
                     if entry <= 0:
                         continue
                     qty = abs(amt)
-                    self.positions[symbol] = self._build_position(
+                    self.positions[symbol] = self._build_pos(
                         entry=entry, qty=qty,
-                        tp1_price=entry * (1 + SL_MIN_PCT * TP1_RR / 100),
-                        tp2_price=entry * (1 + SL_MIN_PCT * TP2_RR / 100),
-                        sl_price =entry * (1 - SL_MIN_PCT / 100),
-                        sl_pct   =SL_MIN_PCT,
-                        atr_val  =entry * 0.005,
-                        score    =0,
-                        signal   =None,
-                        recovered=True
+                        tp1=entry * (1 + SL_MIN_PCT * TP1_RR / 100),
+                        tp2=entry * (1 + SL_MIN_PCT * TP2_RR / 100),
+                        sl=entry * (1 - SL_MIN_PCT / 100),
+                        sl_pct=SL_MIN_PCT, atr=entry * 0.005,
+                        score=0, sig=None, recovered=True
                     )
                     recovered += 1
-                    log.info(f"♻️  Posición recuperada: {symbol} @ ${entry:.6f}")
+                    log.info(f"♻️  Recuperada: {symbol} @ ${entry:.6f}")
             except Exception as e:
-                log.error(f"Error recuperando posición: {e}\n{traceback.format_exc()}")
+                log.error(f"Recover: {e}")
         if recovered:
             log.info(f"✓ {recovered} posiciones recuperadas")
 
-    # ── Constructor de dict de posición (garantiza todos los campos) ──────────
-    def _build_position(self, *, entry, qty, tp1_price, tp2_price, sl_price,
-                         sl_pct, atr_val, score, signal, recovered=False) -> dict:
+    # ── Constructor de posición ───────────────────────────────────────────────
+    def _build_pos(self, *, entry, qty, tp1, tp2, sl, sl_pct,
+                   atr, score, sig, recovered=False) -> dict:
         return {
-            'entry':       entry,
-            'qty':         qty,
-            'qty_tp1':     round(qty * TP1_PCT / 100, 6),
-            'qty_tp2':     round(qty * TP2_PCT / 100, 6),
-            'side':        'LONG',
-            'sl_price':    sl_price,
-            'sl_pct':      sl_pct,
-            'tp1_price':   tp1_price,
-            'tp2_price':   tp2_price,
-            'tp1_hit':     False,
-            'tp2_hit':     False,
-            'highest':     entry,          # CRÍTICO: siempre presente
-            'opened_at':   datetime.now(),
-            'score':       score,
-            'signal':      signal or {'atr': atr_val, 'atr_pct': 0},
+            'entry':        entry,
+            'qty':          qty,
+            'qty_tp1':      round(qty * TP1_PCT / 100, 6),
+            'qty_tp2':      round(qty * TP2_PCT / 100, 6),
+            'side':         'LONG',
+            'sl_price':     sl,
+            'sl_pct':       sl_pct,
+            'tp1_price':    tp1,
+            'tp2_price':    tp2,
+            'tp1_hit':      False,
+            'tp2_hit':      False,
+            'highest':      entry,
+            'opened_at':    datetime.now(),
+            'score':        score,
+            'signal':       sig or {'atr': atr},
             'pnl_realized': 0.0,
-            'pos_size':    POSITION_SIZE,
-            'recovered':   recovered,
+            'pos_size':     POSITION_SIZE,
+            'recovered':    recovered,
         }
 
-    # ── Obtener velas ─────────────────────────────────────────────────────────
+    # ── Velas ─────────────────────────────────────────────────────────────────
     def _klines(self, symbol: str, interval: str = '5m',
                 limit: int = 150) -> Tuple[List, List, List, List, List]:
         try:
@@ -645,7 +1042,7 @@ class InstitutionalBot:
             log.error(f"Klines [{symbol}]: {e}")
         return None, None, None, None, None
 
-    # ── Obtener ticker ────────────────────────────────────────────────────────
+    # ── Ticker ────────────────────────────────────────────────────────────────
     def _ticker(self, symbol: str) -> Optional[dict]:
         try:
             data = public_request('/openApi/swap/v2/quote/ticker', {'symbol': symbol})
@@ -660,17 +1057,20 @@ class InstitutionalBot:
             log.error(f"Ticker [{symbol}]: {e}")
         return None
 
-    # ── Análisis de símbolo (scoring) ─────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # NÚCLEO: ANÁLISIS SIMONS — ENSEMBLE DE SEÑALES
+    # ══════════════════════════════════════════════════════════════════════════
     def analyze(self, symbol: str) -> Optional[dict]:
-        """Devuelve señal si el símbolo cumple todos los filtros y score ≥ MIN_SCORE."""
+        """
+        Motor de análisis cuantitativo multi-señal.
+        Retorna dict de señal si score ≥ MIN_QUANT_SCORE, else None.
+        """
         if symbol in self.positions:
             return None
         if symbol not in self.contracts_info:
             return None
-
-        # Cooldown: evitar re-entrada en símbolo perdedor reciente
-        last_close = self.symbol_cooldown.get(symbol, 0)
-        if time.time() - last_close < SYMBOL_COOLDOWN * 60:
+        # Cooldown post-pérdida
+        if time.time() - self.symbol_cooldown.get(symbol, 0) < SYMBOL_COOLDOWN * 60:
             return None
 
         closes, highs, lows, volumes, opens = self._klines(symbol, '5m', 150)
@@ -681,28 +1081,29 @@ class InstitutionalBot:
         if not tick or tick['price'] <= 0:
             return None
 
-        price    = tick['price']
-        chg_24h  = tick['change_pct']
-        cur_vol  = tick['volume']
+        price   = tick['price']
+        chg_24h = tick['change_pct']
 
-        # ── Filtros macro ──────────────────────────────────────────────────────
-        regime, atr_pct = market_regime(closes, highs, lows, volumes)
+        # ── 1. Régimen de mercado ──────────────────────────────────────────────
+        regime, atr_pct = Q.volatility_regime(highs, lows, closes)
         if regime in ("volatile_extreme", "ranging_quiet", "bearish"):
             log.debug(f"{symbol}: ✗ Regime={regime}")
             return None
 
+        # ── 2. BTC Health ─────────────────────────────────────────────────────
         if symbol != 'BTC-USDT':
             btc_ok, btc_reason = self.filters.btc_health()
             if not btc_ok:
                 log.debug(f"{symbol}: ✗ {btc_reason}")
                 return None
 
-        # Correlation guard: máximo MAX_CORR_LONGS altcoins simultáneas
+        # ── 3. Correlation guard ──────────────────────────────────────────────
         if symbol not in ('BTC-USDT', 'ETH-USDT'):
             alts = sum(1 for s in self.positions if s not in ('BTC-USDT', 'ETH-USDT'))
             if alts >= MAX_CORR_LONGS:
                 return None
 
+        # ── 4. Filtros institucionales ─────────────────────────────────────────
         fund_ok, fund_reason, fund_rate = self.filters.funding_rate(symbol)
         if not fund_ok:
             log.debug(f"{symbol}: ✗ {fund_reason}")
@@ -718,181 +1119,261 @@ class InstitutionalBot:
             log.debug(f"{symbol}: ✗ {sess_name}")
             return None
 
-        # ── Indicadores ────────────────────────────────────────────────────────
-        ma10  = sma(closes, 10)
-        ma20  = sma(closes, 20)
-        ma20p = sma(closes[:-5], 20) if len(closes) > 25 else ma20
-        e9    = ema(closes, 9)
-        e50   = ema(closes, 50)
-        atr_v = atr_calc(highs, lows, closes, 14)
-        rsi_v = rsi_calc(closes, 14)
-        cvd_v, cvd_sig = self.filters.cvd_quality(volumes, closes, opens)
-        zones = swing_zones(highs, lows, 100)
+        # ══════════════════════════════════════════════════════════════════════
+        # SEÑALES CUANTITATIVAS — NÚCLEO SIMONS
+        # ══════════════════════════════════════════════════════════════════════
 
-        above_ma10 = price > ma10
-        above_ma20 = price > ma20
-        ma_stack   = ma10 > ma20 and above_ma10 and above_ma20
-        ma20_rising = ma20 > ma20p
-        vol_ok, vol_ratio = (True, (cur_vol / volume_avg(volumes[:-1], 20))
-                             ) if volume_avg(volumes[:-1], 20) > 0 else (True, 1.0)
-        vol_breakout = vol_ratio >= VOLUME_BREAKOUT_MULT
-        vcp_ok, vcp_str  = detect_vcp(closes, volumes, VCP_LOOKBACK)
-        flag_ok, flag_str = detect_flag(closes, volumes, highs, lows)
-        e9_ok, e9_str    = ema9_setup(closes, price)
+        # Z-Scores
+        z_vol   = Q.z_score_volume(volumes, 30)
+        z_price = Q.z_score_price(closes, 20)
 
-        # ── Scoring ────────────────────────────────────────────────────────────
-        score   = 0
-        reasons = []
+        # Absorción institucional
+        abs_ok, abs_str = Q.detect_absorption(volumes, highs, lows, opens, z_vol, closes)
 
-        # Regime (15 pts)
-        if regime == "trending_bullish":
-            score += 15; reasons.append("Regime_Bull(15)")
-        elif regime == "trending_moderate":
-            score +=  8; reasons.append("Regime_Mod(8)")
+        # Momentum multi-período
+        mom_score, mom_str = Q.momentum_signal(closes)
 
-        # MA stack (25 pts)
-        if ma_stack and ma20_rising:
-            score += 25; reasons.append("MA_Stack_Rising(25)")
-        elif above_ma20 and ma20_rising:
-            score += 15; reasons.append("Above_MA20_Rising(15)")
-        elif above_ma20:
-            score +=  8; reasons.append("Above_MA20(8)")
+        # Mean reversion zone
+        mr_score, mr_str = Q.mean_reversion_score(closes, MEAN_REV_PERIOD)
 
-        # VCP (20 pts)
+        # CVD
+        cvd_val, cvd_str = Q.cvd(volumes, closes, opens)
+
+        # ── AlphaX Impulse Bands ───────────────────────────────────────────────
+        ax = AlphaXEngine.compute(closes, highs, lows, opens, volumes)
+        if AX_ENABLED and ax.get('valid'):
+            if not AlphaXEngine.bull_signal(ax):
+                log.debug(f"{symbol}: ✗ AlphaX bull_conf={ax['bull_conf']:.0f} "
+                          f"trend={ax['trend_dir']} fresh={ax['freshness']:.2f}")
+                return None
+
+        # Patrones clásicos
+        vcp_ok,  vcp_str  = Q.detect_vcp(closes, volumes, VCP_LOOKBACK)
+        flag_ok, flag_str = Q.detect_flag(closes, volumes, highs, lows)
+
+        # Indicadores de soporte
+        atr_v = Q.atr(highs, lows, closes, 14)
+        rsi_v = Q.rsi(closes, 14)
+        e9    = Q.ema(closes, 9)
+        e50   = Q.ema(closes, 50)
+        ma10  = sum(closes[-10:]) / 10
+        ma20  = sum(closes[-20:]) / 20 if len(closes) >= 20 else ma10
+        vol_avg  = sum(volumes[-20:-1]) / 19 if len(volumes) >= 20 else volumes[-1]
+        vol_ratio = volumes[-1] / vol_avg if vol_avg > 0 else 1.0
+
+        # ── Score Ensemble (Simons) ────────────────────────────────────────────
+        ensemble = Q.ensemble_score(z_vol, z_price, mom_score, mr_score, cvd_val)
+
+        # ── Score Total (Ensemble + Patrones + Filtros + AlphaX) ─────────────
+        score   = ensemble   # base: ensemble cuantitativo
+        reasons = [f"Ensemble({ensemble:.0f})"]
+
+        # Patrones visuales (+25 cada uno, hasta 50)
         if vcp_ok:
-            score += 20; reasons.append(f"VCP(20)")
-
-        # Flag (15 pts)
+            score += 12; reasons.append(f"VCP(+12)")
         if flag_ok:
-            score += 15; reasons.append(f"Flag(15)")
+            score += 10; reasons.append(f"Flag(+10)")
+        if abs_ok:
+            score += 15; reasons.append(f"Absorcion(+15)")
 
-        # Volume (15 pts)
-        if vol_breakout:
-            score += 15; reasons.append(f"VolBreakout({vol_ratio:.1f}x)(15)")
-        elif vol_ratio > 1.2:
-            score +=  7; reasons.append(f"VolAbove({vol_ratio:.1f}x)(7)")
+        # Volumen inusual confirma
+        if z_vol > Z_VOL_THRESHOLD:
+            bonus = min(int((z_vol - Z_VOL_THRESHOLD) * 5), 10)
+            score += bonus; reasons.append(f"ZVol{z_vol:.1f}(+{bonus})")
+        if vol_ratio >= VOLUME_BREAKOUT_MULT:
+            score += 8;  reasons.append(f"VolBreak{vol_ratio:.1f}x(+8)")
 
-        # EMA9 (10 pts)
-        if e9_ok:
-            bonus = 10 if e9_str == "ema9_fresh_cross" else 5
-            score += bonus; reasons.append(f"{e9_str}({bonus})")
+        # Momentum confirmado
+        if mom_str == "mom_strong" and mom_score > 0.008:
+            score += 8; reasons.append(f"MomStrong(+8)")
 
-        # CVD (10 pts)
-        if cvd_sig == "bullish_cvd":
-            score += 10; reasons.append("CVD_Bull(10)")
-        elif cvd_sig == "cvd_neutral":
-            score +=  4; reasons.append("CVD_Neutral(4)")
+        # Estructura de MAs
+        if price > ma10 and ma10 > ma20 and price > e50:
+            score += 10; reasons.append("MAStack(+10)")
+        elif price > ma20:
+            score += 5;  reasons.append("AboveMA20(+5)")
 
-        # Funding (5 pts)
-        if fund_rate < 0:
-            score += 5; reasons.append("Fund_Neg(5)")
-        elif fund_rate < 0.02:
-            score += 3; reasons.append("Fund_Low(3)")
+        # EMA9 pullback / cross
+        if price > e9 and closes[-2] <= Q.ema(closes[:-1], 9):
+            score += 8; reasons.append("EMA9Cross(+8)")
+        elif price > e9:
+            score += 4; reasons.append("AboveEMA9(+4)")
 
-        # OI (5 pts)
-        if oi_reason == "oi_breakout_confirmed":
-            score += 5; reasons.append("OI_Break(5)")
+        # RSI sweet spot
+        if 40 < rsi_v < 60:
+            score += 5; reasons.append(f"RSI_Sweet({rsi_v:.0f})(+5)")
+        elif 30 < rsi_v <= 40:
+            score += 3; reasons.append(f"RSI_Oversold({rsi_v:.0f})(+3)")
 
-        # Session (5 pts)
+        # Regime bonus
+        if regime == "trending_bullish":
+            score += 8; reasons.append("Trending_Bull(+8)")
+
+        # Sesión
         if sess_name == "us_session":
-            score += 5; reasons.append("US_Sess(5)")
-        elif sess_name == "london_session":
-            score += 3; reasons.append("London_Sess(3)")
+            score += 4; reasons.append("US_Sess(+4)")
 
-        # RSI sweet spot (5 pts)
-        if 35 < rsi_v < 55:
-            score += 5; reasons.append(f"RSI_Sweet({int(rsi_v)})(5)")
+        # Funding negativo = longs no saturados
+        if fund_rate < 0:
+            score += 4; reasons.append("Fund_Neg(+4)")
 
-        # ── Gestión de riesgo: SL dinámico ─────────────────────────────────────
-        sl_atr = price - atr_v * SL_ATR_MULT
-        sup    = next((s * 0.998 for s in zones['sup'] if s < price), None)
-        sl_raw = max(sl_atr, sup) if sup else sl_atr
-        sl_pct = (price - sl_raw) / price * 100
-        sl_pct = max(SL_MIN_PCT, min(SL_MAX_PCT, sl_pct))
+        # OI confirma breakout
+        if oi_reason == "oi_breakout_confirmed":
+            score += 5; reasons.append("OI_Break(+5)")
+
+        # ── AlphaX Impulse bonus ───────────────────────────────────────────────
+        if ax.get('valid'):
+            bc = ax['bull_conf']
+            # S/A/B tier bonuses
+            if bc >= 70:
+                score += 18; reasons.append(f"AX_S({bc:.0f}%)(+18)")
+            elif bc >= 55:
+                score += 12; reasons.append(f"AX_A({bc:.0f}%)(+12)")
+            elif bc >= AX_MIN_CONF:
+                score += 6;  reasons.append(f"AX_B({bc:.0f}%)(+6)")
+            # Sub-señales adicionales
+            if ax['wpr_triple_os']:
+                score += 8; reasons.append("AX_TripleOS(+8)")
+            elif ax['wpr_med'] < AX_WPR_OS:
+                score += 4; reasons.append("AX_MedOS(+4)")
+            if ax['trend_flip_up']:
+                score += 10; reasons.append("AX_TrendFlip(+10)")
+            if ax['freshness'] > 0.7:
+                score += 5; reasons.append(f"AX_Fresh({ax['freshness']:.0%})(+5)")
+            if AlphaXEngine.squeeze_warning(ax):
+                score += 6; reasons.append(f"AX_Squeeze(bw={ax['band_width_pct']:.1f}%)(+6)")
+            if ax['wpr_bull_align']:
+                score += 4; reasons.append("AX_WPRAlign(+4)")
+
+        # ── Gestión de riesgo dinámica ─────────────────────────────────────────
+        sl_atr  = price - atr_v * SL_ATR_MULT
+        sl_pct  = (price - sl_atr) / price * 100
+        sl_pct  = max(SL_MIN_PCT, min(SL_MAX_PCT, sl_pct))
         sl_price   = price * (1 - sl_pct / 100)
         tp1_price  = price * (1 + sl_pct * TP1_RR / 100)
         tp2_price  = price * (1 + sl_pct * TP2_RR / 100)
         edge_ratio = (sl_pct * TP1_RR) / (TOTAL_COST * 100)
 
         if edge_ratio < MIN_EDGE:
-            log.debug(f"{symbol}: ✗ Edge {edge_ratio:.1f}× < {MIN_EDGE}×")
+            log.debug(f"{symbol}: ✗ Edge {edge_ratio:.1f}×")
             return None
-        if score < MIN_SCORE:
-            log.debug(f"{symbol}: ✗ Score {score} < {MIN_SCORE}")
+        if score < MIN_QUANT_SCORE:
+            log.debug(f"{symbol}: ✗ Score {score:.0f}")
             return None
 
         return {
-            'symbol':     symbol,
-            'price':      price,
-            'score':      score,
-            'reasons':    ' | '.join(reasons),
-            'sl_price':   sl_price,
-            'sl_pct':     sl_pct,
-            'tp1_price':  tp1_price,
-            'tp2_price':  tp2_price,
-            'edge_ratio': edge_ratio,
-            'atr':        atr_v,
-            'atr_pct':    atr_pct,
-            'ma10': ma10, 'ma20': ma20,
-            'ema9': e9,   'ema50': e50,
-            'rsi':        rsi_v,
-            'regime':     regime,
-            'vcp':        vcp_ok,
-            'flag':       flag_ok,
-            'vol_ratio':  vol_ratio,
-            'cvd_signal': cvd_sig,
+            'symbol':      symbol,
+            'price':       price,
+            'score':       score,
+            'ensemble':    ensemble,
+            'reasons':     ' | '.join(reasons),
+            'sl_price':    sl_price,
+            'sl_pct':      sl_pct,
+            'tp1_price':   tp1_price,
+            'tp2_price':   tp2_price,
+            'edge_ratio':  edge_ratio,
+            'atr':         atr_v,
+            'atr_pct':     atr_pct,
+            'z_vol':       z_vol,
+            'z_price':     z_price,
+            'mom_score':   mom_score,
+            'mr_score':    mr_score,
+            'cvd_val':     cvd_val,
+            'cvd_signal':  cvd_str,
+            'absorption':  abs_ok,
+            'absorption_str': abs_str,
+            'vcp':         vcp_ok,
+            'vcp_str':     vcp_str,
+            'flag':        flag_ok,
+            'flag_str':    flag_str,
+            'vol_ratio':   vol_ratio,
+            'rsi':         rsi_v,
+            'regime':      regime,
+            'session':     sess_name,
             'funding_rate': fund_rate,
-            'oi_change':  oi_chg,
-            'session':    sess_name,
+            'oi_change':   oi_chg,
+            'ma10': ma10, 'ma20': ma20, 'ema9': e9, 'ema50': e50,
+            # AlphaX Impulse Bands
+            'ax_valid':       ax.get('valid', False),
+            'ax_bull_conf':   ax.get('bull_conf', 0.0),
+            'ax_bull_tier':   ax.get('bull_tier', '?'),
+            'ax_freshness':   ax.get('freshness', 0.0),
+            'ax_trend_dir':   ax.get('trend_dir', 0),
+            'ax_trend_flip':  ax.get('trend_flip_up', False),
+            'ax_wpr_fast':    ax.get('wpr_fast', -50.0),
+            'ax_wpr_slow':    ax.get('wpr_slow', -50.0),
+            'ax_triple_os':   ax.get('wpr_triple_os', False),
+            'ax_squeeze':     AlphaXEngine.squeeze_warning(ax),
+            'ax_band_width':  ax.get('band_width_pct', 0.0),
+            'ax_impulse_dir': ax.get('impulse_dir', 0),
         }
 
-    # ── Abrir posición ────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # EJECUCIÓN
+    # ══════════════════════════════════════════════════════════════════════════
+
     def open_position(self, sig: dict) -> bool:
-        symbol    = sig['symbol']
-        price     = sig['price']
-        sl_price  = sig['sl_price']
+        symbol   = sig['symbol']
+        price    = sig['price']
+        sl_price = sig['sl_price']
 
         if not AUTO_TRADING:
-            log.info(f"📝 PAPER: Abriría LONG {symbol} | Score:{int(sig['score'])} | "
-                     f"Edge:{sig['edge_ratio']:.1f}× | Regime:{sig['regime']}")
-            return False
+            log.info(
+                f"📝 PAPER LONG {symbol} | "
+                f"Score:{sig['score']:.0f} | Ensemble:{sig['ensemble']:.0f} | "
+                f"Z-Vol:{sig['z_vol']:.2f} | Edge:{sig['edge_ratio']:.1f}× | "
+                f"Regime:{sig['regime']}"
+            )
+            # Track paper position so monitor_positions can simulate exits
+            sl_pct = sig['sl_pct']
+            tp1 = sig['price'] * (1 + sl_pct * TP1_RR / 100)
+            tp2 = sig['price'] * (1 + sl_pct * TP2_RR / 100)
+            qty_paper = (POSITION_SIZE * LEVERAGE) / sig['price']
+            self.positions[symbol] = self._build_pos(
+                entry=sig['price'], qty=qty_paper,
+                tp1=tp1, tp2=tp2,
+                sl=sig['sl_price'], sl_pct=sl_pct,
+                atr=sig['atr'], score=sig['score'], sig=sig
+            )
+            self.daily_trades += 1
+            self.stats['z_vol_avg'].append(sig['z_vol'])
+            self.stats['ensemble_avg'].append(sig['ensemble'])
+            return True
 
         if symbol not in self.contracts_info:
-            log.error(f"❌ {symbol}: no hay info de contrato")
+            log.error(f"❌ {symbol}: sin info de contrato")
             return False
 
         log.info(f"{'='*60}")
-        log.info(f"🎯 ABRIENDO LONG: {symbol} | Score:{int(sig['score'])} | Edge:{sig['edge_ratio']:.1f}×")
+        log.info(f"🎯 LONG {symbol} | Score:{sig['score']:.0f} | Ensemble:{sig['ensemble']:.0f}")
         log.info(f"Entry: ${price:.6f} | SL: ${sl_price:.6f} (-{sig['sl_pct']:.2f}%)")
 
-        # Kelly sizing tras 10+ trades
+        # Kelly sizing
         total = self.stats['wins'] + self.stats['losses']
         pos_size = POSITION_SIZE
         if (total >= 10 and self.stats['win_amounts'] and self.stats['loss_amounts']):
-            wr  = self.stats['wins'] / total
+            wr    = self.stats['wins'] / total
             avg_w = sum(self.stats['win_amounts'][-20:]) / len(self.stats['win_amounts'][-20:])
             avg_l = abs(sum(self.stats['loss_amounts'][-20:]) / len(self.stats['loss_amounts'][-20:]))
-            pos_size = kelly_size(wr, avg_w, avg_l, self.equity)
+            pos_size = Q.kelly_size(wr, avg_w, avg_l, self.equity)
 
         qty = self._calc_qty(symbol, price, sl_price, pos_size)
         if not qty:
-            log.error(f"❌ {symbol}: cantidad no calculable")
+            log.error(f"❌ {symbol}: qty incalculable")
             return False
 
-        # Set leverage
         self._set_leverage(symbol, LEVERAGE)
         time.sleep(0.3)
 
-        # Orden de apertura con positionSide (CRÍTICO)
         order = api_request('POST', '/openApi/swap/v2/trade/order', {
             'symbol':       symbol,
             'side':         'BUY',
             'type':         'MARKET',
             'quantity':     str(qty),
-            'positionSide': 'LONG',    # SIEMPRE requerido en BingX
+            'positionSide': 'LONG',
         })
         if order.get('code') != 0:
-            log.error(f"❌ Orden fallida {symbol}: {order.get('msg')}")
+            log.error(f"❌ Orden {symbol}: {order.get('msg')}")
             return False
 
         time.sleep(1)
@@ -901,109 +1382,118 @@ class InstitutionalBot:
             log.error(f"❌ {symbol}: posición no confirmada")
             return False
 
-        # Recalcular con precio de ejecución real
         real_sl_pct = (fill_price - sl_price) / fill_price * 100
         tp1 = fill_price * (1 + real_sl_pct * TP1_RR / 100)
         tp2 = fill_price * (1 + real_sl_pct * TP2_RR / 100)
 
-        # Stop Loss en exchange (con positionSide)
-        sl_p = {'symbol': symbol, 'side': 'SELL', 'type': 'STOP_MARKET',
-                 'quantity': str(fill_qty), 'stopPrice': str(round(sl_price, 8)),
-                 'positionSide': 'LONG'}
-        sl_r = api_request('POST', '/openApi/swap/v2/trade/order', sl_p)
+        # Stop Loss en exchange
+        sl_params = {
+            'symbol': symbol, 'side': 'SELL', 'type': 'STOP_MARKET',
+            'quantity': str(fill_qty), 'stopPrice': str(round(sl_price, 8)),
+            'positionSide': 'LONG'
+        }
+        sl_r = api_request('POST', '/openApi/swap/v2/trade/order', sl_params)
         if sl_r.get('code') != 0:
-            # Intentar con STOP
-            sl_p['type'] = 'STOP'
-            sl_p['price'] = str(round(sl_price * 0.999, 8))
-            sl_r = api_request('POST', '/openApi/swap/v2/trade/order', sl_p)
+            sl_params['type']  = 'STOP'
+            sl_params['price'] = str(round(sl_price * 0.999, 8))
+            sl_r = api_request('POST', '/openApi/swap/v2/trade/order', sl_params)
         sl_ok = sl_r.get('code') == 0
 
-        # Registrar posición con TODOS los campos
-        self.positions[symbol] = self._build_position(
+        self.positions[symbol] = self._build_pos(
             entry=fill_price, qty=fill_qty,
-            tp1_price=tp1, tp2_price=tp2,
-            sl_price=sl_price, sl_pct=real_sl_pct,
-            atr_val=sig['atr'], score=sig['score'], signal=sig
+            tp1=tp1, tp2=tp2,
+            sl=sl_price, sl_pct=real_sl_pct,
+            atr=sig['atr'], score=sig['score'], sig=sig
         )
         self.positions[symbol]['pos_size'] = pos_size
         self.daily_trades += 1
 
-        patterns = " + ".join(filter(None, [
-            "VCP" if sig.get('vcp') else "",
-            "Flag" if sig.get('flag') else "",
-        ])) or "Momentum"
+        # Guardar métricas Simons
+        self.stats['z_vol_avg'].append(sig['z_vol'])
+        self.stats['ensemble_avg'].append(sig['ensemble'])
 
-        log.info(f"✓ LONG abierto: {symbol} @ ${fill_price:.6f} | SL: {'OK' if sl_ok else '⚠️ MANUAL'}")
+        patterns = "+".join(filter(None, [
+            "Absorción" if sig.get('absorption') else "",
+            "VCP"       if sig.get('vcp')        else "",
+            "Flag"      if sig.get('flag')        else "",
+        ])) or "Momentum_Quant"
 
+        ax_line = ""
+        if sig.get('ax_valid'):
+            ax_line = (f"\n🌊 AlphaX: {sig['ax_bull_tier']}-Tier "
+                       f"({sig['ax_bull_conf']:.0f}%) | "
+                       f"Fresh:{sig['ax_freshness']:.0%} | "
+                       f"WPR:{sig['ax_wpr_fast']:.0f}/{sig['ax_wpr_slow']:.0f}"
+                       + (" | TripleOS🔥" if sig.get('ax_triple_os') else "")
+                       + (" | SQUEEZE⚡" if sig.get('ax_squeeze') else ""))
+
+        log.info(f"✓ LONG {symbol} @ ${fill_price:.6f} | SL:{'OK' if sl_ok else '⚠️'}")
         self._notify(
-            f"<b>🟢 LONG ABIERTO</b> — {symbol}\n\n"
-            f"Score: {int(sig['score'])} | Edge: {sig['edge_ratio']:.1f}× | {patterns}\n"
-            f"Volumen: {sig.get('vol_ratio',1):.1f}× | Funding: {sig['funding_rate']:.3f}%\n\n"
+            f"<b>🟢 LONG ABIERTO — SIMONS QUANT</b>\n\n"
+            f"<b>{symbol}</b> | {patterns}\n\n"
+            f"🔬 Ensemble: {sig['ensemble']:.0f} | Score: {sig['score']:.0f}\n"
+            f"📊 Z-Vol: {sig['z_vol']:.2f} | Z-Price: {sig['z_price']:.2f}\n"
+            f"⚡ Momentum: {sig['mom_score']*100:.2f}% | CVD: {sig['cvd_signal']}"
+            f"{ax_line}\n"
+            f"💱 Funding: {sig['funding_rate']:.3f}% | OI: {sig['oi_change']:+.1f}%\n\n"
             f"📍 Entrada: ${fill_price:.6f}\n"
             f"🎯 TP1: ${tp1:.6f} (+{real_sl_pct * TP1_RR:.2f}%)\n"
             f"🎯 TP2: ${tp2:.6f} (+{real_sl_pct * TP2_RR:.2f}%)\n"
-            f"🛑 SL: ${sl_price:.6f} (-{real_sl_pct:.2f}%)\n\n"
-            f"{'✅ SL en exchange' if sl_ok else '⚠️ SL MANUAL NECESARIO'}"
+            f"🛑 SL: ${sl_price:.6f} (-{real_sl_pct:.2f}%)\n"
+            f"Edge: {sig['edge_ratio']:.1f}× | Regime: {sig['regime']}\n\n"
+            f"{'✅ SL en exchange' if sl_ok else '⚠️ SL MANUAL'}"
         )
         return True
 
     # ── Monitor de posiciones ─────────────────────────────────────────────────
     async def monitor_positions(self):
-        """Revisa cada posición: TP parciales, trailing stops, SL, max hold."""
         for symbol in list(self.positions.keys()):
             try:
                 pos  = self.positions[symbol]
                 tick = self._ticker(symbol)
                 if not tick:
                     continue
-
                 cp = tick['price']
-
-                # Actualizar highest (siempre con .get() como seguro)
                 if cp > pos.get('highest', pos['entry']):
                     pos['highest'] = cp
 
-                # ── Max hold time ──────────────────────────────────────────────
+                # Max hold
                 hold_min = (datetime.now() - pos['opened_at']).total_seconds() / 60
                 if hold_min >= MAX_HOLD_H * 60:
-                    log.info(f"⏰ {symbol}: Max hold {MAX_HOLD_H}h alcanzado")
-                    self._close_full(symbol, cp, "MAX_HOLD_TIME")
+                    log.info(f"⏰ {symbol}: max hold")
+                    self._close_full(symbol, cp, "MAX_HOLD")
                     continue
 
-                # ── TP1 ────────────────────────────────────────────────────────
+                # TP1
                 if not pos['tp1_hit'] and cp >= pos.get('tp1_price', 1e18):
                     self._close_partial(symbol, pos['qty_tp1'], cp, "TP1")
                     pos['tp1_hit']  = True
-                    pos['sl_price'] = pos['entry'] * 1.001  # Breakeven
-                    log.info(f"💰 {symbol} TP1 hit → SL a breakeven")
+                    pos['sl_price'] = pos['entry'] * 1.001
                     continue
 
-                # ── TP2 ────────────────────────────────────────────────────────
+                # TP2
                 if pos['tp1_hit'] and not pos['tp2_hit'] and cp >= pos.get('tp2_price', 1e18):
                     self._close_partial(symbol, pos['qty_tp2'], cp, "TP2")
                     pos['tp2_hit'] = True
-                    sig = pos.get('signal') or {}
+                    sig     = pos.get('signal') or {}
                     atr_val = sig.get('atr', pos['entry'] * 0.005)
-                    trail_dist = atr_val * RUNNER_TRAIL
-                    pos['sl_price'] = max(pos['sl_price'], cp - trail_dist)
-                    log.info(f"💰 {symbol} TP2 hit → SL trail @ ${pos['sl_price']:.6f}")
+                    pos['sl_price'] = max(pos['sl_price'], cp - atr_val * RUNNER_TRAIL)
                     continue
 
-                # ── Runner trailing ────────────────────────────────────────────
+                # Runner trailing
                 if pos['tp2_hit']:
-                    sig = pos.get('signal') or {}
+                    sig     = pos.get('signal') or {}
                     atr_val = sig.get('atr', pos['entry'] * 0.005)
-                    new_sl = cp - atr_val * RUNNER_TRAIL
+                    new_sl  = cp - atr_val * RUNNER_TRAIL
                     if new_sl > pos['sl_price']:
                         pos['sl_price'] = new_sl
 
-                # ── SL ─────────────────────────────────────────────────────────
+                # SL
                 if cp <= pos['sl_price']:
                     self._close_full(symbol, cp, "STOP_LOSS")
 
             except KeyError as e:
-                log.error(f"KeyError {symbol}: {e} | keys={list(self.positions.get(symbol, {}).keys())}\n"
-                          f"{traceback.format_exc()}")
+                log.error(f"KeyError {symbol}: {e}")
                 self.positions.pop(symbol, None)
             except Exception as e:
                 log.error(f"Monitor [{symbol}]: {e}\n{traceback.format_exc()}")
@@ -1015,13 +1505,13 @@ class InstitutionalBot:
         if AUTO_TRADING:
             res = api_request('POST', '/openApi/swap/v2/trade/order', {
                 'symbol': symbol, 'side': 'SELL', 'type': 'MARKET',
-                'quantity': str(qty), 'positionSide': 'LONG',  # CRÍTICO
+                'quantity': str(qty), 'positionSide': 'LONG',
             })
             if res.get('code') != 0:
                 log.error(f"❌ Cierre parcial {symbol}: {res.get('msg')}")
                 return
-        pos  = self.positions[symbol]
-        pnl  = self._calc_pnl(pos['entry'], price, qty, symbol)
+        pos = self.positions[symbol]
+        pnl = self._calc_pnl(pos['entry'], price, qty, symbol)
         pos['pnl_realized'] += pnl
         pos['qty']          -= qty
         self._update_stats_partial(pnl)
@@ -1035,29 +1525,36 @@ class InstitutionalBot:
         pos = self.positions[symbol]
         qty = pos['qty']
         if qty > 0 and AUTO_TRADING:
-            res = api_request('POST', '/openApi/swap/v2/trade/order', {
+            api_request('POST', '/openApi/swap/v2/trade/order', {
                 'symbol': symbol, 'side': 'SELL', 'type': 'MARKET',
-                'quantity': str(qty), 'positionSide': 'LONG',  # CRÍTICO
+                'quantity': str(qty), 'positionSide': 'LONG',
             })
-            if res.get('code') != 0:
-                log.error(f"❌ Cierre total {symbol}: {res.get('msg')}")
-        pnl_final  = self._calc_pnl(pos['entry'], price, qty, symbol)
-        total_pnl  = pos['pnl_realized'] + pnl_final
-        hold_min   = int((datetime.now() - pos['opened_at']).total_seconds() / 60)
+            # Cancel open SL/TP orders to avoid orphan orders on exchange
+            try:
+                open_orders = api_request('GET', '/openApi/swap/v2/trade/openOrders', {'symbol': symbol})
+                for o in open_orders.get('data', {}).get('orders', []):
+                    oid = o.get('orderId')
+                    if oid:
+                        api_request('DELETE', '/openApi/swap/v2/trade/order',
+                                    {'symbol': symbol, 'orderId': str(oid)})
+            except Exception as e:
+                log.warning(f"Cancel orphan orders [{symbol}]: {e}")
+        pnl_final = self._calc_pnl(pos['entry'], price, qty, symbol)
+        total_pnl = pos['pnl_realized'] + pnl_final
+        hold_min  = int((datetime.now() - pos['opened_at']).total_seconds() / 60)
         win = total_pnl > 0
-        # Actualizar stats
         if win:
-            self.stats['wins'] += 1
+            self.stats['wins']        += 1
             self.stats['win_amounts'].append(total_pnl)
             self.losing_streak = 0
         else:
-            self.stats['losses'] += 1
+            self.stats['losses']       += 1
             self.stats['loss_amounts'].append(total_pnl)
-            self.losing_streak += 1
-            self.symbol_cooldown[symbol] = time.time()   # Cooldown en perdedor
+            self.losing_streak        += 1
+            self.symbol_cooldown[symbol] = time.time()
         self.stats['total_pnl'] += pnl_final
         self.stats['hold_times'].append(hold_min)
-        self.daily_pnl += pnl_final
+        self.daily_pnl         += pnl_final
         if total_pnl > self.stats['best_trade']:  self.stats['best_trade']  = total_pnl
         if total_pnl < self.stats['worst_trade']: self.stats['worst_trade'] = total_pnl
         total_t = self.stats['wins'] + self.stats['losses']
@@ -1068,8 +1565,7 @@ class InstitutionalBot:
         self._notify(
             f"<b>{'✅ WIN' if win else '❌ LOSS'}</b> — {reason}\n\n"
             f"<b>{symbol}</b>\n"
-            f"Entrada: ${pos['entry']:.6f} → Salida: ${price:.6f}\n"
-            f"Duración: {hold_min}min\n\n"
+            f"${pos['entry']:.6f} → ${price:.6f} | {hold_min}min\n\n"
             f"<b>PnL: ${total_pnl:+.4f}</b>\n"
             f"WR: {wr:.0f}% ({self.stats['wins']}/{total_t}) | PF: {pf:.2f}\n"
             f"Racha pérdidas: {self.losing_streak}"
@@ -1078,15 +1574,15 @@ class InstitutionalBot:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     def _calc_pnl(self, entry: float, exit_p: float, qty: float, symbol: str = '') -> float:
-        info = self.contracts_info.get(symbol, {})
-        csz  = info.get('contract_size', 1)
+        info     = self.contracts_info.get(symbol, {})
+        csz      = info.get('contract_size', 1)
         notional = qty * entry * csz
         gross    = (exit_p - entry) / entry * notional * LEVERAGE
         fees     = notional * (FEE_TAKER + FEE_MAKER)
         return gross - fees
 
     def _calc_qty(self, symbol: str, price: float, sl_price: float,
-                   pos_size: float = None) -> Optional[float]:
+                  pos_size: float = None) -> Optional[float]:
         if pos_size is None:
             pos_size = POSITION_SIZE
         info      = self.contracts_info.get(symbol, {})
@@ -1105,10 +1601,8 @@ class InstitutionalBot:
 
     def _set_leverage(self, symbol: str, leverage: int):
         for side in ('LONG', 'SHORT'):
-            r = api_request('POST', '/openApi/swap/v2/trade/leverage',
-                            {'symbol': symbol, 'side': side, 'leverage': str(leverage)})
-            if r.get('code') != 0:
-                log.warning(f"⚠️ Leverage {side} {symbol}: {r.get('msg')}")
+            api_request('POST', '/openApi/swap/v2/trade/leverage',
+                        {'symbol': symbol, 'side': side, 'leverage': str(leverage)})
 
     def _confirm_position(self, symbol: str, timeout: int = 15) -> Tuple[Optional[float], Optional[float]]:
         for _ in range(timeout):
@@ -1129,8 +1623,8 @@ class InstitutionalBot:
         if pnl < self.stats['worst_trade']: self.stats['worst_trade'] = pnl
 
     def _profit_factor(self) -> float:
-        gross_win  = sum(self.stats['win_amounts'])  if self.stats['win_amounts']  else 0
-        gross_loss = abs(sum(self.stats['loss_amounts'])) if self.stats['loss_amounts'] else 1
+        gross_win  = sum(self.stats['win_amounts'])            if self.stats['win_amounts']  else 0
+        gross_loss = abs(sum(self.stats['loss_amounts']))      if self.stats['loss_amounts'] else 1
         return round(gross_win / gross_loss, 2)
 
     # ── Circuit Breaker ───────────────────────────────────────────────────────
@@ -1143,33 +1637,29 @@ class InstitutionalBot:
             if self.circuit_active:
                 self.circuit_active = False
                 self.circuit_until  = None
-                log.info("🔓 Circuit Breaker RESET (nuevo día)")
-
+                log.info("🔓 Circuit Breaker RESET")
         if self.circuit_active:
             if self.circuit_until and datetime.utcnow() > self.circuit_until:
                 self.circuit_active = False
                 log.info("🔓 Circuit Breaker OFF")
                 return False
             return True
-
         threshold = self.equity * (CIRCUIT_BREAKER_PCT / 100)
-
         if self.daily_pnl < -threshold:
-            self._activate_circuit(f"Pérdida diaria ${self.daily_pnl:.2f}", hours=6)
+            self._activate_circuit(f"Pérdida ${self.daily_pnl:.2f}", hours=6)
             return True
         if self.losing_streak >= MAX_LOSING_STREAK:
             self._activate_circuit(f"Racha {self.losing_streak} pérdidas", hours=4)
             return True
         if self.daily_trades >= MAX_DAILY_TRADES:
-            log.warning(f"⚠️ Máximo de trades diarios: {self.daily_trades}/{MAX_DAILY_TRADES}")
+            log.warning(f"⚠️ Max trades: {self.daily_trades}/{MAX_DAILY_TRADES}")
             return True
-
         return False
 
     def _activate_circuit(self, reason: str, hours: int):
         self.circuit_active = True
         self.circuit_until  = datetime.utcnow() + timedelta(hours=hours)
-        log.warning(f"🔒 CIRCUIT BREAKER — {reason} | Pausa: {hours}h")
+        log.warning(f"🔒 CIRCUIT BREAKER — {reason} | {hours}h")
         self._notify(f"<b>🔒 CIRCUIT BREAKER</b>\n{reason}\nPausa: {hours}h")
 
     # ── Telegram ──────────────────────────────────────────────────────────────
@@ -1187,7 +1677,7 @@ class InstitutionalBot:
 
     # ── Loop principal ────────────────────────────────────────────────────────
     async def run(self):
-        log.info("🚀 Bot v4.0 corriendo...\n")
+        log.info("🚀 SuperBot v5.0 Simons Quant — Corriendo...\n")
         iteration          = 0
         last_sym_refresh   = 0
         last_equity_update = 0
@@ -1197,12 +1687,10 @@ class InstitutionalBot:
             try:
                 iteration += 1
 
-                # Refresh de símbolos cada 10 minutos
                 if time.time() - last_sym_refresh > 600:
                     self._refresh_symbols()
                     last_sym_refresh = time.time()
 
-                # Actualizar equity cada 30 minutos
                 if AUTO_TRADING and time.time() - last_equity_update > 1800:
                     data = api_request('GET', '/openApi/swap/v2/user/balance')
                     if data.get('code') == 0:
@@ -1211,46 +1699,43 @@ class InstitutionalBot:
                             self.equity = eq
                     last_equity_update = time.time()
 
-                # Circuit breaker
                 if self._circuit_breaker():
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
 
-                # Stats
                 total = self.stats['wins'] + self.stats['losses']
                 wr    = (self.stats['wins'] / total * 100) if total > 0 else 0
                 pf    = self._profit_factor()
                 avg_h = (sum(self.stats['hold_times']) / len(self.stats['hold_times'])
                          if self.stats['hold_times'] else 0)
+                avg_z = (sum(self.stats['z_vol_avg'][-20:]) / len(self.stats['z_vol_avg'][-20:])
+                         if self.stats['z_vol_avg'] else 0)
+                avg_e = (sum(self.stats['ensemble_avg'][-20:]) / len(self.stats['ensemble_avg'][-20:])
+                         if self.stats['ensemble_avg'] else 0)
 
                 log.info(f"\n{'='*70}")
-                log.info(f"  #{iteration} {datetime.now().strftime('%d/%m %H:%M:%S')} UTC | "
+                log.info(f"  #{iteration} {datetime.now().strftime('%d/%m %H:%M:%S')} | "
                          f"Pos: {len(self.positions)}/{MAX_POSITIONS}")
-                log.info(f"  PnL total: ${self.stats['total_pnl']:+.4f} | "
-                         f"Hoy: ${self.daily_pnl:+.4f} | "
+                log.info(f"  PnL: ${self.stats['total_pnl']:+.4f} | Hoy: ${self.daily_pnl:+.4f} | "
                          f"WR: {wr:.0f}% ({total}T) | PF: {pf:.2f}")
-                log.info(f"  Equity: ${self.equity:.2f} | Trades hoy: {self.daily_trades}/"
-                         f"{MAX_DAILY_TRADES} | Avg hold: {avg_h:.0f}min")
+                log.info(f"  Equity: ${self.equity:.2f} | Avg-Hold: {avg_h:.0f}min | "
+                         f"Avg-ZVol: {avg_z:.2f} | Avg-Ensemble: {avg_e:.0f}")
                 log.info(f"{'='*70}\n")
 
-                # Monitorear posiciones abiertas
                 await self.monitor_positions()
 
-                # Informe por Telegram cada hora
                 if time.time() - last_report > 3600:
                     self._notify(
-                        f"<b>📊 Reporte horario</b>\n\n"
-                        f"PnL total: ${self.stats['total_pnl']:+.4f}\n"
-                        f"Hoy: ${self.daily_pnl:+.4f}\n"
-                        f"WR: {wr:.0f}% ({total} trades)\n"
-                        f"PF: {pf:.2f} | Avg hold: {avg_h:.0f}min\n"
-                        f"Posiciones: {len(self.positions)}/{MAX_POSITIONS}"
+                        f"<b>📊 Reporte Horario — SuperBot v5</b>\n\n"
+                        f"PnL: ${self.stats['total_pnl']:+.4f} | Hoy: ${self.daily_pnl:+.4f}\n"
+                        f"WR: {wr:.0f}% ({total}T) | PF: {pf:.2f}\n"
+                        f"Avg Hold: {avg_h:.0f}min | Avg Z-Vol: {avg_z:.2f}\n"
+                        f"Pos: {len(self.positions)}/{MAX_POSITIONS}"
                     )
                     last_report = time.time()
 
-                # Escanear nuevas señales
                 if len(self.positions) < MAX_POSITIONS and self.daily_trades < MAX_DAILY_TRADES:
-                    log.info(f"Escaneando {len(self.symbols)} símbolos...")
+                    log.info(f"🔬 Escaneando {len(self.symbols)} símbolos [Simons Quant]...")
                     found = 0
                     for symbol in self.symbols:
                         if len(self.positions) >= MAX_POSITIONS:
@@ -1261,12 +1746,24 @@ class InstitutionalBot:
                         if sig:
                             found += 1
                             patterns = "+".join(filter(None, [
-                                "VCP"  if sig.get('vcp')  else "",
-                                "Flag" if sig.get('flag') else "",
-                            ])) or "Momentum"
-                            log.info(f"💡 {symbol} | Score:{int(sig['score'])} | "
-                                     f"Edge:{sig['edge_ratio']:.1f}× | {patterns} | "
-                                     f"Regime:{sig['regime']}")
+                                "Absorción" if sig.get('absorption') else "",
+                                "VCP"       if sig.get('vcp')        else "",
+                                "Flag"      if sig.get('flag')        else "",
+                            ])) or "Quant"
+                            ax_info = ""
+                            if sig.get('ax_valid'):
+                                ax_info = (f" | AX:{sig['ax_bull_tier']}"
+                                           f"({sig['ax_bull_conf']:.0f}%)"
+                                           f" Fresh:{sig['ax_freshness']:.0%}"
+                                           f" WPR:{sig['ax_wpr_fast']:.0f}"
+                                           + (" 🌊TOS" if sig.get('ax_triple_os') else "")
+                                           + (" 🔧SQZ" if sig.get('ax_squeeze') else ""))
+                            log.info(
+                                f"💡 {symbol} | "
+                                f"Score:{sig['score']:.0f} | Ensemble:{sig['ensemble']:.0f} | "
+                                f"ZVol:{sig['z_vol']:.2f} | {patterns} | {sig['regime']}"
+                                f"{ax_info}"
+                            )
                             if self.open_position(sig):
                                 await asyncio.sleep(3)
                     log.info(f"✓ Escaneo completo | Señales: {found}")
@@ -1274,23 +1771,9 @@ class InstitutionalBot:
                 await asyncio.sleep(SCAN_INTERVAL)
 
             except KeyboardInterrupt:
-                log.info("\n⏹️  Bot detenido por usuario")
-                self._notify("<b>⏹️ BOT DETENIDO</b>\nApagado manual")
+                log.info("\n⏹️  Bot detenido")
+                self._notify("<b>⏹️ SUPERBOT DETENIDO</b>")
                 break
             except Exception as e:
-                log.error(f"❌ Error en main loop: {e}\n{traceback.format_exc()}")
+                log.error(f"❌ Main loop: {e}\n{traceback.format_exc()}")
                 await asyncio.sleep(30)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def main():
-    bot = InstitutionalBot()
-    await bot.run()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("👋 Bot v4.0 terminado")
