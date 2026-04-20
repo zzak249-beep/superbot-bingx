@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""
-Punto de entrada principal para Railway
-Ejecuta bot_v2.py (versión con todos los filtros)
-"""
+import asyncio
+from bot_v2 import TradingBotV2
 
 if __name__ == "__main__":
-    import bot_v2
+    bot = TradingBotV2()
+    asyncio.run(bot.run())
