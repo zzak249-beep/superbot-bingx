@@ -1,27 +1,34 @@
 # ⚡ SOLUCIÓN RÁPIDA - 3 PASOS
 
-## El problema
+## El problema original
 Tu bot falló en Railway con error: `COPY src/ /src/`  
 **Causa:** El Dockerfile espera archivos en carpeta `src/` pero están en la raíz.
 
+## ⚠️ NUEVO: Error "can't open file main.py"
+Si después del fix ves este error, es porque Railway busca `main.py` por defecto.  
+**Solución:** Sube también el archivo `main.py` que te he generado.
+
 ---
 
-## ✅ SOLUCIÓN (5 minutos)
+## ✅ SOLUCIÓN COMPLETA (5 minutos)
 
-### 📝 Paso 1: Reemplaza tu Dockerfile
+### 📝 Paso 1: Sube estos archivos a tu repo
 
-Sube el archivo **`Dockerfile`** que te he generado a tu repositorio (reemplaza el actual).
+**ARCHIVOS OBLIGATORIOS:**
+- ✅ `Dockerfile` (corregido)
+- ✅ `main.py` (nuevo - punto de entrada para Railway)
 
-Este archivo ya está corregido para:
-- ✅ Copiar archivos desde la raíz (donde realmente están)
-- ✅ Ejecutar `bot_v2.py` (versión con todos los filtros avanzados)
-- ✅ Crear carpeta de logs automáticamente
+**ARCHIVOS OPCIONALES (recomendados):**
+- `Procfile` (alternativa al main.py)
+- `.env.example` (template de configuración)
+- `.gitignore` (seguridad)
 
 ### 🔄 Paso 2: Push a GitHub
 
 ```bash
-git add Dockerfile
-git commit -m "fix: corregir error COPY src/"
+# Añade los archivos nuevos
+git add Dockerfile main.py Procfile
+git commit -m "fix: corregir Railway - agregar main.py"
 git push
 ```
 
@@ -89,6 +96,9 @@ Tu bot ahora ejecutará `bot_v2.py` que tiene:
 ---
 
 ## 🆘 ¿Problemas después de arreglar?
+
+**Error: "can't open file '/app/main.py'"**  
+→ Sube el archivo `main.py` que te generé (es el punto de entrada)
 
 **"Module not found"**  
 → Verifica que `requirements.txt` está en la raíz del repo
