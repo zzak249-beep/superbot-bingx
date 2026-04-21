@@ -19,22 +19,25 @@ from reward_scheme import PBR
 
 log = logging.getLogger("TRADE_MGR")
 
-STATE_FILE   = Path("logs/open_trades.json")
-
-LEVERAGE     = int(os.getenv("LEVERAGE",         "5"))
-RISK_PCT     = float(os.getenv("RISK_PCT",        "0.01"))   # 1% del balance por trade
-TP_MULT      = float(os.getenv("TP_MULT",         "2.0"))    # TP = señal_mean * TP_MULT
-SL_MULT      = float(os.getenv("SL_MULT",         "1.0"))    # SL = |worst_pnl| * SL_MULT
-MAX_TRADES   = int(os.getenv("MAX_OPEN_TRADES",   "5"))
-MAX_HOLD_H   = int(os.getenv("MAX_HOLD_HOURS",    "48"))
-MIN_NOTIONAL = float(os.getenv("MIN_NOTIONAL",    "10"))     # USDT mínimo por orden
+STATE_FILE = Path("logs/open_trades.json")
 
 
 class TradeManager:
-    def __init__(self, client: BingXClient):
+    def __init__(self, client: BingXClient, config=None):
         self.client = client
+        self.config = config  # BotConfig instance (optional for backwards compatibility)
         self.trades: dict[str, dict] = self._load_state()
         self.pbr:   dict[str, PBR]  = {}   # un PBR por símbolo abierto
+        
+        # Usar valores de config si está disponible, sino usar env vars
+        self._leverage = config.LEVERAGE if config else int(os.getenv("LEVERAGE", "5"))
+        self._risk_pct = config.RISK_PCT if config else float(os.getenv("RISK_PCT", "0.01"))
+        self._tp_mult = config.TP_MULT if config else float(os.getenv("TP_MULT", "2.0"))
+        self._sl_mult = config.SL_MULT if config else float(os.getenv("SL_MULT", "1.0"))
+        self._max_trades = config.MAX_OPEN_TRADES if config else int(os.getenv("MAX_OPEN_TRADES", "5"))
+        self._max_hold_h = config.MAX_HOLD_HOURS if config else int(os.getenv("MAX_HOLD_HOURS", "48"))
+        self._min_notional = config.MIN_TRADE_USDT if config else float(os.getenv("MIN_NOTIONAL", "10"))
+        self._dry_run = config.DRY_RUN if config else os.getenv("DRY_RUN", "true").lower() == "true"
 
     # ------------------------------------------------------------------ #
     def _load_state(self) -> dict:
@@ -57,8 +60,8 @@ class TradeManager:
             log.debug(f"  Ya hay trade abierto en {sym}, saltando")
             return False
 
-        if len(self.trades) >= MAX_TRADES:
-            log.info(f"  Máximo de trades abiertos ({MAX_TRADES}) alcanzado")
+        if len(self.trades) >= self._max_trades:
+            log.info(f"  Máximo de trades abiertos ({self._max_trades}) alcanzado")
             return False
 
         direction = signal["direction"]
@@ -72,30 +75,55 @@ class TradeManager:
             log.error("Balance 0, no se puede operar")
             return False
 
-        risk_usdt = balance * RISK_PCT * LEVERAGE
+        risk_usdt = balance * self._risk_pct * self._leverage
         quantity  = round(risk_usdt / price, 6)
         notional  = quantity * price
 
-        if notional < MIN_NOTIONAL:
-            log.info(f"  {sym}: notional {notional:.2f} USDT < mínimo {MIN_NOTIONAL}, saltando")
+        if notional < self._min_notional:
+            log.info(f"  {sym}: notional {notional:.2f} USDT < mínimo {self._min_notional}, saltando")
             return False
 
         # --- TP / SL ---
         if direction == "LONG":
-            tp_price = round(price * (1 + abs(mean_pnl) * TP_MULT), 6)
-            sl_price = round(price * (1 - abs(worst_pnl) * SL_MULT), 6)
+            tp_price = round(price * (1 + abs(mean_pnl) * self._tp_mult), 6)
+            sl_price = round(price * (1 - abs(worst_pnl) * self._sl_mult), 6)
             side, pos_side = "BUY", "LONG"
         else:
-            tp_price = round(price * (1 - abs(mean_pnl) * TP_MULT), 6)
-            sl_price = round(price * (1 + abs(worst_pnl) * SL_MULT), 6)
+            tp_price = round(price * (1 - abs(mean_pnl) * self._tp_mult), 6)
+            sl_price = round(price * (1 + abs(worst_pnl) * self._sl_mult), 6)
             side, pos_side = "SELL", "SHORT"
 
-        log.info(f"  📈  Abriendo {direction} {sym}  qty={quantity}  "
+        log.info(f"  📈  {'[DRY RUN] ' if self._dry_run else ''}Abriendo {direction} {sym}  qty={quantity}  "
                  f"entry={price}  TP={tp_price}  SL={sl_price}  notional={notional:.2f}$")
+
+        # Si está en DRY_RUN, simular el trade sin ejecutarlo
+        if self._dry_run:
+            log.info(f"  ✅  [DRY RUN] Trade simulado (no ejecutado en exchange)")
+            self.trades[sym] = {
+                "symbol":     sym,
+                "direction":  direction,
+                "entry":      price,
+                "quantity":   quantity,
+                "tp":         tp_price,
+                "sl":         sl_price,
+                "order_id":   "DRY_RUN_" + str(int(datetime.utcnow().timestamp())),
+                "opened_at":  datetime.utcnow().isoformat(),
+                "signal":     {k: v for k, v in signal.items() if k != "projections"},
+                "dry_run":    True,
+            }
+            self._save_state()
+            
+            # Inicializar PBR
+            pbr = PBR()
+            pbr.on_action(1 if direction == "LONG" else 0)
+            pbr.feed_price(price)
+            self.pbr[sym] = pbr
+            
+            return True
 
         try:
             # Fijar apalancamiento
-            await self.client.set_leverage(sym, LEVERAGE, pos_side)
+            await self.client.set_leverage(sym, self._leverage, pos_side)
             await asyncio.sleep(0.3)
 
             resp = await self.client.place_order(
@@ -123,6 +151,7 @@ class TradeManager:
                 "order_id":   order_id,
                 "opened_at":  datetime.utcnow().isoformat(),
                 "signal":     {k: v for k, v in signal.items() if k != "projections"},
+                "dry_run":    False,
             }
             self._save_state()
 
@@ -145,6 +174,31 @@ class TradeManager:
         if not self.trades:
             return
 
+        # En modo DRY_RUN, simular monitoreo sin consultar exchange
+        if self._dry_run:
+            to_close = []
+            for sym, trade in list(self.trades.items()):
+                opened_at = datetime.fromisoformat(trade["opened_at"])
+                age_h     = (datetime.utcnow() - opened_at).total_seconds() / 3600
+                
+                # Cerrar por tiempo máximo en DRY_RUN
+                if age_h >= self._max_hold_h:
+                    log.info(f"  ⏰  [DRY RUN] {sym}: tiempo máximo alcanzado")
+                    to_close.append(sym)
+            
+            for sym in to_close:
+                if sym in self.pbr:
+                    summary = self.pbr[sym].summary()
+                    log.info(f"  🏆  [DRY RUN] {sym} PBR final: cumulative={summary['cumulative_reward']:.6f}")
+                    self.pbr[sym].reset()
+                    del self.pbr[sym]
+                self.trades.pop(sym, None)
+            
+            if to_close:
+                self._save_state()
+            return
+
+        # Modo REAL - consultar exchange
         positions = await self.client.get_positions()
         pos_map   = {p["symbol"]: p for p in positions if float(p.get("positionAmt", 0)) != 0}
 
@@ -175,7 +229,7 @@ class TradeManager:
                 log.info(f"  📊  {sym}  unrealizedPnL={pnl:.4f} USDT  age={age_h:.1f}h")
 
             # Cierre por tiempo máximo
-            if age_h >= MAX_HOLD_H:
+            if age_h >= self._max_hold_h:
                 log.info(f"  ⏰  {sym}: tiempo máximo alcanzado, cerrando")
                 qty = abs(float(pos.get("positionAmt", trade["quantity"])))
                 await self.client.close_position(sym, trade["direction"], qty)
