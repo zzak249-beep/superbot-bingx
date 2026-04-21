@@ -1,0 +1,12 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python bot.py"
+healthcheckPath = "/"
+healthcheckTimeout = 30
+restartPolicyType = "always"
+
+[[services]]
+name = "bingx-signal-bot"
