@@ -1,16 +1,13 @@
 """
 Bot v2 — Orquestador Principal con todas las mejoras
 ─────────────────────────────────────────────────────
-Flujo por señal:
-  1. Scanner detecta moneda explosiva
-  2. Correlation filter (no abrir pares correlacionados)
-  3. Funding + OI filter (no entrar contra el funding)
-  4. MTF confluence (1h + 4h alineados)
-  5. Signal engine v2 (ADX/ATR/RSI + score ≥ MIN_SCORE)
-  6. Dynamic leverage (ATR% → ajusta apalancamiento)
-  7. Smart limit order (entrada en retroceso)
-  8. Trailing stop + gestión dinámica
-  9. Telegram alert en cada evento
+FIXES v2.1:
+  - Logging diagnóstico en cada etapa del filtrado
+  - _last_scan_time inicia en datetime.min (fuerza scan al arrancar)  ← ya estaba
+  - Log explícito cuando scan_cache está vacío
+  - Log de cuántos candidatos pasan cada filtro
+  - Timeout en funding/mtf para no bloquear el loop
+  - Fallback si balance_data tiene estructura inesperada
 """
 
 import asyncio
@@ -33,7 +30,7 @@ logger.add(
     "logs/botv2_{time:YYYY-MM-DD}.log",
     rotation="00:00",
     retention="30 days",
-    level="INFO",
+    level="DEBUG",          # ← DEBUG para ver todo durante diagnóstico
     format="{time:HH:mm:ss} | {level:<8} | {message}",
 )
 
@@ -43,7 +40,6 @@ class TradingBotV2:
     def __init__(self):
         cfg.validate()
 
-        # ── Core ──────────────────────────────────────────────────────────
         self.client = BingXClient(
             api_key=cfg.BINGX_API_KEY,
             secret_key=cfg.BINGX_SECRET_KEY,
@@ -80,7 +76,6 @@ class TradingBotV2:
             leverage=cfg.LEVERAGE,
         )
 
-        # ── New v2 modules ────────────────────────────────────────────────
         self.funding_filter = FundingOIFilter(
             funding_long_block  = float(getattr(cfg, "FUNDING_BLOCK", 0.0005)),
             funding_short_block = float(getattr(cfg, "FUNDING_BLOCK_SHORT", -0.0005)),
@@ -92,8 +87,8 @@ class TradingBotV2:
             check_4h       = getattr(cfg, "MTF_CHECK_4H", True),
         )
         self.smart_order = SmartOrderManager(
-            atr_offset       = float(getattr(cfg, "LIMIT_ATR_OFFSET", 0.3)),
-            max_wait_seconds = int(getattr(cfg, "LIMIT_WAIT_SECONDS", 45)),
+            atr_offset          = float(getattr(cfg, "LIMIT_ATR_OFFSET", 0.3)),
+            max_wait_seconds    = int(getattr(cfg, "LIMIT_WAIT_SECONDS", 45)),
             use_market_fallback = True,
         )
         self.corr_filter = CorrelationFilter(
@@ -101,21 +96,14 @@ class TradingBotV2:
         )
         self.notifier = TelegramNotifier()
 
-        # ── State ─────────────────────────────────────────────────────────
         self._scan_cache:     list[CoinScore] = []
         self._last_scan_time: datetime        = datetime.min
         self._loop_count:     int             = 0
-        self._blocked_log:    dict            = {}  # symbol → último bloqueo
+        self._blocked_log:    dict            = {}
 
     # ─── Helpers ───────────────────────────────────────────────────────────
 
     def _calc_dynamic_leverage(self, atr_pct: float) -> int:
-        """
-        Reduce apalancamiento automáticamente cuando la volatilidad es alta.
-        ATR% < 1%  → leverage máximo
-        ATR% 1-2%  → leverage medio
-        ATR% > 3%  → leverage mínimo (evitar liquidación)
-        """
         base = cfg.LEVERAGE
         if atr_pct < 1.0:
             return base
@@ -124,23 +112,10 @@ class TradingBotV2:
         elif atr_pct < 3.0:
             return max(2, base - 3)
         else:
-            return 2  # mercado muy volátil → mínimo
-
-    def _is_good_session(self) -> bool:
-        """
-        Preferir horas con mayor liquidez: EU (07-17 UTC) y US (13-22 UTC).
-        Reducir actividad en sesión asiática lenta (00-07 UTC).
-        """
-        if not getattr(cfg, "SESSION_FILTER", False):
-            return True
-        h = datetime.utcnow().hour
-        # Asia solo: baja liquidez → ser más exigente (MIN_SCORE + 10)
-        return True  # por defecto siempre operar; score se ajusta abajo
+            return 2
 
     def _effective_min_score(self) -> float:
-        """Score mínimo ajustado por sesión"""
         h = datetime.utcnow().hour
-        # Sesión Asia pura (01-07 UTC) → subir umbral
         if 1 <= h <= 7 and getattr(cfg, "SESSION_FILTER", False):
             return cfg.MIN_SCORE + 10
         return cfg.MIN_SCORE
@@ -150,19 +125,48 @@ class TradingBotV2:
     async def _refresh_scan_if_needed(self):
         now = datetime.now()
         minutes_since = (now - self._last_scan_time).total_seconds() / 60
-        if minutes_since >= cfg.SCAN_INTERVAL_MIN:
+        needs_scan = minutes_since >= cfg.SCAN_INTERVAL_MIN
+
+        logger.debug(
+            f"Scan check: {minutes_since:.1f}min desde último scan "
+            f"(intervalo={cfg.SCAN_INTERVAL_MIN}min) → {'EJECUTANDO' if needs_scan else 'skip'}"
+        )
+
+        if needs_scan:
+            logger.info("🔍 Ejecutando scan de mercado...")
             self._scan_cache = await self.scanner.scan()
             self._last_scan_time = now
+
+            if not self._scan_cache:
+                logger.warning(
+                    "⚠️  Scanner devolvió 0 candidatos. Verifica: "
+                    f"MIN_VOLUME_24H={cfg.MIN_VOLUME_24H}, "
+                    f"VOL_SPIKE_MIN={cfg.VOL_SPIKE_MIN}, "
+                    f"MIN_CHANGE_ABS={cfg.MIN_CHANGE_ABS}"
+                )
+            else:
+                logger.info(
+                    f"✅ Scanner encontró {len(self._scan_cache)} candidatos: "
+                    + ", ".join(c.symbol for c in self._scan_cache[:10])
+                )
 
     # ─── Main entry logic ──────────────────────────────────────────────────
 
     async def _try_open_trade(self, coin: CoinScore):
         symbol = coin.symbol
-        side_name = ""
 
         # ── Fetch candles ─────────────────────────────────────────────────
-        klines = await self.client.get_klines(symbol, cfg.TRADE_INTERVAL, cfg.CANDLES)
+        try:
+            klines = await asyncio.wait_for(
+                self.client.get_klines(symbol, cfg.TRADE_INTERVAL, cfg.CANDLES),
+                timeout=15,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"  ⏱ Timeout obteniendo klines para {symbol}")
+            return
+
         if not klines or len(klines) < 210:
+            logger.debug(f"  {symbol}: klines insuficientes ({len(klines) if klines else 0})")
             return
 
         opens   = np.array([float(k[1]) for k in klines])
@@ -174,19 +178,26 @@ class TradingBotV2:
         # ── Signal Engine ─────────────────────────────────────────────────
         result = self.engine.analyze(opens, highs, lows, closes, volumes)
         if result.signal == SignalType.NONE:
+            logger.debug(f"  {symbol}: sin señal del motor")
             return
 
         side_name = result.signal.value
         min_score = self._effective_min_score()
 
-        # ── Risk pre-check ────────────────────────────────────────────────
-        ok, reason = self.risk.can_open_trade(symbol, side_name, result.score)
-        if not ok:
-            return
+        logger.info(
+            f"  📈 {symbol}: señal {side_name} | score={result.score} "
+            f"(mín={min_score}) | ADX={result.adx:.1f} | RSI={result.rsi:.1f}"
+        )
 
         # ── Score filter ──────────────────────────────────────────────────
         if result.score < min_score:
-            logger.debug(f"  ⏭  {symbol}: score {result.score} < {min_score}")
+            logger.info(f"  ⏭  {symbol}: score {result.score} < mín {min_score} → descartado")
+            return
+
+        # ── Risk pre-check ────────────────────────────────────────────────
+        ok, reason = self.risk.can_open_trade(symbol, side_name, result.score)
+        if not ok:
+            logger.info(f"  🚫 {symbol}: risk check falló → {reason}")
             return
 
         logger.info(f"\n{'─'*50}")
@@ -205,9 +216,17 @@ class TradingBotV2:
         # ── Filter 2: Funding + OI ────────────────────────────────────────
         cur_price  = float(closes[-1])
         prev_price = float(closes[-2])
-        funding_result = await self.funding_filter.analyze(
-            self.client, symbol, cur_price, prev_price
-        )
+        try:
+            funding_result = await asyncio.wait_for(
+                self.funding_filter.analyze(self.client, symbol, cur_price, prev_price),
+                timeout=10,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"  ⏱ {symbol}: timeout en funding filter, continuando sin él")
+            # Crear resultado neutro para no bloquear por timeout
+            from funding_oi import FundingOIResult  # import local para evitar circular
+            funding_result = FundingOIResult(funding_pct=0.0, oi_trend="neutral")
+
         fund_ok, fund_reason = self.funding_filter.passes(funding_result, side_name)
         if not fund_ok:
             logger.info(f"  💸 Funding bloqueado: {fund_reason}")
@@ -215,35 +234,67 @@ class TradingBotV2:
             return
 
         # ── Filter 3: MTF confluence ──────────────────────────────────────
-        mtf_result = await self.mtf.analyze(self.client, symbol, side_name, closes)
+        try:
+            mtf_result = await asyncio.wait_for(
+                self.mtf.analyze(self.client, symbol, side_name, closes),
+                timeout=15,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"  ⏱ {symbol}: timeout en MTF filter, continuando sin él")
+            # Aprobar MTF si hay timeout para no bloquear innecesariamente
+            class _FakeMTF:
+                confluence_score = 0.0
+                long_confirmed   = True
+                short_confirmed  = True
+                reason           = "timeout (aprobado por fallback)"
+            mtf_result = _FakeMTF()
+
         confluence = mtf_result.confluence_score
+        logger.info(f"  📊 MTF confluence: {confluence:+.0f} | {mtf_result.reason}")
+
         if side_name == "LONG"  and not mtf_result.long_confirmed:
-            logger.info(f"  📊 MTF en contra: {mtf_result.reason}")
+            logger.info(f"  📊 MTF bloqueó LONG: {mtf_result.reason}")
             await self.notifier.signal_blocked(symbol, side_name, f"MTF: {mtf_result.reason}")
             return
         if side_name == "SHORT" and not mtf_result.short_confirmed:
-            logger.info(f"  📊 MTF en contra: {mtf_result.reason}")
+            logger.info(f"  📊 MTF bloqueó SHORT: {mtf_result.reason}")
             await self.notifier.signal_blocked(symbol, side_name, f"MTF: {mtf_result.reason}")
             return
 
         # ── Dynamic leverage ──────────────────────────────────────────────
-        atr_pct   = result.atr / cur_price * 100
-        lev       = self._calc_dynamic_leverage(atr_pct)
+        atr_pct = result.atr / cur_price * 100
+        lev     = self._calc_dynamic_leverage(atr_pct)
         if lev != cfg.LEVERAGE:
             logger.info(f"  ⚡ Leverage dinámico: {cfg.LEVERAGE}x → {lev}x (ATR {atr_pct:.2f}%)")
 
         # ── Balance & size ────────────────────────────────────────────────
-        balance_data = await self.client.get_balance()
-        balance = float(
-            balance_data.get("availableMargin", 0) or
-            balance_data.get("equity", 0) or 0
-        )
+        try:
+            balance_data = await asyncio.wait_for(self.client.get_balance(), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning(f"  ⏱ Timeout obteniendo balance para {symbol}")
+            return
+
+        # FIX: probar múltiples campos posibles en la respuesta de BingX
+        balance = 0.0
+        for field in ("availableMargin", "equity", "availableBalance", "balance"):
+            val = balance_data.get(field)
+            if val is not None:
+                try:
+                    balance = float(val)
+                    if balance > 0:
+                        break
+                except (ValueError, TypeError):
+                    continue
+
+        logger.info(f"  💰 Balance disponible: {balance:.2f} USDT")
+
         if balance <= 5:
-            logger.warning(f"Balance insuficiente: {balance} USDT")
+            logger.warning(f"  ⚠️  Balance insuficiente: {balance:.2f} USDT (mín 5)")
             return
 
         qty = self.risk.calc_position_size(balance, cur_price, result.projected_sl, symbol)
         if qty <= 0:
+            logger.warning(f"  ⚠️  Qty calculada = 0 para {symbol} | balance={balance} price={cur_price}")
             return
 
         # ── Log del setup completo ────────────────────────────────────────
@@ -259,7 +310,6 @@ class TradingBotV2:
             f"{'═'*55}"
         )
 
-        # Proyección estadística
         if result.projection:
             last_bar = max(result.projection.keys())
             proj = result.projection[last_bar]
@@ -299,7 +349,6 @@ class TradingBotV2:
             f"fill: {fill_price:.6f} | espera: {order_result.wait_seconds:.1f}s"
         )
 
-        # ── Register + Notify ─────────────────────────────────────────────
         self.risk.register_position(PositionInfo(
             symbol=symbol,
             side=side_name,
@@ -377,10 +426,13 @@ class TradingBotV2:
 
     async def run(self):
         logger.info("=" * 60)
-        logger.info("🤖 BingX Signal Projection Bot v2")
+        logger.info("🤖 BingX Signal Projection Bot v2.1")
         logger.info(f"   Modo: {'⚠️  DEMO' if cfg.DEMO_MODE else '🔴 REAL'}")
         logger.info(f"   Filtros: Funding+OI | MTF | Correlación | Sesión")
         logger.info(f"   Entradas: Smart Limit | Dynamic Leverage | Telegram")
+        logger.info(f"   Config: MIN_SCORE={cfg.MIN_SCORE} | LEVERAGE={cfg.LEVERAGE}x")
+        logger.info(f"           SCAN_INTERVAL={cfg.SCAN_INTERVAL_MIN}min | LOOP_SLEEP={cfg.LOOP_SLEEP_SECONDS}s")
+        logger.info(f"           MAX_COINS_SCAN={cfg.MAX_COINS_SCAN} | MIN_VOLUME={cfg.MIN_VOLUME_24H}")
         logger.info("=" * 60)
 
         await self.notifier.startup(cfg.DEMO_MODE)
@@ -402,12 +454,26 @@ class TradingBotV2:
                 await self._refresh_scan_if_needed()
 
                 # 3. Nuevas entradas
-                if self._scan_cache:
-                    logger.info(f"📡 {len(self._scan_cache)} candidatos | {len(self.risk.open_positions)} posiciones abiertas")
-                    for coin in self._scan_cache:
-                        if coin.symbol not in self.risk.open_positions:
-                            await self._try_open_trade(coin)
-                            await asyncio.sleep(0.5)
+                if not self._scan_cache:
+                    logger.info("📭 Sin candidatos en cache — esperando próximo scan")
+                else:
+                    open_count = len(self.risk.open_positions)
+                    max_pos    = cfg.MAX_OPEN_POSITIONS
+                    logger.info(
+                        f"📡 {len(self._scan_cache)} candidatos | "
+                        f"{open_count}/{max_pos} posiciones abiertas"
+                    )
+
+                    if open_count >= max_pos:
+                        logger.info(f"  ⚠️  Máximo de posiciones alcanzado ({max_pos})")
+                    else:
+                        processed = 0
+                        for coin in self._scan_cache:
+                            if coin.symbol not in self.risk.open_positions:
+                                await self._try_open_trade(coin)
+                                processed += 1
+                                await asyncio.sleep(0.5)
+                        logger.info(f"  → {processed} candidatos procesados")
 
                 logger.info(f"💤 {cfg.LOOP_SLEEP_SECONDS}s...")
                 await asyncio.sleep(cfg.LOOP_SLEEP_SECONDS)
