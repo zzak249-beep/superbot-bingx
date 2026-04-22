@@ -1,0 +1,193 @@
+# ================================================================
+# VARIABLES DE ENTORNO PARA BINGX TRADING BOT V5
+# ================================================================
+# Bot con Order Book Analysis, CVD, BB Squeeze, MTF
+# ================================================================
+
+# ================================================================
+# 1. CREDENCIALES (REQUERIDAS) ❗
+# ================================================================
+BINGX_API_KEY=tu_api_key_aqui
+BINGX_API_SECRET=tu_api_secret_aqui
+
+# ================================================================
+# 2. TELEGRAM (Opcional - para notificaciones)
+# ================================================================
+# Para obtener:
+# 1. Crea un bot con @BotFather en Telegram
+# 2. Obtén el token
+# 3. Envía un mensaje al bot
+# 4. Ve a: https://api.telegram.org/bot<TOKEN>/getUpdates
+# 5. Copia el chat_id
+
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+# ================================================================
+# 3. MODO DE OPERACIÓN (CRÍTICO) ⚠️
+# ================================================================
+# DRY_RUN = true  → Simulación (NO ejecuta trades reales) ✅
+# DRY_RUN = false → Trading real ⚠️
+DRY_RUN=true
+
+# Trading automático (false = solo alertas)
+AUTO_TRADING_ENABLED=true
+
+# ================================================================
+# 4. CONFIGURACIÓN BÁSICA
+# ================================================================
+PORT=8080
+SCAN_INTERVAL_SEC=60
+
+# Timeframe principal
+KLINE_INTERVAL=1h
+
+# ================================================================
+# 5. SCANNER DE MERCADO
+# ================================================================
+# Máximo de símbolos a analizar
+TOP_SYMBOLS=30
+
+# Volumen mínimo 24h en USDT
+MIN_VOLUME_USDT=500000
+
+# Score mínimo para generar señal (0-100)
+# 40 = muchas señales, 60 = señales de calidad, 70 = solo las mejores
+MIN_SIGNAL_SCORE=40
+
+# ================================================================
+# 6. INDICADORES TÉCNICOS
+# ================================================================
+# EMAs
+MA_FAST=9
+MA_SLOW=21
+
+# RSI
+RSI_PERIOD=14
+
+# Bollinger Bands
+BB_PERIOD=20
+BB_STD=2.0
+
+# Proyección histórica
+PROJ_LENGTH=10
+
+# ================================================================
+# 7. GESTIÓN DE RIESGO
+# ================================================================
+# Apalancamiento (1-125x, recomendado: 3-10x)
+LEVERAGE=5
+
+# Riesgo por trade como % del balance (0.01 = 1%)
+RISK_PCT=0.01
+
+# Máximo de trades abiertos simultáneamente
+MAX_OPEN_TRADES=3
+
+# Trade mínimo en USDT
+MIN_TRADE_USDT=10
+
+# Risk:Reward mínimo para abrir trade
+MIN_RR=2.0
+
+# ================================================================
+# 8. TAKE PROFIT / STOP LOSS
+# ================================================================
+# TP1: primer objetivo (cierra X% de la posición)
+TP1_RATIO=2.5
+TP1_PCT=40
+
+# TP2: segundo objetivo (cierra Y% de la posición)
+TP2_RATIO=4.0
+TP2_PCT=35
+
+# El resto (25%) se deja para trailing o cierre manual
+
+# Stop Loss
+SL_MULT=1.0
+
+# Máximo de horas para mantener un trade
+MAX_HOLD_HOURS=48
+
+# ================================================================
+# 9. CIRCUIT BREAKERS (Protección) 🛡️
+# ================================================================
+# Pérdida diaria máxima permitida (%)
+DAILY_LOSS_CAP_PCT=5.0
+
+# Máximo de trades perdedores consecutivos antes de pausar
+MAX_LOSING_STREAK=3
+
+# ================================================================
+# 10. REINFORCEMENT LEARNING (Opcional - Desactivado)
+# ================================================================
+RL_TRAIN_EVERY=0
+RL_TRAIN_SYMBOL=BTC-USDT
+RL_ITERATIONS=5
+
+# ================================================================
+# NOTAS DEL BOT V5:
+# ================================================================
+#
+# Este bot es MUCHO más avanzado que la versión básica:
+#
+# ✅ Order Book Analysis:
+#    - Detecta muros de bid/ask
+#    - Calcula CVD (Cumulative Volume Delta)
+#    - Identifica absorption signals
+#    - Analiza imbalance ratio
+#
+# ✅ Bollinger Bands Squeeze:
+#    - Detecta compresión de volatilidad
+#    - Identifica expansión (explosión de precio)
+#    - Señal temprana de movimientos grandes
+#
+# ✅ Multi-Timeframe (MTF):
+#    - Confirma señales en 4h
+#    - Mayor probabilidad de éxito
+#
+# ✅ Sistema de Scoring:
+#    - 0-100 puntos (no binario)
+#    - Combina múltiples indicadores
+#    - Ajustable con MIN_SIGNAL_SCORE
+#
+# ✅ Take Profit Parcial:
+#    - TP1: 40% de la posición
+#    - TP2: 35% de la posición
+#    - Resto: trailing o manual
+#
+# ✅ Performance Tracking:
+#    - Win rate
+#    - Profit factor
+#    - Stats por tipo de señal
+#
+# ✅ Circuit Breakers:
+#    - Pausa automática tras pérdidas
+#    - Límite de pérdida diaria
+#
+# ================================================================
+# ADVERTENCIAS (LEE ESTO):
+# ================================================================
+#
+# 1. Este bot es MÁS COMPLEJO ≠ MÁS RENTABLE
+#    - Más indicadores no garantizan mejores resultados
+#    - Backtest ≠ resultados futuros
+#
+# 2. SIEMPRE empieza con DRY_RUN=true
+#    - Monitorea durante semanas
+#    - Verifica que las señales tienen sentido
+#
+# 3. Order Book data requiere API calls extras
+#    - Más lento que bot básico
+#    - Puede consumir más rate limits
+#
+# 4. MIN_SIGNAL_SCORE controla cantidad de señales:
+#    - 40 = muchas señales (más ruido)
+#    - 60 = señales de calidad
+#    - 70 = solo las mejores (pocas señales)
+#
+# 5. Telegram es opcional:
+#    - Si no configuras TOKEN/CHAT_ID, solo loggea
+#    - Recomendado para recibir alertas en móvil
+#
+# ================================================================
