@@ -2,24 +2,20 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Dependencias
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Código fuente
 COPY *.py ./
-
-# Crear directorio de logs
 RUN mkdir -p logs
 
-# Variables de entorno por defecto (sobreescribir en Railway)
+# Defaults (override in Railway Variables)
 ENV PORT=8080
 ENV SCAN_INTERVAL_SEC=60
 ENV KLINE_INTERVAL=1h
-ENV MA_FAST=50
-ENV MA_SLOW=200
+ENV MA_FAST=9
+ENV MA_SLOW=21
 ENV PROJ_LENGTH=10
-ENV MIN_MEAN_PNL=0.003
+ENV MIN_MEAN_PNL=0.001
 ENV TOP_SYMBOLS=30
 ENV MIN_VOLUME_USDT=500000
 ENV LEVERAGE=5
@@ -29,7 +25,15 @@ ENV SL_MULT=1.0
 ENV MAX_OPEN_TRADES=5
 ENV MAX_HOLD_HOURS=48
 ENV MIN_NOTIONAL=10
+ENV MAX_DAILY_TRADES=10
+ENV MIN_RR=1.5
+ENV USE_OB_FILTER=true
+ENV USE_OB_SCAN=true
+ENV USE_TREND_FILTER=true
+ENV DRY_RUN=false
+ENV AUTO_TRADING_ENABLED=true
+ENV BOOK_DEPTH=50
+ENV WALL_MULT=3.0
 
 EXPOSE 8080
-
 CMD ["python", "bot.py"]
