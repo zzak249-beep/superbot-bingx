@@ -61,8 +61,10 @@ class BingXClient:
     # ── Firma BingX ───────────────────────────────────────────── #
 
     def _sign(self, params: dict) -> str:
-        qs = urllib.parse.urlencode(sorted(params.items()))
-        return hmac.new(self._secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+        # BingX requiere parámetros ordenados alfabéticamente por clave
+        # NO usar urlencode - concatenar directamente key=value
+        sorted_params = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
+        return hmac.new(self._secret.encode(), sorted_params.encode(), hashlib.sha256).hexdigest()
 
     def _headers(self) -> dict:
         return {"X-BX-APIKEY": self._key, "Content-Type": "application/json"}
