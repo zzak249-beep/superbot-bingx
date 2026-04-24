@@ -117,6 +117,11 @@ class MarketScanner:
                     pass
                 break
 
+        # DEBUG: log first ticker to check field names from BingX
+        if tickers:
+            log.info(f"[DEBUG] Ticker sample fields: {list(tickers[0].keys())}")
+            log.info(f"[DEBUG] Ticker sample: {tickers[0]}")
+
         # 3. Filtro inicial — volumen y símbolo válido
         candidates = []
         for t in tickers:
@@ -126,14 +131,29 @@ class MarketScanner:
             if sym in ("USDT-USDT",):
                 continue
             try:
-                vol = float(t.get("quoteVolume", 0) or t.get("volume", 0))
-                chg = float(t.get("priceChangePercent", 0))
-                lp  = float(t.get("lastPrice", 0))
+                # BingX may use quoteVolume, volume, turnover, or tradeAmount
+                # Try all known field names; prefer quote (USDT) volume
+                vol = float(
+                    t.get("quoteVolume") or
+                    t.get("turnover") or
+                    t.get("tradeAmount") or
+                    t.get("volume") or
+                    0
+                )
+                # priceChangePercent may be a string like "1.23" or "-0.5"
+                chg_raw = t.get("priceChangePercent") or t.get("priceChange24h") or 0
+                chg = float(chg_raw)
+                lp  = float(t.get("lastPrice") or t.get("price") or 0)
             except (ValueError, TypeError):
                 continue
-            if vol < min_volume or lp <= 0:
+            if lp <= 0:
+                continue
+            # Skip volume filter if vol is zero (field name mismatch — include all, score will sort)
+            if vol > 0 and vol < min_volume:
                 continue
             candidates.append({"symbol": sym, "vol": vol, "chg": chg, "price": lp, "ticker": t})
+
+        log.info(f"[DEBUG] {len(tickers)} tickers → {len(candidates)} candidatos tras filtro vol>={min_volume:,.0f}")
 
         if not candidates:
             log.warning(f"0 candidatos tras filtro vol>={min_volume:,.0f}")
@@ -166,11 +186,23 @@ class MarketScanner:
             return None
 
         try:
-            closes  = [float(k[4]) for k in klines]
-            volumes = [float(k[5]) for k in klines]
-            highs   = [float(k[2]) for k in klines]
-            lows    = [float(k[3]) for k in klines]
-        except (IndexError, ValueError):
+            if isinstance(klines[0], dict):
+                # BingX may return dicts instead of arrays
+                if not hasattr(self, "_kline_fmt_logged"):
+                    log.info(f"[DEBUG] Kline dict keys: {list(klines[0].keys())}")
+                    self._kline_fmt_logged = True
+                closes  = [float(k.get("close") or k.get("c") or k.get("closePrice", 0)) for k in klines]
+                volumes = [float(k.get("volume") or k.get("v") or k.get("vol", 0)) for k in klines]
+                highs   = [float(k.get("high") or k.get("h") or k.get("highPrice", 0)) for k in klines]
+                lows    = [float(k.get("low") or k.get("l") or k.get("lowPrice", 0)) for k in klines]
+            else:
+                # Standard array format: [ts, open, high, low, close, volume, ...]
+                closes  = [float(k[4]) for k in klines]
+                volumes = [float(k[5]) for k in klines]
+                highs   = [float(k[2]) for k in klines]
+                lows    = [float(k[3]) for k in klines]
+        except (IndexError, ValueError, TypeError, KeyError) as e:
+            log.debug(f"Kline parse error {sym}: {e} — sample={klines[0] if klines else 'empty'}")
             return None
 
         if not closes or closes[-1] <= 0:
