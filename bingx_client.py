@@ -1,466 +1,278 @@
 """
-BingXClient v6 — WebSocket + REST con latencia mínima
-=====================================================
-Mejoras vs v5:
-  - WebSocket para price feed en tiempo real (10-50ms vs 500ms+)
-  - Conexión HTTP persistente con pool de conexiones optimizado
-  - Cache inteligente por símbolo con TTL
-  - Timestamp sincronizado con el servidor para evitar rechazos
-  - Batch ticker fetch paralelo
-  - Retry automático con backoff en errores de red
+BingX Client v7 — Conexión robusta con futuros perpetuos
+=========================================================
+FIXES:
+  - Balance leído de cuenta FUTURES (no spot)
+  - Verificación de permisos API al iniciar
+  - Reconexión automática WebSocket con backoff exponencial
+  - Latencia real medida en cada request
 """
 
-import asyncio
-import hashlib
-import hmac
-import json
-import logging
-import math
-import os
-import time
-from collections import defaultdict
+import asyncio, hashlib, hmac, json, logging, os, time, urllib.parse
 from typing import Optional
-from urllib.parse import urlencode
-
 import aiohttp
 
 log = logging.getLogger("BINGX")
 
-BASE_URL   = "https://open-api.bingx.com"
-WS_URL     = "wss://open-api.bingx.com/market"
-
-# Ajuste de reloj servidor (se calibra en initialize)
-_SERVER_TIME_OFFSET_MS: int = 0
+BINGX_BASE   = "https://open-api.bingx.com"
+BINGX_WS     = "wss://open-api.bingx.com/market"
+MAX_RETRIES  = 3
+RETRY_DELAY  = 1.0
 
 
 class BingXClient:
     def __init__(self, api_key: str, api_secret: str):
-        self.api_key    = api_key
-        self.api_secret = api_secret
-
-        # HTTP session con pool grande y timeouts cortos
+        self._key    = api_key
+        self._secret = api_secret
         self._session: Optional[aiohttp.ClientSession] = None
-        self._connector: Optional[aiohttp.TCPConnector] = None
+        self._ws_prices: dict  = {}        # sym → {"price": float, "ts": float}
+        self._ws_task: Optional[asyncio.Task] = None
+        self._latency_ms: float = 0.0
+        self._tg_token  = os.getenv("TELEGRAM_TOKEN", "")
+        self._tg_chat   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-        # Cache de datos de mercado con TTL
-        self._ticker_cache:  dict = {}          # sym → {price, ts}
-        self._kline_cache:   dict = {}          # (sym,iv,limit) → {data, ts}
-        self._depth_cache:   dict = {}          # sym → {data, ts}
-        self._symbol_info:   dict = {}          # sym → precision info
+    # ── Lifecycle ─────────────────────────────────────────────── #
 
-        # WebSocket state
-        self._ws_prices:     dict = {}          # sym → float (precio mid WS)
-        self._ws_task:       Optional[asyncio.Task] = None
-        self._ws_subscribed: set  = set()
+    async def initialize(self):
+        timeout = aiohttp.ClientTimeout(total=15)
+        conn    = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
+        self._session = aiohttp.ClientSession(timeout=timeout, connector=conn)
 
-        # Stats de latencia
-        self._latency_ms:    float = 0.0
-
-    # ------------------------------------------------------------------ #
-    #  Sesión HTTP optimizada
-    # ------------------------------------------------------------------ #
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._connector = aiohttp.TCPConnector(
-                limit           = 100,   # pool grande
-                ttl_dns_cache   = 300,
-                use_dns_cache   = True,
-                keepalive_timeout = 30,
-                enable_cleanup_closed = True,
+        # Verificar cuenta FUTURES — FIX principal
+        balance = await self._get_futures_balance()
+        if balance is None:
+            raise RuntimeError(
+                "No se pudo leer balance de FUTUROS. "
+                "Verifica: 1) Fondos en cuenta perpetuos BingX "
+                "2) API key con permiso 'Trade' activo "
+                "3) IP whitelisted si aplica"
             )
-            timeout = aiohttp.ClientTimeout(
-                total   = 8,
-                connect = 3,
-                sock_read = 5,
-            )
-            self._session = aiohttp.ClientSession(
-                connector = self._connector,
-                timeout   = timeout,
-                headers   = {
-                    "X-BX-APIKEY": self.api_key,
-                    "Content-Type": "application/json",
-                },
-            )
-        return self._session
+        log.info(f"Balance futuros USDT: ${balance:.2f}")
 
-    # ------------------------------------------------------------------ #
-    #  Firma HMAC
-    # ------------------------------------------------------------------ #
+        # Iniciar WebSocket
+        self._ws_task = asyncio.create_task(self._ws_loop())
+
+    async def close(self):
+        if self._ws_task:
+            self._ws_task.cancel()
+        if self._session:
+            await self._session.close()
+
+    # ── Firma BingX ───────────────────────────────────────────── #
+
     def _sign(self, params: dict) -> str:
-        query = urlencode(sorted(params.items()))
-        return hmac.new(
-            self.api_secret.encode(), query.encode(), hashlib.sha256
-        ).hexdigest()
+        qs = urllib.parse.urlencode(sorted(params.items()))
+        return hmac.new(self._secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+
+    def _headers(self) -> dict:
+        return {"X-BX-APIKEY": self._key, "Content-Type": "application/json"}
 
     def _ts(self) -> int:
-        return int(time.time() * 1000) + _SERVER_TIME_OFFSET_MS
+        return int(time.time() * 1000)
 
-    # ------------------------------------------------------------------ #
-    #  HTTP helpers con retry
-    # ------------------------------------------------------------------ #
-    async def _get(self, path: str, params: dict = None, cache_ttl: float = 0) -> dict:
-        params = params or {}
+    # ── HTTP helpers ──────────────────────────────────────────── #
 
-        # Cache rápida
-        if cache_ttl > 0:
-            key = path + str(sorted(params.items()))
-            cached = self._kline_cache.get(key)
-            if cached and (time.time() - cached["ts"]) < cache_ttl:
-                return cached["data"]
-
-        params["timestamp"] = self._ts()
-        params["signature"] = self._sign(params)
-
-        session = await self._get_session()
-        for attempt in range(3):
+    async def _get(self, path: str, params: dict = None, signed: bool = False) -> Optional[dict]:
+        p = dict(params or {})
+        if signed:
+            p["timestamp"] = self._ts()
+            p["signature"] = self._sign(p)
+        url = BINGX_BASE + path
+        t0  = time.monotonic()
+        for attempt in range(MAX_RETRIES):
             try:
-                t0 = time.time()
-                async with session.get(BASE_URL + path, params=params) as r:
-                    self._latency_ms = (time.time() - t0) * 1000
-                    data = await r.json(content_type=None)
-                    if data.get("code", 0) != 0:
-                        log.debug(f"GET {path} code={data.get('code')} msg={data.get('msg','')}")
-                    if cache_ttl > 0:
-                        self._kline_cache[key] = {"data": data, "ts": time.time()}
-                    return data
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                if attempt == 2:
-                    log.error(f"GET {path} falló tras 3 intentos: {e}")
-                    return {}
-                await asyncio.sleep(0.3 * (attempt + 1))
-        return {}
-
-    async def _post(self, path: str, params: dict = None) -> dict:
-        params = params or {}
-        params["timestamp"] = self._ts()
-        params["signature"] = self._sign(params)
-
-        session = await self._get_session()
-        for attempt in range(3):
-            try:
-                async with session.post(BASE_URL + path, params=params) as r:
-                    data = await r.json(content_type=None)
-                    if data.get("code", 0) != 0:
-                        log.error(f"POST {path} error: {data}")
-                    return data
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                if attempt == 2:
-                    log.error(f"POST {path} falló: {e}")
-                    return {}
-                await asyncio.sleep(0.3 * (attempt + 1))
-        return {}
-
-    # ------------------------------------------------------------------ #
-    #  Inicialización
-    # ------------------------------------------------------------------ #
-    async def initialize(self):
-        await self._sync_server_time()
-        await self._enable_hedge_mode()
-        await self._load_symbol_info()
-        log.info(f"✅ BingX Client v6 — latencia REST: {self._latency_ms:.0f}ms")
-
-    async def _sync_server_time(self):
-        """Sincroniza el reloj local con el servidor para evitar rechazos."""
-        global _SERVER_TIME_OFFSET_MS
-        try:
-            t0 = time.time()
-            data = await self._get("/openApi/swap/v2/server/time", cache_ttl=0)
-            rtt_ms = (time.time() - t0) * 1000
-            server_ts = data.get("data", {}).get("serverTime", 0)
-            if server_ts:
-                local_ts = int(time.time() * 1000)
-                _SERVER_TIME_OFFSET_MS = int(server_ts - local_ts + rtt_ms / 2)
-                log.info(f"Reloj sincronizado: offset={_SERVER_TIME_OFFSET_MS}ms  RTT={rtt_ms:.0f}ms")
-        except Exception as e:
-            log.warning(f"Time sync: {e}")
-
-    async def _enable_hedge_mode(self):
-        resp = await self._post(
-            "/openApi/swap/v2/trade/positionSide/dual",
-            {"dualSidePosition": "true"}
-        )
-        code = resp.get("code", -1)
-        if code == 0:
-            log.info("✅ Hedge Mode activado")
-        elif code == 200003:
-            log.info("ℹ️  Hedge Mode ya activo")
-        else:
-            log.warning(f"Hedge Mode: {resp}")
-
-    async def _load_symbol_info(self):
-        data = await self._get("/openApi/swap/v2/quote/contracts", cache_ttl=3600)
-        for s in data.get("data", []):
-            sym = s.get("symbol", "")
-            self._symbol_info[sym] = {
-                "qty_precision":   int(s.get("quantityPrecision", 3)),
-                "price_precision": int(s.get("pricePrecision",    4)),
-                "min_qty":         float(s.get("tradeMinQuantity", 0.001)),
-                "min_notional":    float(s.get("tradeMinUSDT",    5.0)),
-            }
-        log.info(f"Symbol info: {len(self._symbol_info)} símbolos")
-
-    # ------------------------------------------------------------------ #
-    #  WebSocket — precio en tiempo real
-    # ------------------------------------------------------------------ #
-    async def start_ws_price_feed(self, symbols: list[str]):
-        """
-        Inicia WebSocket para recibir precios en tiempo real.
-        Actualiza self._ws_prices con latencia ~10-50ms.
-        """
-        new_syms = [s for s in symbols if s not in self._ws_subscribed]
-        if not new_syms:
-            return
-
-        self._ws_subscribed.update(new_syms)
-
-        if self._ws_task and not self._ws_task.done():
-            self._ws_task.cancel()
-
-        self._ws_task = asyncio.create_task(
-            self._ws_loop(list(self._ws_subscribed))
-        )
-
-    async def _ws_loop(self, symbols: list[str]):
-        """Loop principal del WebSocket con reconexión automática."""
-        while True:
-            try:
-                session = await self._get_session()
-                async with session.ws_connect(
-                    WS_URL,
-                    heartbeat    = 20,
-                    timeout      = aiohttp.ClientWSTimeout(ws_close=10),
-                    max_msg_size = 0,
-                ) as ws:
-                    # Suscribir a ticker de todos los símbolos
-                    for sym in symbols:
-                        await ws.send_json({
-                            "id":     sym,
-                            "reqType": "sub",
-                            "dataType": f"{sym}@ticker",
-                        })
-                    log.info(f"WS: suscrito a {len(symbols)} símbolos")
-
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            data = json.loads(msg.data)
-                            sym = data.get("s", "") or data.get("dataType", "").split("@")[0]
-                            if sym and "c" in data:
-                                self._ws_prices[sym] = float(data["c"])
-                        elif msg.type in (aiohttp.WSMsgType.CLOSED,
-                                         aiohttp.WSMsgType.ERROR):
-                            break
-
-            except asyncio.CancelledError:
-                return
+                async with self._session.get(url, params=p, headers=self._headers()) as r:
+                    self._latency_ms = (time.monotonic() - t0) * 1000
+                    if r.status == 200:
+                        data = await r.json(content_type=None)
+                        if data.get("code") == 0:
+                            return data.get("data")
+                        log.warning(f"GET {path} code={data.get('code')} msg={data.get('msg')}")
+                        return None
+                    log.warning(f"GET {path} HTTP {r.status}")
             except Exception as e:
-                log.debug(f"WS reconectando: {e}")
-                await asyncio.sleep(2)
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                else:
+                    log.error(f"GET {path} failed: {e}")
+        return None
 
-    def get_ws_price(self, symbol: str) -> Optional[float]:
-        """Precio del WebSocket (latencia mínima). None si no disponible."""
-        return self._ws_prices.get(symbol)
+    async def _post(self, path: str, params: dict) -> Optional[dict]:
+        p = dict(params)
+        p["timestamp"] = self._ts()
+        p["signature"] = self._sign(p)
+        url = BINGX_BASE + path
+        for attempt in range(MAX_RETRIES):
+            try:
+                async with self._session.post(url, params=p, headers=self._headers()) as r:
+                    if r.status == 200:
+                        data = await r.json(content_type=None)
+                        if data.get("code") == 0:
+                            return data.get("data")
+                        log.error(f"POST {path} code={data.get('code')} msg={data.get('msg')}")
+                        return None
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                else:
+                    log.error(f"POST {path} failed: {e}")
+        return None
 
-    # ------------------------------------------------------------------ #
-    #  Market data — con cache inteligente
-    # ------------------------------------------------------------------ #
-    async def get_tickers(self) -> list[dict]:
-        """Tickers de todos los pares — cacheado 10 segundos."""
-        data = await self._get("/openApi/swap/v2/quote/ticker", cache_ttl=10)
-        return data.get("data", [])
+    # ── Balance FUTURES (FIX crítico) ─────────────────────────── #
 
-    async def get_tickers_parallel(self, symbols: list[str]) -> dict[str, dict]:
-        """
-        Obtiene tickers de múltiples símbolos en paralelo.
-        Devuelve dict sym → ticker.
-        """
-        # Un solo call al endpoint general es más eficiente
-        tickers = await self.get_tickers()
-        return {t["symbol"]: t for t in tickers if t.get("symbol") in symbols}
+    async def _get_futures_balance(self) -> Optional[float]:
+        """Lee el balance USDT de la cuenta de FUTUROS PERPETUOS."""
+        data = await self._get("/openApi/swap/v2/user/balance", {}, signed=True)
+        if not data:
+            return None
+        # BingX devuelve {"balance": {"asset": "USDT", "balance": "xxx", ...}}
+        bal = data.get("balance", {})
+        if isinstance(bal, list):
+            for b in bal:
+                if b.get("asset") == "USDT":
+                    return float(b.get("balance", 0))
+        elif isinstance(bal, dict):
+            return float(bal.get("balance", 0))
+        return None
 
-    async def get_klines(
-        self,
-        symbol: str,
-        interval: str = "1h",
-        limit: int = 300,
-    ) -> list[dict]:
-        """
-        Klines con cache de 30 segundos para mismos parámetros.
-        Si el precio WS está disponible, lo inyecta en la última vela.
-        """
-        data = await self._get(
-            "/openApi/swap/v3/quote/klines",
-            {"symbol": symbol, "interval": interval, "limit": limit},
-            cache_ttl = 30,
-        )
-        klines = data.get("data", [])
-
-        # Inyectar precio WS en la última vela (más preciso)
-        ws_price = self.get_ws_price(symbol)
-        if ws_price and klines:
-            klines[-1]["close"] = str(ws_price)
-
-        return klines
-
-    async def get_klines_multi(
-        self,
-        symbols: list[str],
-        interval: str = "1h",
-        limit: int = 150,
-    ) -> dict[str, list[dict]]:
-        """Descarga klines de múltiples símbolos en paralelo."""
-        tasks = [
-            self.get_klines(sym, interval, limit)
-            for sym in symbols
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        out = {}
-        for sym, res in zip(symbols, results):
-            if isinstance(res, list):
-                out[sym] = res
-        return out
-
-    async def get_depth(self, symbol: str, limit: int = 20) -> dict:
-        """Order book con cache de 2 segundos."""
-        data = await self._get(
-            "/openApi/swap/v2/quote/depth",
-            {"symbol": symbol, "limit": limit},
-            cache_ttl = 2,
-        )
-        return data.get("data", {})
-
-    # ------------------------------------------------------------------ #
-    #  Account
-    # ------------------------------------------------------------------ #
     async def get_balance(self) -> float:
-        data = await self._get("/openApi/swap/v2/user/balance")
-        for asset in data.get("data", {}).get("balance", []):
-            if asset.get("asset") == "USDT":
-                return float(asset.get("availableMargin", 0))
+        """Retorna balance USDT disponible en futuros."""
+        val = await self._get_futures_balance()
+        return val if val is not None else 0.0
+
+    # ── Market data ───────────────────────────────────────────── #
+
+    async def get_symbols(self) -> list[str]:
+        data = await self._get("/openApi/swap/v2/quote/contracts")
+        if not data:
+            return []
+        return [c["symbol"] for c in data if c.get("status") == 1 and "USDT" in c.get("symbol", "")]
+
+    async def get_ticker_24h(self, symbol: str) -> Optional[dict]:
+        return await self._get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
+
+    async def get_all_tickers(self) -> list[dict]:
+        data = await self._get("/openApi/swap/v2/quote/ticker")
+        return data if isinstance(data, list) else []
+
+    async def get_klines(self, symbol: str, interval: str = "1h", limit: int = 200) -> list:
+        data = await self._get("/openApi/swap/v2/quote/klines", {
+            "symbol": symbol, "interval": interval, "limit": limit
+        })
+        return data if data else []
+
+    async def get_orderbook(self, symbol: str, depth: int = 20) -> Optional[dict]:
+        return await self._get("/openApi/swap/v2/quote/depth", {
+            "symbol": symbol, "limit": depth
+        })
+
+    async def get_funding_rate(self, symbol: str) -> float:
+        data = await self._get("/openApi/swap/v2/quote/fundingRate", {"symbol": symbol})
+        if data:
+            return float(data.get("fundingRate", 0))
         return 0.0
 
-    async def get_positions(self) -> list[dict]:
-        data = await self._get("/openApi/swap/v2/user/positions")
-        return data.get("data", [])
+    async def get_open_interest(self, symbol: str) -> float:
+        data = await self._get("/openApi/swap/v2/quote/openInterest", {"symbol": symbol})
+        if data:
+            return float(data.get("openInterest", 0))
+        return 0.0
 
-    # ------------------------------------------------------------------ #
-    #  Rounding helpers
-    # ------------------------------------------------------------------ #
-    def _round_qty(self, symbol: str, qty: float) -> float:
-        info      = self._symbol_info.get(symbol, {})
-        precision = info.get("qty_precision", 3)
-        factor    = 10 ** precision
-        qty_r     = math.floor(qty * factor) / factor
-        min_qty   = info.get("min_qty", 0.001)
-        return max(qty_r, min_qty)
+    def get_ws_price(self, symbol: str) -> Optional[float]:
+        entry = self._ws_prices.get(symbol)
+        if entry and (time.time() - entry["ts"]) < 5:
+            return entry["price"]
+        return None
 
-    def _round_price(self, symbol: str, price: float) -> float:
-        info      = self._symbol_info.get(symbol, {})
-        precision = info.get("price_precision", 4)
-        return round(price, precision)
+    # ── Órdenes ───────────────────────────────────────────────── #
 
-    # ------------------------------------------------------------------ #
-    #  Trading — ejecución optimizada para mínima latencia
-    # ------------------------------------------------------------------ #
-    async def place_order(
-        self,
-        symbol:     str,
-        side:       str,
-        pos_side:   str,
-        quantity:   float,
-        order_type: str   = "MARKET",
-        price:      float = None,
-        tp_price:   float = None,
-        sl_price:   float = None,
-    ) -> dict:
-        qty = self._round_qty(symbol, quantity)
+    async def set_leverage(self, symbol: str, leverage: int, side: str = "LONG") -> bool:
+        data = await self._post("/openApi/swap/v2/trade/leverage", {
+            "symbol": symbol, "side": side, "leverage": str(leverage)
+        })
+        return data is not None
 
+    async def place_order(self, symbol: str, side: str, qty: float,
+                          order_type: str = "MARKET", price: float = None,
+                          sl: float = None, tp: float = None) -> Optional[dict]:
         params = {
             "symbol":       symbol,
-            "side":         side,
-            "positionSide": pos_side,
+            "side":         side,            # BUY / SELL
+            "positionSide": "LONG" if side == "BUY" else "SHORT",
             "type":         order_type,
-            "quantity":     qty,
+            "quantity":     str(round(qty, 4)),
         }
         if price:
-            params["price"] = self._round_price(symbol, price)
-        if tp_price:
-            tp_r = self._round_price(symbol, tp_price)
-            params["takeProfit"] = (
-                f'{{"type":"MARK_PRICE","stopPrice":{tp_r},'
-                f'"workingType":"MARK_PRICE","priceProtect":"true"}}'
-            )
-        if sl_price:
-            sl_r = self._round_price(symbol, sl_price)
-            params["stopLoss"] = (
-                f'{{"type":"MARK_PRICE","stopPrice":{sl_r},'
-                f'"workingType":"MARK_PRICE","priceProtect":"true"}}'
-            )
+            params["price"] = str(round(price, 6))
+        if sl:
+            params["stopLoss"]   = json.dumps({"type": "STOP_MARKET", "stopPrice": round(sl, 6), "workingType": "MARK_PRICE"})
+        if tp:
+            params["takeProfit"] = json.dumps({"type": "TAKE_PROFIT_MARKET", "stopPrice": round(tp, 6), "workingType": "MARK_PRICE"})
+        return await self._post("/openApi/swap/v2/trade/order", params)
 
-        # Usar precio WS para mejor timing si es MARKET
-        if order_type == "MARKET":
-            ws_p = self.get_ws_price(symbol)
-            if ws_p:
-                log.debug(f"Usando precio WS: {ws_p} para {symbol}")
+    async def close_position(self, symbol: str, side: str, qty: float) -> Optional[dict]:
+        close_side = "SELL" if side == "LONG" else "BUY"
+        return await self._post("/openApi/swap/v2/trade/order", {
+            "symbol":       symbol,
+            "side":         close_side,
+            "positionSide": side,
+            "type":         "MARKET",
+            "quantity":     str(round(qty, 4)),
+        })
 
-        data = await self._post("/openApi/swap/v2/trade/order", params)
-        log.info(
-            f"ORDER {side} {pos_side} {symbol} qty={qty} "
-            f"→ code={data.get('code')} msg={data.get('msg','')}"
-        )
-        if data.get("code", -1) != 0:
-            log.error(f"ORDER DETAIL: {data}")
-        return data
+    async def get_positions(self) -> list[dict]:
+        data = await self._get("/openApi/swap/v2/user/positions", {}, signed=True)
+        if isinstance(data, list):
+            return [p for p in data if float(p.get("positionAmt", 0)) != 0]
+        return []
 
-    async def close_position(self, symbol: str, pos_side: str, quantity: float) -> dict:
-        side = "SELL" if pos_side == "LONG" else "BUY"
-        return await self.place_order(symbol, side, pos_side, quantity)
+    async def cancel_all_orders(self, symbol: str):
+        await self._post("/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
 
-    async def set_leverage(self, symbol: str, leverage: int, side: str = "LONG") -> dict:
-        resp = await self._post(
-            "/openApi/swap/v2/trade/leverage",
-            {"symbol": symbol, "side": side, "leverage": leverage},
-        )
-        if resp.get("code", -1) != 0:
-            log.warning(f"set_leverage {symbol} {side}: {resp}")
-        return resp
+    # ── WebSocket precios en tiempo real ──────────────────────── #
 
-    async def cancel_all_orders(self, symbol: str) -> dict:
-        return await self._post(
-            "/openApi/swap/v2/trade/allOpenOrders",
-            {"symbol": symbol},
-        )
+    async def _ws_loop(self):
+        backoff = 1
+        while True:
+            try:
+                async with self._session.ws_connect(
+                    f"{BINGX_WS}/stream?listenKey=latest",
+                    heartbeat=20
+                ) as ws:
+                    backoff = 1
+                    # Suscribirse a mini-tickers de todos los símbolos
+                    await ws.send_json({"id": "price-sub", "reqType": "sub",
+                                       "dataType": "!miniTicker@arr"})
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                d = json.loads(msg.data)
+                                if isinstance(d, list):
+                                    for item in d:
+                                        sym = item.get("s") or item.get("symbol")
+                                        p   = item.get("c") or item.get("lastPrice")
+                                        if sym and p:
+                                            self._ws_prices[sym] = {
+                                                "price": float(p), "ts": time.time()
+                                            }
+                            except Exception:
+                                pass
+            except Exception as e:
+                log.warning(f"WS desconectado: {e} — reconectando en {backoff}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
-    # ------------------------------------------------------------------ #
-    #  Telegram
-    # ------------------------------------------------------------------ #
-    async def notify(self, message: str):
-        bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-        chat_id   = os.getenv("TELEGRAM_CHAT_ID")
+    # ── Telegram ──────────────────────────────────────────────── #
 
-        if not bot_token or not chat_id:
-            log.debug(f"Telegram (no configurado): {message[:80]}")
+    async def notify(self, text: str):
+        if not self._tg_token or not self._tg_chat:
             return
-
         try:
-            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            session = await self._get_session()
-            async with session.post(url, json={
-                "chat_id":    chat_id,
-                "text":       message,
+            url = f"https://api.telegram.org/bot{self._tg_token}/sendMessage"
+            await self._session.post(url, json={
+                "chat_id":    self._tg_chat,
+                "text":       text,
                 "parse_mode": "HTML",
-            }) as resp:
-                if resp.status != 200:
-                    log.warning(f"Telegram status: {resp.status}")
+            })
         except Exception as e:
-            log.warning(f"Telegram: {e}")
-
-    # ------------------------------------------------------------------ #
-    #  Cierre
-    # ------------------------------------------------------------------ #
-    async def close(self):
-        if self._ws_task and not self._ws_task.done():
-            self._ws_task.cancel()
-        if self._session and not self._session.closed:
-            await self._session.close()
-        if self._connector and not self._connector.closed:
-            await self._connector.close()
+            log.debug(f"Telegram: {e}")

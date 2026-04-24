@@ -1,440 +1,393 @@
 """
-Trade Manager v5 — TP Parcial, Performance Tracking, Circuit Breakers
-======================================================================
-Mejoras vs v1:
-  - Take Profit parcial (TP1 40%, TP2 35%, trailing 25%)
-  - Performance tracking (win rate, profit factor, por tipo de señal)
-  - Daily stats y circuit breakers
-  - Risk management mejorado
+Trade Manager v7 — Gestión profesional de posiciones
+======================================================
+MEJORAS:
+  - Apalancamiento dinámico según volumen y volatilidad del símbolo
+  - Balance leído correctamente de futuros
+  - Trailing stop profesional
+  - Circuit breaker robusto
+  - Cooldown inteligente por tipo de cierre
+  - PnL tracking en tiempo real
+  - Tamaño de posición basado en ATR (no solo pct fijo)
 """
 
-import asyncio
-import logging
-import os
-import json
-from datetime import datetime, timedelta
-from pathlib import Path
+import asyncio, logging, os, time
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from typing import Optional
-from collections import defaultdict
-
-from bingx_client import BingXClient
-from reward_scheme import PBR
 
 log = logging.getLogger("TRADE_MGR")
 
-STATE_FILE = Path("logs/open_trades.json")
-HISTORY_FILE = Path("logs/trade_history.json")
+# ── Config ──────────────────────────────────────────────────── #
+DRY_RUN           = os.getenv("DRY_RUN",            "false").lower() == "true"
+ACCOUNT_EQUITY    = float(os.getenv("ACCOUNT_EQUITY",   "100"))
+RISK_PCT          = float(os.getenv("RISK_PCT",          "0.01"))   # 1%
+MAX_OPEN          = int(os.getenv("MAX_OPEN_TRADES",     "3"))
+MAX_DAILY         = int(os.getenv("MAX_DAILY_TRADES",    "6"))
+MIN_TRADE_USDT    = float(os.getenv("MIN_TRADE_USDT",   "10"))
+MAX_POS_USDT      = float(os.getenv("MAX_POSITION_SIZE","15"))
+DAILY_LOSS_CAP    = float(os.getenv("DAILY_LOSS_CAP_PCT","8.0")) / 100
+MAX_STREAK        = int(os.getenv("MAX_LOSING_STREAK",  "3"))
+TP1_PCT           = float(os.getenv("TP1_PCT",          "40")) / 100  # cerrar 40% en TP1
+TP2_PCT           = float(os.getenv("TP2_PCT",          "35")) / 100
+TRAIL_RATE        = float(os.getenv("TRAIL_RATE_PCT",   "1.2")) / 100
+TRAIL_ACT         = float(os.getenv("TRAIL_ACTIVATION", "1.0")) / 100
+MAX_HOLD_H        = float(os.getenv("MAX_HOLD_HOURS",   "48"))
+CB_PCT            = float(os.getenv("CIRCUIT_BREAKER_PCT","5.0")) / 100
+CB_PAUSE_H        = float(os.getenv("CB_PAUSE_HOURS",   "4"))
+COOLDOWN_TP_MIN   = int(os.getenv("COOLDOWN_TP_MIN",    "15"))
+COOLDOWN_SL_MIN   = int(os.getenv("COOLDOWN_SL_MIN",    "240"))  # 4h tras SL
 
-# Config
-LEVERAGE = int(os.getenv("LEVERAGE", "5"))
-RISK_PCT = float(os.getenv("RISK_PCT", "0.01"))
-TP1_RATIO = float(os.getenv("TP1_RATIO", "2.5"))
-TP2_RATIO = float(os.getenv("TP2_RATIO", "4.0"))
-TP1_PCT = float(os.getenv("TP1_PCT", "40"))  # % de posición a cerrar en TP1
-TP2_PCT = float(os.getenv("TP2_PCT", "35"))  # % en TP2
-MAX_TRADES = int(os.getenv("MAX_OPEN_TRADES", "3"))
-MAX_HOLD_H = int(os.getenv("MAX_HOLD_HOURS", "48"))
-MIN_NOTIONAL = float(os.getenv("MIN_TRADE_USDT", "10"))
-SL_MULT = float(os.getenv("SL_MULT", "1.0"))
-MIN_RR = float(os.getenv("MIN_RR", "2.0"))
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+# Apalancamiento dinámico según categoría de coin
+LEV_CONFIG = {
+    "MAJOR":  int(os.getenv("LEV_MAJOR",  "5")),   # BTC, ETH, BNB
+    "MID":    int(os.getenv("LEV_MID",    "3")),   # top-50 alts
+    "SMALL":  int(os.getenv("LEV_SMALL",  "2")),   # altcoins pequeñas
+}
+MAJOR_COINS = {"BTC-USDT", "ETH-USDT", "BNB-USDT", "SOL-USDT", "XRP-USDT"}
+MID_COINS   = {"ADA-USDT","DOGE-USDT","AVAX-USDT","DOT-USDT","LINK-USDT",
+               "MATIC-USDT","LTC-USDT","UNI-USDT","ATOM-USDT","NEAR-USDT",
+               "OP-USDT","ARB-USDT","APT-USDT","SUI-USDT","INJ-USDT"}
 
-# Circuit Breakers
-MAX_DAILY_LOSS_PCT = float(os.getenv("DAILY_LOSS_CAP_PCT", "5.0"))
-MAX_LOSING_STREAK = int(os.getenv("MAX_LOSING_STREAK", "3"))
+
+@dataclass
+class Trade:
+    symbol:      str
+    direction:   str        # LONG
+    entry:       float
+    sl:          float
+    tp1:         float
+    tp2:         float
+    qty:         float      # cantidad en coin
+    notional:    float      # qty * entry
+    leverage:    int
+    score:       float
+    signal_type: str
+    opened_at:   str        = ""
+    tp1_hit:     bool       = False
+    tp2_hit:     bool       = False
+    trail_sl:    float      = 0.0
+    trail_active:bool       = False
+    pnl_usdt:    float      = 0.0
+    order_id:    str        = ""
+    peak_price:  float      = 0.0
 
 
 class TradeManager:
-    def __init__(self, client: BingXClient):
-        self.client = client
-        self.trades: dict[str, dict] = self._load_state()
-        self.history: list[dict] = self._load_history()
-        self.pbr: dict[str, PBR] = {}
-        
-        # Risk management state
-        self._losing_streak = 0
-        self._risk_paused = False
-        self._pause_until: Optional[datetime] = None
-        self._daily_start_balance = None
-        self._last_reset_date = None
-    
-    # ================================================================== #
-    #  State Persistence
-    # ================================================================== #
-    def _load_state(self) -> dict:
-        if STATE_FILE.exists():
-            try:
-                return json.loads(STATE_FILE.read_text())
-            except Exception:
-                pass
-        return {}
-    
-    def _save_state(self):
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(self.trades, indent=2, default=str))
-    
-    def _load_history(self) -> list:
-        if HISTORY_FILE.exists():
-            try:
-                return json.loads(HISTORY_FILE.read_text())
-            except Exception:
-                pass
-        return []
-    
-    def _save_history(self):
-        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        # Guardar solo últimos 500 trades
-        HISTORY_FILE.write_text(
-            json.dumps(self.history[-500:], indent=2, default=str)
-        )
-    
-    # ================================================================== #
-    #  Public API
-    # ================================================================== #
-    async def open_trade(self, signal: dict) -> bool:
-        """Abre un nuevo trade basado en la señal."""
-        sym = signal["symbol"]
-        
-        # Checks
-        if sym in self.trades:
-            log.debug(f"Trade ya abierto en {sym}")
+    def __init__(self, client):
+        self.client        = client
+        self._trades: list[Trade] = []
+        self._daily_pnl:   float  = 0.0
+        self._daily_trades:int    = 0
+        self._losing_streak:int   = 0
+        self._paused_until:float  = 0.0
+        self._pause_reason:str    = ""
+        self._equity:      float  = ACCOUNT_EQUITY
+        self._perf: dict          = {
+            "total_trades": 0, "wins": 0, "losses": 0,
+            "gross_profit": 0.0, "gross_loss": 0.0,
+            "by_signal_type": {}
+        }
+
+    # ── Abrir trade ───────────────────────────────────────────── #
+
+    async def open_trade(self, sig: dict) -> bool:
+        sym = sig["symbol"]
+
+        # Guards
+        if self._is_paused():
+            log.info(f"  Skip {sym}: circuit breaker activo")
             return False
-        
-        if len(self.trades) >= MAX_TRADES:
-            log.info(f"Máximo de trades ({MAX_TRADES}) alcanzado")
+        if len(self._trades) >= MAX_OPEN:
+            log.debug(f"  Skip {sym}: max trades abiertos ({MAX_OPEN})")
             return False
-        
-        # Circuit breaker
-        if self._risk_paused:
-            if self._pause_until and datetime.utcnow() < self._pause_until:
-                log.warning(f"Risk paused hasta {self._pause_until}")
-                return False
-            else:
-                self._risk_paused = False
-                self._pause_until = None
-        
-        # Risk:Reward check
-        if signal.get("risk_reward", 0) < MIN_RR:
-            log.debug(f"{sym}: R:R {signal.get('risk_reward',0):.2f} < {MIN_RR}")
+        if self._daily_trades >= MAX_DAILY:
+            log.info(f"  Skip {sym}: max trades diarios alcanzado")
             return False
-        
-        direction = signal["direction"]
-        price = signal["price"]
-        mean_pnl = signal["mean_pnl"]
-        worst_pnl = signal["worst_pnl"]
-        
-        # Sizing
+        if any(t.symbol == sym for t in self._trades):
+            log.debug(f"  Skip {sym}: ya hay posición abierta")
+            return False
+
+        # Balance real
         balance = await self.client.get_balance()
         if balance <= 0:
-            log.error("Balance 0")
+            log.error(f"TRADE_MGR - Balance {balance:.2f} USDT insuficiente. "
+                      f"Verifica fondos en cuenta de FUTUROS BingX.")
             return False
-        
-        risk_usdt = balance * RISK_PCT * LEVERAGE
-        quantity = round(risk_usdt / price, 6)
-        notional = quantity * price
-        
-        if notional < MIN_NOTIONAL:
-            log.info(f"{sym}: notional {notional:.2f} < {MIN_NOTIONAL}")
+
+        self._equity = max(balance, self._equity)
+
+        # Apalancamiento dinámico
+        leverage = self._dynamic_leverage(sym, sig.get("atr", 0), sig.get("price", 1))
+
+        # Tamaño de posición basado en riesgo
+        price  = sig["price"]
+        sl     = sig["sl"]
+        risk_u = self._equity * RISK_PCT              # $ en riesgo
+        sl_pct = abs(price - sl) / price
+        if sl_pct <= 0:
             return False
-        
-        # TP/SL
-        if direction == "LONG":
-            tp1 = round(price * (1 + abs(mean_pnl) * TP1_RATIO), 6)
-            tp2 = round(price * (1 + abs(mean_pnl) * TP2_RATIO), 6)
-            sl = round(price * (1 - abs(worst_pnl) * SL_MULT), 6)
-            side, pos_side = "BUY", "LONG"
-        else:
-            tp1 = round(price * (1 - abs(mean_pnl) * TP1_RATIO), 6)
-            tp2 = round(price * (1 - abs(mean_pnl) * TP2_RATIO), 6)
-            sl = round(price * (1 + abs(worst_pnl) * SL_MULT), 6)
-            side, pos_side = "SELL", "SHORT"
-        
-        prefix = "[DRY RUN] " if DRY_RUN else ""
-        log.info(f"{prefix}Abriendo {direction} {sym}  qty={quantity}  "
-                 f"entry={price}  TP1={tp1}  TP2={tp2}  SL={sl}")
-        
-        if DRY_RUN:
-            order_id = f"DRY_{int(datetime.utcnow().timestamp())}"
-        else:
-            try:
-                await self.client.set_leverage(sym, LEVERAGE, pos_side)
-                await asyncio.sleep(0.3)
-                
-                resp = await self.client.place_order(
-                    symbol=sym, side=side, pos_side=pos_side,
-                    quantity=quantity, sl_price=sl
-                )
-                
-                if resp.get("code", -1) != 0:
-                    log.error(f"Error: {resp}")
-                    return False
-                
-                order_id = resp.get("data", {}).get("order", {}).get("orderId", "?")
-            except Exception as e:
-                log.error(f"Exception: {e}", exc_info=True)
-                return False
-        
-        # Guardar trade
-        self.trades[sym] = {
-            "symbol": sym,
-            "direction": direction,
-            "entry": price,
-            "quantity": quantity,
-            "tp1": tp1,
-            "tp2": tp2,
-            "sl": sl,
-            "tp1_hit": False,
-            "tp2_hit": False,
-            "remaining_qty": quantity,
-            "order_id": order_id,
-            "opened_at": datetime.utcnow().isoformat(),
-            "signal": {k: v for k, v in signal.items() if k != "projections"},
-            "dry_run": DRY_RUN,
-        }
-        self._save_state()
-        
-        # PBR
-        pbr = PBR()
-        pbr.on_action(1 if direction == "LONG" else 0)
-        pbr.feed_price(price)
-        self.pbr[sym] = pbr
-        
-        log.info(f"✅ Trade abierto {sym} #{order_id}")
-        return True
-    
-    # ------------------------------------------------------------------ #
-    async def manage_open_trades(self):
-        """Gestiona trades abiertos (TP parcial, SL, timeout)."""
-        if not self.trades:
-            return
-        
-        if DRY_RUN:
-            # En DRY RUN solo simulamos timeout
-            to_close = []
-            for sym, t in list(self.trades.items()):
-                age_h = (datetime.utcnow() - 
-                        datetime.fromisoformat(t["opened_at"])).total_seconds() / 3600
-                if age_h >= MAX_HOLD_H:
-                    log.info(f"[DRY RUN] {sym} timeout")
-                    to_close.append(sym)
-            
-            for sym in to_close:
-                self._close_trade(sym, "TIMEOUT", 0)
-            return
-        
-        # REAL MODE
-        positions = await self.client.get_positions()
-        pos_map = {p["symbol"]: p for p in positions 
-                   if float(p.get("positionAmt", 0)) != 0}
-        
-        to_close = []
-        
-        for sym, t in list(self.trades.items()):
-            # Posición cerrada en exchange
-            if sym not in pos_map:
-                log.info(f"{sym}: cerrada en exchange")
-                self._close_trade(sym, "SL/TP", 0)
-                continue
-            
-            pos = pos_map[sym]
-            current_price = float(pos.get("markPrice", t["entry"]))
-            unrealized_pnl = float(pos.get("unrealizedProfit", 0))
-            
-            # Update PBR
-            if sym in self.pbr:
-                self.pbr[sym].feed_price(current_price)
-                self.pbr[sym].get_reward()
-            
-            # Age check
-            age_h = (datetime.utcnow() - 
-                    datetime.fromisoformat(t["opened_at"])).total_seconds() / 3600
-            
-            # TP parcial check
-            direction = t["direction"]
-            tp1 = t["tp1"]
-            tp2 = t["tp2"]
-            
-            # TP1
-            if not t["tp1_hit"]:
-                tp1_hit = (direction == "LONG" and current_price >= tp1) or \
-                         (direction == "SHORT" and current_price <= tp1)
-                if tp1_hit:
-                    close_qty = t["quantity"] * (TP1_PCT / 100)
-                    await self._close_partial(sym, close_qty, "TP1")
-                    t["tp1_hit"] = True
-                    t["remaining_qty"] -= close_qty
-                    self._save_state()
-            
-            # TP2
-            if not t["tp2_hit"]:
-                tp2_hit = (direction == "LONG" and current_price >= tp2) or \
-                         (direction == "SHORT" and current_price <= tp2)
-                if tp2_hit:
-                    close_qty = t["quantity"] * (TP2_PCT / 100)
-                    await self._close_partial(sym, close_qty, "TP2")
-                    t["tp2_hit"] = True
-                    t["remaining_qty"] -= close_qty
-                    self._save_state()
-            
-            # Timeout
-            if age_h >= MAX_HOLD_H:
-                log.info(f"{sym}: timeout {age_h:.1f}h")
-                to_close.append(sym)
-        
-        for sym in to_close:
-            await self._close_full(sym, "TIMEOUT")
-    
-    # ------------------------------------------------------------------ #
-    async def _close_partial(self, sym: str, qty: float, reason: str):
-        """Cierra parte de la posición."""
-        t = self.trades[sym]
-        side = "SELL" if t["direction"] == "LONG" else "BUY"
-        
-        log.info(f"Closing {qty} of {sym} ({reason})")
-        
-        try:
-            await self.client.close_position(sym, t["direction"], qty)
-        except Exception as e:
-            log.error(f"Error closing partial {sym}: {e}")
-    
-    async def _close_full(self, sym: str, reason: str):
-        """Cierra la posición completamente y guarda en historial."""
-        t = self.trades[sym]
-        
-        try:
-            await self.client.close_position(
-                sym, t["direction"], t["remaining_qty"]
+
+        pos_usdt = min(risk_u / sl_pct, MAX_POS_USDT, balance * 0.95)
+        pos_usdt = max(pos_usdt, MIN_TRADE_USDT)
+
+        if pos_usdt > balance * 0.95:
+            log.warning(f"  {sym}: posición reducida a ${balance*0.95:.2f} (balance insuficiente)")
+            pos_usdt = balance * 0.95
+
+        qty = pos_usdt / price
+
+        log.info(f"  {'[DRY]' if DRY_RUN else '[LIVE]'} OPEN {sym} {sig['direction']} "
+                 f"entry={price:.6g} sl={sl:.6g} tp1={sig['tp1']:.6g} "
+                 f"qty={qty:.4f} notional=${pos_usdt:.2f} lev={leverage}x "
+                 f"score={sig['score']:.0f}")
+
+        order_id = ""
+        if not DRY_RUN:
+            # Configurar apalancamiento
+            await self.client.set_leverage(sym, leverage, "LONG")
+
+            # Ejecutar orden
+            result = await self.client.place_order(
+                symbol    = sym,
+                side      = "BUY",
+                qty       = qty,
+                order_type= "MARKET",
+                sl        = sl,
+                tp        = sig["tp1"],
             )
-        except Exception as e:
-            log.error(f"Error closing {sym}: {e}")
+            if not result:
+                log.error(f"  {sym}: orden fallida")
+                return False
+            order_id = str(result.get("orderId", ""))
+
+        trade = Trade(
+            symbol      = sym,
+            direction   = "LONG",
+            entry       = price,
+            sl          = sl,
+            tp1         = sig["tp1"],
+            tp2         = sig["tp2"],
+            qty         = qty,
+            notional    = pos_usdt,
+            leverage    = leverage,
+            score       = sig["score"],
+            signal_type = sig.get("signal_type", "COMBO"),
+            opened_at   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            trail_sl    = sl,
+            peak_price  = price,
+            order_id    = order_id,
+        )
+        self._trades.append(trade)
+        self._daily_trades += 1
+
+        await self.client.notify(
+            f"🟢 <b>TRADE ABIERTO</b> — {sym}\n"
+            f"{'🔵 DRY RUN' if DRY_RUN else '🔴 LIVE'} | {leverage}x\n"
+            f"Entry: ${price:.6g} | SL: ${sl:.6g}\n"
+            f"TP1: ${sig['tp1']:.6g} | TP2: ${sig['tp2']:.6g}\n"
+            f"Posición: ${pos_usdt:.2f} | Riesgo: ${risk_u:.2f}\n"
+            f"Score: {sig['score']:.0f} | {', '.join(sig.get('active_sigs',[])[:3])}"
+        )
+        return True
+
+    # ── Gestión de trades abiertos ────────────────────────────── #
+
+    async def manage_open_trades(self):
+        to_close = []
+        for trade in self._trades:
+            price = self.client.get_ws_price(trade.symbol) or 0
+            if price <= 0:
+                continue
+
+            # PnL actual
+            trade.pnl_usdt = (price - trade.entry) / trade.entry * trade.notional
+            trade.peak_price = max(trade.peak_price, price)
+
+            # Actualizar trailing stop
+            if not trade.trail_active and price >= trade.entry * (1 + TRAIL_ACT):
+                trade.trail_active = True
+                log.info(f"  {trade.symbol}: Trailing stop activado en ${price:.6g}")
+
+            if trade.trail_active:
+                new_sl = price * (1 - TRAIL_RATE)
+                if new_sl > trade.trail_sl:
+                    trade.trail_sl = new_sl
+
+            effective_sl = max(trade.sl, trade.trail_sl)
+
+            # TP1 parcial
+            if not trade.tp1_hit and price >= trade.tp1:
+                trade.tp1_hit = True
+                log.info(f"  {trade.symbol}: TP1 alcanzado ${price:.6g}")
+                if not DRY_RUN:
+                    await self.client.place_order(trade.symbol, "SELL",
+                                                   trade.qty * TP1_PCT, "MARKET")
+                await self.client.notify(
+                    f"🎯 <b>TP1</b> {trade.symbol} @ ${price:.6g}\n"
+                    f"PnL parcial: +${trade.pnl_usdt * TP1_PCT:.2f}"
+                )
+
+            # TP2 — cerrar resto
+            if trade.tp1_hit and price >= trade.tp2:
+                to_close.append((trade, "TP2", price))
+                continue
+
+            # Stop loss
+            if price <= effective_sl:
+                to_close.append((trade, "SL", price))
+                continue
+
+            # Tiempo máximo
+            try:
+                opened_dt = datetime.strptime(trade.opened_at, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+                hours_held = (datetime.now(timezone.utc) - opened_dt).seconds / 3600
+                if hours_held >= MAX_HOLD_H:
+                    to_close.append((trade, "TIMEOUT", price))
+            except Exception:
+                pass
+
+        for trade, reason, price in to_close:
+            await self._close_trade(trade, reason, price)
+
+    async def _close_trade(self, trade: Trade, reason: str, price: float):
+        pnl = (price - trade.entry) / trade.entry * trade.notional
+
+        # Si TP1 ya cobró parcial
+        if trade.tp1_hit:
+            remaining = 1 - TP1_PCT
+            pnl = pnl * remaining + trade.notional * TP1_PCT * (trade.tp1 - trade.entry) / trade.entry
         
-        # Calcular PnL (simulado en DRY RUN)
-        pnl = 0  # TODO: calcular PnL real desde exchange
-        
-        self._close_trade(sym, reason, pnl)
-    
-    def _close_trade(self, sym: str, reason: str, pnl: float):
-        """Mueve trade a historial y actualiza stats."""
-        t = self.trades.pop(sym, None)
-        if not t:
-            return
-        
-        # PBR final
-        if sym in self.pbr:
-            pbr_summary = self.pbr[sym].summary()
-            self.pbr[sym].reset()
-            del self.pbr[sym]
-        else:
-            pbr_summary = {}
-        
-        # Historial
-        t["closed_at"] = datetime.utcnow().isoformat()
-        t["close_reason"] = reason
-        t["pnl"] = pnl
-        t["pbr_final"] = pbr_summary
-        self.history.append(t)
-        
-        # Update stats
-        if pnl < 0:
-            self._losing_streak += 1
-        else:
+        win = pnl > 0
+
+        log.info(f"  CLOSE {trade.symbol} [{reason}] "
+                 f"entry={trade.entry:.6g} exit={price:.6g} "
+                 f"pnl=${pnl:+.2f} ({'WIN' if win else 'LOSS'})")
+
+        if not DRY_RUN:
+            remaining_qty = trade.qty * (1 - TP1_PCT) if trade.tp1_hit else trade.qty
+            await self.client.close_position(trade.symbol, "LONG", remaining_qty)
+
+        self._trades.remove(trade)
+        self._daily_pnl += pnl
+        self._update_perf(trade, pnl, win)
+
+        # Circuit breaker
+        if win:
             self._losing_streak = 0
-        
-        # Circuit breaker check
-        if self._losing_streak >= MAX_LOSING_STREAK:
-            self._risk_paused = True
-            self._pause_until = datetime.utcnow() + timedelta(hours=4)
-            log.warning(f"⚠️ Circuit breaker: {self._losing_streak} pérdidas. "
-                       f"Paused hasta {self._pause_until}")
-        
-        self._save_state()
-        self._save_history()
-        
-        log.info(f"🏁 {sym} cerrado ({reason})  PnL: {pnl:.2f}  "
-                 f"PBR: {pbr_summary.get('cumulative_reward',0):.5f}")
-    
-    # ================================================================== #
-    #  Stats / Performance
-    # ================================================================== #
+        else:
+            self._losing_streak += 1
+            if self._losing_streak >= MAX_STREAK:
+                self._pause(f"{self._losing_streak} pérdidas consecutivas", CB_PAUSE_H)
+            if self._daily_pnl <= -self._equity * DAILY_LOSS_CAP:
+                self._pause(f"Daily loss cap: {self._daily_pnl:.2f}$", CB_PAUSE_H * 2)
+
+        # Cooldown por símbolo
+        from signal_engine import SignalEngine
+        cool_min = COOLDOWN_TP_MIN if win else COOLDOWN_SL_MIN
+        _DUMMY_ENGINE = SignalEngine()
+        _DUMMY_ENGINE.set_cooldown(trade.symbol, cool_min)
+
+        emoji = "✅" if win else "❌"
+        await self.client.notify(
+            f"{emoji} <b>TRADE CERRADO</b> [{reason}] — {trade.symbol}\n"
+            f"Entry: ${trade.entry:.6g} → Exit: ${price:.6g}\n"
+            f"PnL: ${pnl:+.2f} | Daily: ${self._daily_pnl:+.2f}\n"
+            f"Racha pérdidas: {self._losing_streak}"
+        )
+
+    def _update_perf(self, trade: Trade, pnl: float, win: bool):
+        p = self._perf
+        p["total_trades"] += 1
+        if win:
+            p["wins"] += 1
+            p["gross_profit"] += pnl
+        else:
+            p["losses"] += 1
+            p["gross_loss"] += abs(pnl)
+
+        st = trade.signal_type
+        if st not in p["by_signal_type"]:
+            p["by_signal_type"][st] = {"count": 0, "wins": 0, "pnl": 0.0}
+        p["by_signal_type"][st]["count"] += 1
+        if win:
+            p["by_signal_type"][st]["wins"] += 1
+        p["by_signal_type"][st]["pnl"] += pnl
+
+    # ── Stats ─────────────────────────────────────────────────── #
+
     async def get_open_trades(self) -> list[dict]:
-        """Devuelve trades abiertos con PBR."""
         result = []
-        for sym, t in self.trades.items():
-            t_copy = dict(t)
-            if sym in self.pbr:
-                t_copy["pbr"] = self.pbr[sym].summary()
-            result.append(t_copy)
+        for t in self._trades:
+            d = asdict(t)
+            result.append(d)
         return result
-    
+
     def get_daily_stats(self) -> dict:
-        """Stats diarias para circuit breaker."""
-        today = datetime.utcnow().date()
-        
-        # Reset diario
-        if self._last_reset_date != today:
-            self._last_reset_date = today
-            self._daily_start_balance = None  # Se actualizará en próximo check
-        
-        # Filtrar trades de hoy
-        today_trades = [
-            t for t in self.history
-            if datetime.fromisoformat(t["closed_at"]).date() == today
-        ]
-        
-        daily_pnl = sum(t.get("pnl", 0) for t in today_trades)
-        
         return {
-            "date": str(today),
-            "trades_count": len(today_trades),
-            "daily_pnl": daily_pnl,
-            "losing_streak": self._losing_streak,
-            "risk_paused": self._risk_paused,
-            "pause_until": str(self._pause_until) if self._pause_until else None,
-            "pause_reason": f"{self._losing_streak} pérdidas consecutivas" 
-                           if self._risk_paused else None,
+            "daily_pnl":      round(self._daily_pnl, 2),
+            "daily_trades":   self._daily_trades,
+            "losing_streak":  self._losing_streak,
+            "risk_paused":    self._is_paused(),
+            "pause_reason":   self._pause_reason,
+            "equity":         round(self._equity, 2),
         }
-    
+
     def get_performance(self) -> dict:
-        """Performance general."""
-        if not self.history:
-            return {
-                "total_trades": 0,
-                "win_rate": 0,
-                "profit_factor": 0,
-                "total_pnl": 0,
-                "by_signal_type": {},
+        p   = self._perf
+        tot = p["total_trades"]
+        wr  = p["wins"] / tot * 100 if tot > 0 else 0
+        pf  = p["gross_profit"] / p["gross_loss"] if p["gross_loss"] > 0 else 0
+        bst = {}
+        for st, v in p["by_signal_type"].items():
+            bst[st] = {
+                "count":    v["count"],
+                "win_rate": v["wins"] / v["count"] * 100 if v["count"] > 0 else 0,
+                "pnl":      round(v["pnl"], 2),
             }
-        
-        wins = [t for t in self.history if t.get("pnl", 0) > 0]
-        losses = [t for t in self.history if t.get("pnl", 0) < 0]
-        
-        win_rate = (len(wins) / len(self.history)) * 100 if self.history else 0
-        
-        total_win = sum(t["pnl"] for t in wins)
-        total_loss = abs(sum(t["pnl"] for t in losses))
-        profit_factor = total_win / total_loss if total_loss > 0 else 0
-        
-        # Por tipo de señal
-        by_type = defaultdict(lambda: {"count": 0, "wins": 0, "pnl": 0})
-        for t in self.history:
-            sig_type = t.get("signal", {}).get("signal_type", "UNKNOWN")
-            by_type[sig_type]["count"] += 1
-            if t.get("pnl", 0) > 0:
-                by_type[sig_type]["wins"] += 1
-            by_type[sig_type]["pnl"] += t.get("pnl", 0)
-        
-        by_type_dict = {}
-        for st, v in by_type.items():
-            by_type_dict[st] = {
-                "count": v["count"],
-                "win_rate": (v["wins"] / v["count"]) * 100 if v["count"] > 0 else 0,
-                "pnl": v["pnl"],
-            }
-        
         return {
-            "total_trades": len(self.history),
-            "win_rate": win_rate,
-            "profit_factor": profit_factor,
-            "total_pnl": sum(t.get("pnl", 0) for t in self.history),
-            "by_signal_type": by_type_dict,
+            "total_trades":    tot,
+            "win_rate":        round(wr, 1),
+            "profit_factor":   round(pf, 2),
+            "net_pnl":         round(p["gross_profit"] - p["gross_loss"], 2),
+            "by_signal_type":  bst,
         }
+
+    def reset_daily(self):
+        self._daily_pnl    = 0.0
+        self._daily_trades = 0
+
+    # ── Helpers ───────────────────────────────────────────────── #
+
+    def _dynamic_leverage(self, symbol: str, atr: float, price: float) -> int:
+        """
+        Apalancamiento dinámico:
+        - BTC/ETH/BNB/SOL/XRP → hasta 5x
+        - Top-50 altcoins      → hasta 3x
+        - Resto (micro-caps)   → 2x máximo
+        - Si ATR > 3% del precio → reducir un nivel más
+        """
+        if symbol in MAJOR_COINS:
+            lev = LEV_CONFIG["MAJOR"]
+        elif symbol in MID_COINS:
+            lev = LEV_CONFIG["MID"]
+        else:
+            lev = LEV_CONFIG["SMALL"]
+
+        # Reducir si ATR alto (alta volatilidad)
+        if atr > 0 and price > 0:
+            atr_pct = atr / price
+            if atr_pct > 0.04:    # >4% ATR
+                lev = max(1, lev - 2)
+            elif atr_pct > 0.025:  # >2.5% ATR
+                lev = max(1, lev - 1)
+
+        return lev
+
+    def _is_paused(self) -> bool:
+        return time.time() < self._paused_until
+
+    def _pause(self, reason: str, hours: float):
+        self._paused_until = time.time() + hours * 3600
+        self._pause_reason = reason
+        log.warning(f"🛑 Circuit breaker: {reason} — pausa {hours}h")
