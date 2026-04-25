@@ -1,8 +1,0 @@
-# Dependencias opcionales para entrenamiento RL local
-# NO instalar en Railway — solo en máquina local o VM con más RAM/CPU
-#
-# pip install -r requirements-rl.txt
-
-ray[rllib]==2.55.0
-torch==2.2.2
-tensortrade==1.0.3
