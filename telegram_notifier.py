@@ -1,173 +1,131 @@
 """
-Telegram Notifier v2 — Conflux 4 Bot
-Incluye: señales enriquecidas, alertas de riesgo, P&L dashboard, actualizaciones de trade activo.
+notifications/telegram_notifier.py — Cliente Telegram para notificaciones del bot.
+Envía mensajes HTML usando la Bot API de Telegram.
 """
 
-import httpx
-from loguru import logger
+import asyncio
+import logging
+from typing import List, Optional
+
+import aiohttp
+
+from config import config
+
+log = logging.getLogger("telegram")
+
+TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 
 
 class TelegramNotifier:
-    def __init__(self, token: str, chat_id: str):
-        self.token = token
-        self.chat_id = chat_id
-        self.base = f"https://api.telegram.org/bot{token}"
+    def __init__(self):
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._task: Optional[asyncio.Task] = None
 
-    def send(self, text: str, parse_mode: str = "HTML") -> bool:
-        try:
-            r = httpx.post(
-                f"{self.base}/sendMessage",
-                json={"chat_id": self.chat_id, "text": text,
-                      "parse_mode": parse_mode, "disable_web_page_preview": True},
-                timeout=12,
+    def start(self):
+        """Arranca el worker de envío en background."""
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._worker())
+            log.info("Telegram notifier iniciado.")
+
+    async def close(self):
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
             )
-            r.raise_for_status()
-            return True
-        except Exception as e:
-            logger.error(f"Telegram error: {e}")
-            return False
+        return self._session
 
-    # ── Señal principal ────────────────────────────────────────────────────
-    def signal(self, result, symbol: str, interval: str, preset: str,
-               risk_dec=None, quality: int = 0) -> str:
-        sig = result.signal
-        is_bull = sig == "BULL"
-        emoji = "🟢" if is_bull else "🔴"
-        stars = "⭐" * min(quality, 5) + "☆" * max(0, 5 - quality)
+    # ── API de bajo nivel ─────────────────────────────────────────────────────
 
-        def fmt(v):
-            if v is None: return "—"
-            return f"{v:,.2f}" if v >= 1000 else f"{v:.5f}"
+    async def send(self, text: str):
+        """Encola un mensaje para enviar."""
+        await self._queue.put(text)
 
-        risk_txt = ""
-        if risk_dec:
-            risk_txt = (
-                f"\n━━━━━━━━━━━━━━━━━━━━\n"
-                f"💰 <b>Gestión de riesgo</b>\n"
-                f"  Posición: <code>{risk_dec.position_usdt:.1f} USDT</code>\n"
-                f"  Riesgo: <code>{risk_dec.risk_pct:.2f}%</code> del capital\n"
-                f"  Kelly: <code>{risk_dec.Kelly_fraction*100:.2f}%</code>"
-            )
-
-        # Calcular R/R en texto
-        sl_dist = abs(result.entry - result.stop)
-        rr_tp2 = abs(result.tp2 - result.entry) / sl_dist if sl_dist > 0 else 0
-        rr_tp4 = abs(result.tp4 - result.entry) / sl_dist if sl_dist > 0 else 0
-
-        msg = (
-            f"{emoji}<b>CONFLUX 4 — {sig} SIGNAL</b>{emoji}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 <b>{symbol}</b>  |  {interval}  |  {preset}\n"
-            f"📌 {'LONG 📈' if is_bull else 'SHORT 📉'}  |  Calidad: {stars} ({quality}/10)\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💵 Entrada:         <code>{fmt(result.entry)}</code>\n"
-            f"🛑 Stop Loss:       <code>{fmt(result.stop)}</code> ({sl_dist/result.entry*100:.2f}%)\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 TP1 — 25% salida: <code>{fmt(result.tp1)}</code>\n"
-            f"🎯 TP2 — 25% salida: <code>{fmt(result.tp2)}</code> (RR {rr_tp2:.1f}×)\n"
-            f"🎯 TP3 — 25% salida: <code>{fmt(result.tp3)}</code>\n"
-            f"🎯 TP4 — 25% salida: <code>{fmt(result.tp4)}</code> (RR {rr_tp4:.1f}×)\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📈 RSI: {result.rsi_val:.1f}  "
-            f"ADX: {result.adx_val:.1f}  "
-            f"Conf: {result.confluence}/4\n"
-            f"📊 Vol%ile: {result.volume_pct:.0f}  "
-            f"MTF: {'✅' if result.mtf_ok else '❌'}  "
-            f"Funding: {'✅' if result.funding_ok else '❌'}"
-            f"{risk_txt}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ <i>No es consejo financiero. Opera bajo tu propio riesgo.</i>"
-        )
-        self.send(msg)
-        return msg
-
-    # ── Actualización de trade activo (TP parcial, BE move, trailing) ─────
-    def trade_update(self, symbol: str, events: list, price: float, pnl_approx: float = None):
-        if not events:
+    async def _send_now(self, text: str):
+        """Envío inmediato, sin cola."""
+        if not config.TG_TOKEN or not config.TG_CHAT_ID:
+            log.debug(f"[Telegram desactivado] {text[:80]}")
             return
-        ev_txt = "\n".join(f"  {e}" for e in events)
-        pnl_txt = f"\n💹 P&amp;L aprox: <code>{pnl_approx:+.2f} USDT</code>" if pnl_approx is not None else ""
-        msg = (
-            f"📍 <b>Trade Update — {symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"{ev_txt}\n"
-            f"💵 Precio actual: <code>{price:.4f}</code>"
-            f"{pnl_txt}"
+        url = TELEGRAM_API.format(token=config.TG_TOKEN)
+        payload = {
+            "chat_id": config.TG_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        try:
+            session = await self._get_session()
+            async with session.post(url, json=payload) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    log.warning(f"Telegram error {r.status}: {body[:200]}")
+        except Exception as e:
+            log.warning(f"Telegram send failed: {e}")
+
+    async def _worker(self):
+        """Procesa la cola de mensajes uno a uno."""
+        while True:
+            try:
+                text = await self._queue.get()
+                await self._send_now(text)
+                self._queue.task_done()
+                await asyncio.sleep(0.3)  # evitar flood
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.error(f"Telegram worker error: {e}")
+
+    # ── Métodos de alto nivel ─────────────────────────────────────────────────
+
+    async def notify_start(self, symbols: List[str]):
+        mode = "📄 PAPER" if config.PAPER else "💰 REAL"
+        syms_str = ", ".join(symbols[:10])
+        extra = f" +{len(symbols)-10} más" if len(symbols) > 10 else ""
+        await self.send(
+            f"🤖 <b>Bot iniciado</b> — {mode}\n"
+            f"Símbolos: <code>{syms_str}{extra}</code>\n"
+            f"HTF={config.HTF} MTF={config.MTF} LTF={config.LTF}\n"
+            f"Leverage: {config.LEVERAGE}x | MaxPos: {config.MAX_POSITIONS}"
         )
-        self.send(msg)
 
-    # ── Cierre de posición ────────────────────────────────────────────────
-    def trade_closed(self, symbol: str, direction: str, entry: float,
-                     exit_price: float, pnl_usdt: float, reason: str):
-        won = pnl_usdt > 0
-        emoji = "✅" if won else "❌"
-        pct = (exit_price - entry) / entry * 100
-        pct = pct if direction == "BULL" else -pct
-        msg = (
-            f"{emoji} <b>TRADE CERRADO — {symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📌 {direction}  |  Razón: {reason}\n"
-            f"📥 Entrada: <code>{entry:.4f}</code>\n"
-            f"📤 Salida:  <code>{exit_price:.4f}</code>  ({pct:+.2f}%)\n"
-            f"💰 P&amp;L: <code>{pnl_usdt:+.2f} USDT</code>"
+    async def notify_signal(self, summary: str):
+        await self.send(f"🔔 <b>Señal detectada</b>\n{summary}")
+
+    async def notify_order(self, symbol: str, direction: str, entry: float,
+                            sl: float, tp: float, size_usdt: float, order_id: str):
+        emoji = "🟢" if direction == "LONG" else "🔴"
+        await self.send(
+            f"{emoji} <b>ORDEN ABIERTA</b> — {symbol}\n"
+            f"Dirección : <b>{direction}</b>\n"
+            f"Entry     : <code>{entry:.4f}</code>\n"
+            f"SL        : <code>{sl:.4f}</code>\n"
+            f"TP        : <code>{tp:.4f}</code>\n"
+            f"Tamaño    : <code>${size_usdt:.2f}</code>\n"
+            f"Order ID  : <code>{order_id}</code>"
         )
-        self.send(msg)
 
-    # ── Alerta de riesgo ──────────────────────────────────────────────────
-    def risk_alert(self, title: str, detail: str):
-        msg = f"⚠️ <b>ALERTA DE RIESGO — {title}</b>\n{detail}"
-        self.send(msg)
-
-    # ── Dashboard de performance ──────────────────────────────────────────
-    def performance_dashboard(self, risk_summary: dict, symbol_results: dict):
-        s = risk_summary
-        wr_pct = s.get("winrate", 0) * 100
-
-        bars = lambda v, mx: "█" * int(v / mx * 10) + "░" * (10 - int(v / mx * 10)) if mx > 0 else "░" * 10
-
-        pairs_txt = ""
-        for sym, res in symbol_results.items():
-            trend_e = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "⚪"}.get(res.trend, "⚪")
-            pairs_txt += f"\n  {trend_e} <b>{sym}</b>: {res.trend} | RSI {res.rsi_val:.0f} | ADX {res.adx_val:.0f}"
-
-        msg = (
-            f"📊 <b>CONFLUX 4 — Performance Report</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 Balance: <code>{s['balance']:.2f} USDT</code>\n"
-            f"📈 P&amp;L Total: <code>{s['total_pnl']:+.2f} USDT</code>\n"
-            f"📅 Hoy: <code>{s['today_pnl']:+.2f} USDT</code>\n"
-            f"📆 Semana: <code>{s['week_pnl']:+.2f} USDT</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 Winrate: <code>{wr_pct:.1f}%</code>  [{bars(wr_pct, 100)}]\n"
-            f"📉 Drawdown: <code>{s['drawdown_pct']:.2f}%</code>\n"
-            f"🔢 Trades totales: {s['all_trades']}\n"
-            f"🔓 Posiciones abiertas: {s['open_positions']}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>Mercado actual:</b>{pairs_txt}"
+    async def notify_close(self, symbol: str, pnl: float, reason: str):
+        emoji = "✅" if pnl >= 0 else "❌"
+        sign  = "+" if pnl >= 0 else ""
+        await self.send(
+            f"{emoji} <b>POSICIÓN CERRADA</b> — {symbol}\n"
+            f"Motivo : {reason}\n"
+            f"PnL    : <code>{sign}{pnl:.2f} USDT</code>"
         )
-        self.send(msg)
 
-    # ── Señal rechazada por riesgo (solo log interno) ─────────────────────
-    def signal_rejected(self, symbol: str, reason: str):
-        msg = f"🚫 <b>Señal rechazada [{symbol}]</b>\n<i>{reason}</i>"
-        self.send(msg)
+    async def notify_error(self, message: str):
+        await self.send(f"⚠️ <b>ERROR</b>\n<code>{message[:400]}</code>")
 
-    # ── Startup ───────────────────────────────────────────────────────────
-    def startup(self, symbols: list, interval: str, preset: str, balance: float):
-        syms = "  " + "\n  ".join(f"• {s}" for s in symbols)
-        msg = (
-            f"🚀 <b>Conflux 4 Bot v2 — Iniciado</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 Balance: <code>{balance:.2f} USDT</code>\n"
-            f"⏱ Intervalo: {interval}  |  Preset: {preset}\n"
-            f"📊 Pares:\n{syms}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ Motor de señales Conflux 4 activo\n"
-            f"🛡 Risk Manager activo\n"
-            f"📊 Multi-timeframe: activado\n"
-            f"💸 Funding rate filter: activado"
-        )
-        self.send(msg)
 
-    def error(self, msg: str):
-        self.send(f"🚨 <b>ERROR</b>\n<code>{msg[:300]}</code>")
+# Instancia global
+telegram = TelegramNotifier()
