@@ -1,14 +1,5 @@
 .git
-.gitignore
-.env
-.env.*
 __pycache__
 *.pyc
-*.pyo
-.pytest_cache
-.mypy_cache
-.venv
-venv
-*.md
-.DS_Store
-tests/
+.env
+.env.*
