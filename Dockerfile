@@ -1,32 +1,30 @@
 FROM python:3.11-slim
 
-# Evitar prompts interactivos
-ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
 
-# Dependencias del sistema
+# Instalar gcc para compilar algunas deps de numpy/pandas
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc \
     && rm -rf /var/lib/apt/lists/*
 
-# Instalar dependencias Python PRIMERO (capa cacheada)
-COPY requirements.txt /app/requirements.txt
+# Copiar e instalar dependencias
+COPY requirements.txt .
 RUN pip install --upgrade pip \
-    && pip install --no-cache-dir -r /app/requirements.txt
+    && pip install --no-cache-dir -r requirements.txt
 
-# Verificar que loguru está instalado
-RUN python -c "import loguru; import httpx; import pandas; import numpy; print('✅ All deps OK')"
+# Verificar deps críticas
+RUN python -c "import loguru, httpx, pandas, numpy; print('✅ Deps OK')"
 
-# Copiar código fuente
-COPY src/ /app/src/
+# Copiar TODO el código (está en la raíz del repo)
+COPY *.py .
 
-# Crear directorios de datos
-RUN mkdir -p /app/logs /app/data
+# Crear directorios de runtime
+RUN mkdir -p logs data
 
-# Verificar que el código importa correctamente
-RUN python -c "import sys; sys.path.insert(0,'/app/src'); from conflux4 import Conflux4Engine; print('✅ Code imports OK')"
+# Verificar imports del bot
+RUN python -c "from conflux4 import Conflux4Engine; from risk_manager import RiskManager; print('✅ Bot imports OK')"
 
-CMD ["python", "/app/src/main.py"]
+CMD ["python", "main.py"]

@@ -9,11 +9,8 @@ import sys
 import time
 import fcntl
 import traceback
-from pathlib import Path
 
 from loguru import logger
-
-sys.path.insert(0, str(Path(__file__).parent))
 
 from config import load_config, config_to_engine, config_to_risk
 from conflux4 import Conflux4Engine
