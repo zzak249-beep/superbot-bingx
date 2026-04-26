@@ -1,0 +1,9 @@
+# Forzar uso del Dockerfile en lugar de nixpacks auto-detection
+[phases.setup]
+nixPkgs = ["python311"]
+
+[phases.install]
+cmds = ["pip install --no-cache-dir -r requirements.txt"]
+
+[start]
+cmd = "python src/main.py"
