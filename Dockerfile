@@ -6,8 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
+RUN apt-get update && apt-get install -y --no-install-recommends gcc \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -15,7 +14,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Garantizar que main.py está presente (falla el build si no está)
 RUN test -f /app/main.py || (echo "ERROR: main.py no encontrado" && exit 1)
 
 CMD ["python", "main.py"]

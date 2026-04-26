@@ -1,4 +1,3 @@
-# Ignorar solo lo que NO necesita el contenedor
 .git
 .gitignore
 .env
@@ -6,13 +5,10 @@
 __pycache__
 *.pyc
 *.pyo
-*.pyd
 .pytest_cache
 .mypy_cache
 .venv
 venv
-node_modules
 *.md
 .DS_Store
 tests/
-test_*
