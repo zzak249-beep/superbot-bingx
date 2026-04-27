@@ -22,7 +22,7 @@ BINGX_BASE = "https://open-api.bingx.com"
 BINGX_TEST  = "https://open-api-vst.bingx.com"
 
 MAX_RETRIES = 3
-RETRY_DELAY = 2.0   # segundos base (exponential backoff)
+RETRY_DELAY = 2.0
 
 
 class BingXClient:
@@ -31,7 +31,6 @@ class BingXClient:
         self.secret = secret_key
         self.base = BINGX_TEST if testnet else BINGX_BASE
 
-    # ── Firma ──────────────────────────────────────────────────────────────
     def _sign(self, params: dict) -> str:
         query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
         return hmac.new(self.secret.encode(), query.encode(), hashlib.sha256).hexdigest()
@@ -39,7 +38,6 @@ class BingXClient:
     def _headers(self):
         return {"X-BX-APIKEY": self.api_key}
 
-    # ── Request con retry ─────────────────────────────────────────────────
     def _get_public(self, path: str, params: dict = None, retries: int = MAX_RETRIES) -> dict:
         url = self.base + path
         for attempt in range(retries):
@@ -81,10 +79,6 @@ class BingXClient:
 
     # ── OHLCV ─────────────────────────────────────────────────────────────
     def get_klines(self, symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
-        """
-        CORRECCIÓN: BingX v3 devuelve dicts con clave 'time' (no 't' ni 'open_time').
-        Se maneja cualquier formato: lista de listas o lista de dicts con cualquier clave.
-        """
         data = self._get_public(
             "/openApi/swap/v3/quote/klines",
             {"symbol": symbol, "interval": interval, "limit": limit}
@@ -96,23 +90,13 @@ class BingXClient:
         df = pd.DataFrame(rows)
 
         if isinstance(rows[0], list):
-            # ── Lista de listas ──────────────────────────────────────────
-            # BingX v3 devuelve [time, open, high, low, close, volume, ...]
-            # Asignamos solo tantos nombres como columnas haya (sin asumir 8)
             n_cols = len(df.columns)
             base_cols = ["open_time", "open", "high", "low", "close", "volume"]
             extra_cols = [f"_extra_{i}" for i in range(max(0, n_cols - len(base_cols)))]
             df.columns = (base_cols + extra_cols)[:n_cols]
-
         else:
-            # ── Lista de dicts ───────────────────────────────────────────
-            # BingX puede devolver distintas claves según versión/endpoint:
-            #   "time"  → clave real observada en v3 swap
-            #   "t"     → clave corta alternativa
-            #   "T"     → variante mayúscula
-            #   "o","h","l","c","v" → abreviaturas
             rename = {
-                "time": "open_time",    # ← CORRECCIÓN PRINCIPAL
+                "time": "open_time",
                 "t":    "open_time",
                 "T":    "open_time",
                 "o":    "open",
@@ -122,13 +106,8 @@ class BingXClient:
                 "v":    "volume",
             }
             df = df.rename(columns=rename)
-
-            # Fallback posicional si open_time sigue sin estar
             if "open_time" not in df.columns:
-                logger.warning(
-                    f"Columna 'open_time' no encontrada en {list(df.columns)[:6]}. "
-                    f"Aplicando asignación posicional."
-                )
+                logger.warning(f"Columna 'open_time' no encontrada. Asignación posicional.")
                 cols = list(df.columns)
                 base_cols = ["open_time", "open", "high", "low", "close", "volume"]
                 for i, c in enumerate(base_cols):
@@ -136,40 +115,43 @@ class BingXClient:
                         cols[i] = c
                 df.columns = cols
 
-        # ── Seleccionar y limpiar columnas finales ────────────────────────
         df = df[["open_time", "open", "high", "low", "close", "volume"]].copy()
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        # open_time puede llegar como int (ms), string numérico o ya datetime
         df["open_time"] = pd.to_datetime(
             pd.to_numeric(df["open_time"], errors="coerce"),
-            unit="ms",
-            errors="coerce"
+            unit="ms", errors="coerce"
         )
-
         df.dropna(inplace=True)
         df.set_index("open_time", inplace=True)
         return df
 
-    # ── Precio actual ─────────────────────────────────────────────────────
     def get_price(self, symbol: str) -> float:
         data = self._get_public("/openApi/swap/v2/quote/price", {"symbol": symbol})
         return float(data["data"]["price"])
 
     # ── Funding rate ──────────────────────────────────────────────────────
     def get_funding_rate(self, symbol: str) -> float:
-        """Devuelve el funding rate actual (ej: 0.0001 = 0.01%). Positivo = longs pagan."""
+        """
+        CORRECCIÓN: BingX puede devolver data["data"] como lista o dict.
+        - Lista: [{"fundingRate": "0.0001", "symbol": "BTC-USDT", ...}]
+        - Dict:  {"fundingRate": "0.0001", ...}
+        Ambos casos se manejan correctamente.
+        """
         try:
             data = self._get_public("/openApi/swap/v2/quote/fundingRate", {"symbol": symbol})
-            return float(data["data"]["fundingRate"])
+            d = data.get("data", {})
+            if isinstance(d, list):
+                # Lista → tomar primer elemento
+                return float(d[0].get("fundingRate", 0)) if d else 0.0
+            if isinstance(d, dict):
+                return float(d.get("fundingRate", 0))
+            return 0.0
         except Exception as e:
             logger.warning(f"No se pudo obtener funding rate para {symbol}: {e}")
             return 0.0
 
-    # ── Order book depth (para verificar liquidez) ────────────────────────
     def get_bid_ask_spread_pct(self, symbol: str) -> float:
-        """Spread bid-ask como % del precio. Spread alto = poca liquidez."""
         try:
             data = self._get_public("/openApi/swap/v2/quote/bookTicker", {"symbol": symbol})
             bid = float(data["data"]["bidPrice"])
@@ -180,18 +162,12 @@ class BingXClient:
             logger.warning(f"Spread no disponible para {symbol}: {e}")
             return 0.0
 
-    # ── Calcular cantidad por USDT de posición ────────────────────────────
     def calc_quantity(self, symbol: str, position_usdt: float, price: float = None) -> float:
-        """
-        Convierte USDT nocionales a cantidad del activo.
-        Redondea al tick correcto según las reglas del par.
-        """
         if price is None:
             price = self.get_price(symbol)
         qty = position_usdt / price
         return round(qty, 3)
 
-    # ── Balance ───────────────────────────────────────────────────────────
     def get_balance(self) -> float:
         if not self.api_key:
             return 0.0
@@ -202,18 +178,10 @@ class BingXClient:
             logger.error(f"Error obteniendo balance: {e}")
             return 0.0
 
-    # ── Colocar orden de mercado con SL/TP integrados ─────────────────────
-    def place_market_order(
-        self,
-        symbol: str,
-        side: str,            # 'BUY' | 'SELL'
-        quantity: float,
-        stop_loss: float = None,
-        take_profit: float = None,
-    ) -> dict:
+    def place_market_order(self, symbol: str, side: str, quantity: float,
+                           stop_loss: float = None, take_profit: float = None) -> dict:
         if not self.api_key:
             raise ValueError("API key requerida para colocar órdenes")
-
         params = {
             "symbol": symbol,
             "side": side,
@@ -222,23 +190,14 @@ class BingXClient:
             "quantity": quantity,
         }
         if stop_loss:
-            params["stopLoss"] = (
-                f'{{"type":"MARK_PRICE","stopPrice":{stop_loss},"workingType":"MARK_PRICE"}}'
-            )
+            params["stopLoss"] = f'{{"type":"MARK_PRICE","stopPrice":{stop_loss},"workingType":"MARK_PRICE"}}'
         if take_profit:
-            params["takeProfit"] = (
-                f'{{"type":"MARK_PRICE","stopPrice":{take_profit},"workingType":"MARK_PRICE"}}'
-            )
-
+            params["takeProfit"] = f'{{"type":"MARK_PRICE","stopPrice":{take_profit},"workingType":"MARK_PRICE"}}'
         result = self._post_signed("/openApi/swap/v2/trade/order", params)
         logger.info(f"Orden ejecutada: {side} {symbol} qty={quantity} → {result}")
         return result
 
-    # ── Cerrar posición parcialmente ──────────────────────────────────────
     def close_partial(self, symbol: str, side: str, quantity: float) -> dict:
-        """
-        Cierra parcialmente. Para LONG abierto: side='SELL'. Para SHORT: side='BUY'.
-        """
         params = {
             "symbol": symbol,
             "side": side,
@@ -249,15 +208,12 @@ class BingXClient:
         }
         return self._post_signed("/openApi/swap/v2/trade/order", params)
 
-    # ── Actualizar stop loss ───────────────────────────────────────────────
     def update_stop_loss(self, symbol: str, side: str, stop_price: float) -> dict:
-        """Cancela SL existente y coloca uno nuevo."""
         try:
             self._post_signed("/openApi/swap/v2/trade/allOpenOrders",
-                               {"symbol": symbol, "type": "STOP_MARKET"})
+                              {"symbol": symbol, "type": "STOP_MARKET"})
         except Exception:
             pass
-
         params = {
             "symbol": symbol,
             "side": "SELL" if side == "BUY" else "BUY",
@@ -269,7 +225,6 @@ class BingXClient:
         }
         return self._post_signed("/openApi/swap/v2/trade/order", params)
 
-    # ── Verificar posición abierta ─────────────────────────────────────────
     def get_open_position(self, symbol: str) -> Optional[dict]:
         try:
             data = self._get_signed("/openApi/swap/v2/user/positions", {"symbol": symbol})

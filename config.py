@@ -1,6 +1,10 @@
 """
 Configuración Conflux 4 Bot v2
-Todos los parámetros con valores por defecto conservadores.
+CORRECCIONES:
+  - ADX thresholds bajados (25→18 Daytrader, 20→15 resto)
+  - use_adx=False por defecto en todos los presets (filtro SUAVE)
+  - Nuevas variables de entorno: USE_ADX, ADX_THR, RSI_BULL, RSI_BEAR
+  - VWMA_LEN reducido por defecto a 100 (más señales en sideways)
 """
 
 import os
@@ -10,37 +14,48 @@ from typing import List
 
 PRESETS = {
     "Scalp": {
-        "cooldown": 3, "adx_thr": 20, "stop_mode": "ATR Cap",
+        "cooldown": 3,
+        # ── CORRECCIÓN: use_adx=False → ADX no bloquea señales (solo puntúa)
+        "use_adx": False, "adx_thr": 15,
+        "stop_mode": "ATR Cap",
         "stop_atr_mult": 1.0, "stop_fixed_pct": 0.2,
         "rr1": 0.5, "rr2": 1.0, "rr3": 1.5, "rr4": 2.0,
         "leverage": 10, "max_risk_per_trade_pct": 1.0,
-        "max_daily_loss_pct": 2.0, "min_signal_quality": 6,
+        "max_daily_loss_pct": 2.0, "min_signal_quality": 4,
+        # RSI más permisivo para scalp
+        "rsi_bull": 50, "rsi_bear": 50,
     },
     "Daytrader": {
-        "cooldown": 5, "adx_thr": 25, "stop_mode": "Supertrend",
+        "cooldown": 5,
+        # ── CORRECCIÓN: adx_thr bajado de 25 → 18 (ADX 14-18 es normal en crypto)
+        "use_adx": False, "adx_thr": 18,
+        "stop_mode": "Supertrend",
         "stop_atr_mult": 1.5, "stop_fixed_pct": 0.3,
         "rr1": 0.5, "rr2": 1.0, "rr3": 2.0, "rr4": 3.0,
         "leverage": 5, "max_risk_per_trade_pct": 1.5,
-        "max_daily_loss_pct": 3.0, "min_signal_quality": 5,
+        "max_daily_loss_pct": 3.0, "min_signal_quality": 4,
+        "rsi_bull": 52, "rsi_bear": 48,
     },
     "Swing": {
-        "cooldown": 10, "adx_thr": 20, "stop_mode": "Fixed %",
+        "cooldown": 10,
+        "use_adx": False, "adx_thr": 15,
+        "stop_mode": "Fixed %",
         "stop_atr_mult": 1.5, "stop_fixed_pct": 0.5,
         "rr1": 1.0, "rr2": 1.5, "rr3": 2.5, "rr4": 3.5,
         "leverage": 3, "max_risk_per_trade_pct": 2.0,
         "max_daily_loss_pct": 4.0, "min_signal_quality": 4,
+        "rsi_bull": 50, "rsi_bear": 50,
     },
 }
 
-# Timeframe mayor para MTF (según TF primario)
 MTF_MAP = {
-    "1m": ("5m", "15m"),
-    "5m": ("15m", "1h"),
-    "15m": ("1h", "4h"),
-    "30m": ("1h", "4h"),
-    "1h": ("4h", "1d"),
-    "4h": ("1d", None),
-    "1d": (None, None),
+    "1m":  ("5m",  "15m"),
+    "5m":  ("15m", "1h"),
+    "15m": ("1h",  "4h"),
+    "30m": ("1h",  "4h"),
+    "1h":  ("4h",  "1d"),
+    "4h":  ("1d",  None),
+    "1d":  (None,  None),
 }
 
 
@@ -66,17 +81,21 @@ class BotConfig:
     preset: str = "Daytrader"
 
     # ── Indicadores ───────────────────────────────────────────────────────
-    vwma_len: int = 200
+    # CORRECCIÓN: vwma_len bajado a 100 (200 necesita demasiadas velas para converger)
+    vwma_len: int = 100
     ema_fast: int = 21
     ema_slow: int = 50
     rsi_len: int = 14
-    rsi_bull: int = 55
-    rsi_bear: int = 45
+    # CORRECCIÓN: umbrales RSI más permisivos para generar más señales
+    rsi_bull: int = 52
+    rsi_bear: int = 48
     atr_len: int = 10
     st_mult: float = 3.5
-    use_adx: bool = True
+    # CORRECCIÓN: use_adx=False por defecto → no bloquea señales
+    use_adx: bool = False
     adx_len: int = 14
-    adx_thr: int = 25
+    # CORRECCIÓN: adx_thr bajado de 25 → 18
+    adx_thr: int = 18
 
     # ── Señal ─────────────────────────────────────────────────────────────
     cooldown: int = 5
@@ -90,26 +109,26 @@ class BotConfig:
 
     # ── Filtros extra ─────────────────────────────────────────────────────
     use_mtf: bool = True
-    min_volume_percentile: int = 30
-    funding_threshold: float = 0.05   # % funding que rechaza la señal
+    min_volume_percentile: int = 20   # CORRECCIÓN: bajado de 30 → 20
+    funding_threshold: float = 0.05
 
     # ── Riesgo ────────────────────────────────────────────────────────────
     starting_balance: float = 1000.0
     leverage: int = 5
-    max_risk_per_trade_pct: float = 1.5   # % capital en riesgo por trade
+    max_risk_per_trade_pct: float = 1.5
     max_position_usdt: float = 500.0
     max_open_trades: int = 3
     max_daily_loss_pct: float = 3.0
     max_weekly_loss_pct: float = 8.0
     max_drawdown_pct: float = 15.0
-    min_signal_quality: int = 5
+    min_signal_quality: int = 4       # CORRECCIÓN: bajado de 5 → 4
     use_session_filter: bool = True
     avoid_hours_utc: List[int] = field(default_factory=lambda: [0, 1, 2, 3])
 
     # ── Reporting ─────────────────────────────────────────────────────────
     dashboard_every_n_scans: int = 60
 
-    # ── MTF (calculado automáticamente) ───────────────────────────────────
+    # ── MTF ───────────────────────────────────────────────────────────────
     htf1: str = "1h"
     htf2: str = "4h"
 
@@ -117,12 +136,12 @@ class BotConfig:
 def load_config() -> BotConfig:
     cfg = BotConfig()
 
-    cfg.telegram_token = os.environ["TELEGRAM_TOKEN"]
+    cfg.telegram_token  = os.environ["TELEGRAM_TOKEN"]
     cfg.telegram_chat_id = os.environ["TELEGRAM_CHAT_ID"]
-    cfg.bingx_api_key = os.environ.get("BINGX_API_KEY", "")
-    cfg.bingx_secret = os.environ.get("BINGX_SECRET", "")
-    cfg.bingx_testnet = os.environ.get("BINGX_TESTNET", "false").lower() == "true"
-    cfg.auto_trade = os.environ.get("AUTO_TRADE", "false").lower() == "true"
+    cfg.bingx_api_key   = os.environ.get("BINGX_API_KEY", "")
+    cfg.bingx_secret    = os.environ.get("BINGX_SECRET", "")
+    cfg.bingx_testnet   = os.environ.get("BINGX_TESTNET", "false").lower() == "true"
+    cfg.auto_trade      = os.environ.get("AUTO_TRADE", "false").lower() == "true"
 
     if "SYMBOLS" in os.environ:
         cfg.symbols = [s.strip() for s in os.environ["SYMBOLS"].split(",")]
@@ -138,12 +157,38 @@ def load_config() -> BotConfig:
         cfg.max_daily_loss_pct = float(os.environ["MAX_DAILY_LOSS_PCT"])
     if "MAX_DRAWDOWN_PCT" in os.environ:
         cfg.max_drawdown_pct = float(os.environ["MAX_DRAWDOWN_PCT"])
+    if "VWMA_LEN" in os.environ:
+        cfg.vwma_len = int(os.environ["VWMA_LEN"])
+
+    # Nuevas variables de entorno para afinar señales sin redesplegar
+    if "USE_ADX" in os.environ:
+        cfg.use_adx = os.environ["USE_ADX"].lower() == "true"
+    if "ADX_THR" in os.environ:
+        cfg.adx_thr = int(os.environ["ADX_THR"])
+    if "RSI_BULL" in os.environ:
+        cfg.rsi_bull = int(os.environ["RSI_BULL"])
+    if "RSI_BEAR" in os.environ:
+        cfg.rsi_bear = int(os.environ["RSI_BEAR"])
+    if "MIN_VOL_PCT" in os.environ:
+        cfg.min_volume_percentile = int(os.environ["MIN_VOL_PCT"])
+    if "MIN_QUALITY" in os.environ:
+        cfg.min_signal_quality = int(os.environ["MIN_QUALITY"])
 
     # Aplicar preset
     p = PRESETS.get(cfg.preset, PRESETS["Daytrader"])
     for k, v in p.items():
         if hasattr(cfg, k):
             setattr(cfg, k, v)
+
+    # Env vars tienen prioridad sobre preset (aplicar de nuevo si existen)
+    if "USE_ADX" in os.environ:
+        cfg.use_adx = os.environ["USE_ADX"].lower() == "true"
+    if "ADX_THR" in os.environ:
+        cfg.adx_thr = int(os.environ["ADX_THR"])
+    if "RSI_BULL" in os.environ:
+        cfg.rsi_bull = int(os.environ["RSI_BULL"])
+    if "RSI_BEAR" in os.environ:
+        cfg.rsi_bear = int(os.environ["RSI_BEAR"])
 
     # MTF automático
     htf1, htf2 = MTF_MAP.get(cfg.interval, ("1h", "4h"))

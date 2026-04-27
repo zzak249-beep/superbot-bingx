@@ -1,9 +1,9 @@
 """
 Conflux 4 v2 — Signal Engine
-Mejoras vs v1:
-  - Confirmación multi-timeframe (MTF): 15m necesita acuerdo en 1h y 4h
-  - Filtro de funding rate (evita entrar contra el funding extremo)
-  - Volume spike filter (señales en baja liquidez descartadas)
+CORRECCIONES:
+  - use_adx=False ahora REALMENTE desactiva el filtro ADX (bug lógico corregido)
+  - ADX es ahora un filtro SUAVE (puntúa, no bloquea) cuando adx_soft=True
+  - Filtro de funding rate, volume spike, MTF
   - Score de calidad de señal 0-10
 """
 
@@ -26,18 +26,12 @@ def vwma(close: pd.Series, volume: pd.Series, n: int) -> pd.Series:
 
 
 def rsi(close: pd.Series, n: int) -> pd.Series:
-    """
-    RSI con manejo correcto de edge cases:
-    - loss=0 (solo velas alcistas) → RS=+inf → RSI=100
-    - gain=0 (solo velas bajistas) → RS=0   → RSI=0
-    - ambos=0 (serie plana)        → RSI=NaN (correcto)
-    """
     d = close.diff()
     g = d.clip(lower=0).ewm(com=n - 1, adjust=False).mean()
     l = (-d.clip(upper=0)).ewm(com=n - 1, adjust=False).mean()
     with np.errstate(divide="ignore", invalid="ignore"):
-        rs = g / l                          # puede producir ±inf o NaN
-        rs = rs.replace(-np.inf, np.inf)    # -inf (g>0, l=-0.0) → +inf → RSI=100
+        rs = g / l
+        rs = rs.replace(-np.inf, np.inf)
     return 100 - 100 / (1 + rs)
 
 
@@ -53,11 +47,10 @@ def atr(high, low, close, n: int) -> pd.Series:
 def supertrend(high, low, close, n: int, mult: float):
     """
     Supertrend — replica exacta de Pine Script ta.supertrend().
-    direction: -1 = bull (precio sobre ST), 1 = bear (precio bajo ST)
+    direction: -1 = bull, 1 = bear
     """
     a = atr(high, low, close, n)
     hl2 = (high + low) / 2
-
     basic_upper = hl2 + mult * a
     basic_lower = hl2 - mult * a
 
@@ -67,33 +60,29 @@ def supertrend(high, low, close, n: int, mult: float):
     final_lower = basic_lower.copy().astype(float)
 
     for i in range(1, len(close)):
-        # Lower band sube solo si el precio anterior estaba encima
         if basic_lower.iat[i] > final_lower.iat[i - 1] or close.iat[i - 1] < final_lower.iat[i - 1]:
             final_lower.iat[i] = basic_lower.iat[i]
         else:
             final_lower.iat[i] = final_lower.iat[i - 1]
 
-        # Upper band baja solo si el precio anterior estaba debajo
         if basic_upper.iat[i] < final_upper.iat[i - 1] or close.iat[i - 1] > final_upper.iat[i - 1]:
             final_upper.iat[i] = basic_upper.iat[i]
         else:
             final_upper.iat[i] = final_upper.iat[i - 1]
 
-        # Flip de dirección cuando el precio cruza una banda
         if close.iat[i] > final_upper.iat[i]:
-            direction.iat[i] = -1   # bull
+            direction.iat[i] = -1
         elif close.iat[i] < final_lower.iat[i]:
-            direction.iat[i] = 1    # bear
+            direction.iat[i] = 1
         else:
             direction.iat[i] = direction.iat[i - 1]
 
-        # Valor del ST: lower band si bull, upper band si bear
         st.iat[i] = final_lower.iat[i] if direction.iat[i] == -1 else final_upper.iat[i]
 
     return st, direction
 
 
-def adx(high, low, close, n: int):
+def adx_indicator(high, low, close, n: int):
     tr = pd.concat([
         high - low,
         (high - close.shift()).abs(),
@@ -114,7 +103,6 @@ def adx(high, low, close, n: int):
 
 
 def volume_percentile(volume: pd.Series, lookback: int = 20) -> pd.Series:
-    """Rango percentil del volumen actual vs últimas N velas (0-100)."""
     return volume.rolling(lookback).apply(
         lambda x: (x[-1] >= x).sum() / len(x) * 100, raw=True
     )
@@ -126,9 +114,9 @@ def volume_percentile(volume: pd.Series, lookback: int = 20) -> pd.Series:
 
 @dataclass
 class SignalResult:
-    signal: Optional[str]       # 'BULL' | 'BEAR' | None
-    quality: int                # 0-10 (score de calidad)
-    trend: str                  # 'BULL' | 'BEAR' | 'NEUTRAL'
+    signal: Optional[str]
+    quality: int
+    trend: str
     close: float
     atr_val: float
     stop_dist: float
@@ -140,11 +128,11 @@ class SignalResult:
     tp4: float
     rsi_val: float
     adx_val: float
-    confluence: int             # 0-4 filtros alineados
-    volume_pct: float           # percentil de volumen (0-100)
+    confluence: int
+    volume_pct: float
     st_val: float
-    mtf_ok: bool                # confirmación multi-TF
-    funding_ok: bool            # filtro funding rate pasado
+    mtf_ok: bool
+    funding_ok: bool
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -156,7 +144,6 @@ class Conflux4Engine:
         self.c = cfg
         self._last_signal_bar: int = -999
 
-    # ── Calcula señales en un único DataFrame ──────────────────────────────
     def _compute_single(self, df: pd.DataFrame) -> dict:
         c = self.c
         close, high, low, vol = df["close"], df["high"], df["low"], df["volume"]
@@ -166,7 +153,7 @@ class Conflux4Engine:
         es = ema(close, c["ema_slow"])
         rsi_v = rsi(close, c["rsi_len"])
         st_v, st_dir = supertrend(high, low, close, c["atr_len"], c["st_mult"])
-        _, _, adx_v = adx(high, low, close, c["adx_len"])
+        _, _, adx_v = adx_indicator(high, low, close, c["adx_len"])
         atr_v = atr(high, low, close, c["atr_len"])
         vol_pct = volume_percentile(vol, 20)
 
@@ -176,14 +163,22 @@ class Conflux4Engine:
         me = rsi_v < c["rsi_bear"]
         sb = st_dir < 0
         se = st_dir > 0
-        adx_ok = (~adx_v.astype(bool) | (adx_v > c["adx_thr"])) if not c["use_adx"] else (adx_v > c["adx_thr"])
+
+        # ── CORRECCIÓN PRINCIPAL: lógica ADX ─────────────────────────────────
+        # ANTES (roto): (~adx_v.astype(bool) | ...) cuando use_adx=False
+        #   → astype(bool) de un float siempre True → ~True=False → bloquea todo
+        # AHORA: cuando use_adx=False, adx_ok es siempre True (sin filtro)
+        if not c.get("use_adx", True):
+            adx_ok = pd.Series(True, index=adx_v.index)
+        else:
+            adx_ok = adx_v > c["adx_thr"]
+        # ─────────────────────────────────────────────────────────────────────
 
         full_bull = tb & mb & sb & adx_ok
         full_bear = te & me & se & adx_ok
 
         return {
-            "full_bull": full_bull,
-            "full_bear": full_bear,
+            "full_bull": full_bull, "full_bear": full_bear,
             "trend_bull": tb, "trend_bear": te,
             "mom_bull": mb, "mom_bear": me,
             "st_bull": sb, "st_bear": se,
@@ -192,43 +187,36 @@ class Conflux4Engine:
             "atr": atr_v, "st_val": st_v, "vol_pct": vol_pct,
         }
 
-    # ── Señal de calidad con MTF ──────────────────────────────────────────
     def compute(
         self,
         df_primary: pd.DataFrame,
-        df_htf1: pd.DataFrame = None,   # timeframe mayor (ej: 1h)
-        df_htf2: pd.DataFrame = None,   # timeframe aún mayor (ej: 4h)
-        funding_rate: float = 0.0,      # positivo = longs pagan, negativo = shorts pagan
+        df_htf1: pd.DataFrame = None,
+        df_htf2: pd.DataFrame = None,
+        funding_rate: float = 0.0,
     ) -> SignalResult:
         c = self.c
         p = self._compute_single(df_primary)
-        n = len(df_primary) - 1         # índice de la última barra
+        n = len(df_primary) - 1
 
-        # ── Confirmación MTF ──────────────────────────────────────────────
+        # ── MTF ──────────────────────────────────────────────────────────────
         mtf_ok = True
         if df_htf1 is not None and len(df_htf1) > 50:
             h1 = self._compute_single(df_htf1)
-            last_bull = bool(p["full_bull"].iloc[-1])
-            last_bear = bool(p["full_bear"].iloc[-1])
             htf1_bull = bool(h1["full_bull"].iloc[-1]) or bool(h1["trend_bull"].iloc[-1])
             htf1_bear = bool(h1["full_bear"].iloc[-1]) or bool(h1["trend_bear"].iloc[-1])
-            if last_bull and not htf1_bull:
+            if bool(p["full_bull"].iloc[-1]) and not htf1_bull:
                 mtf_ok = False
-            if last_bear and not htf1_bear:
+            if bool(p["full_bear"].iloc[-1]) and not htf1_bear:
                 mtf_ok = False
 
         if df_htf2 is not None and len(df_htf2) > 50:
             h2 = self._compute_single(df_htf2)
-            htf2_bull = bool(h2["trend_bull"].iloc[-1])
-            htf2_bear = bool(h2["trend_bear"].iloc[-1])
-            if bool(p["full_bull"].iloc[-1]) and not htf2_bull:
+            if bool(p["full_bull"].iloc[-1]) and not bool(h2["trend_bull"].iloc[-1]):
                 mtf_ok = False
-            if bool(p["full_bear"].iloc[-1]) and not htf2_bear:
+            if bool(p["full_bear"].iloc[-1]) and not bool(h2["trend_bear"].iloc[-1]):
                 mtf_ok = False
 
-        # ── Filtro funding rate ───────────────────────────────────────────
-        # Si el funding es muy positivo (+0.05%), los longs pagan mucho → no abrir longs
-        # Si el funding es muy negativo (-0.05%), los shorts pagan mucho → no abrir shorts
+        # ── Filtro funding ────────────────────────────────────────────────────
         funding_ok = True
         funding_threshold = c.get("funding_threshold", 0.05)
         if bool(p["full_bull"].iloc[-1]) and funding_rate > funding_threshold:
@@ -236,12 +224,13 @@ class Conflux4Engine:
         if bool(p["full_bear"].iloc[-1]) and funding_rate < -funding_threshold:
             funding_ok = False
 
-        # ── Filtro de volumen mínimo ──────────────────────────────────────
-        vol_pct_now = float(p["vol_pct"].iloc[-1]) if not np.isnan(float(p["vol_pct"].iloc[-1])) else 50.0
-        min_vol_pct = c.get("min_volume_percentile", 30)
-        vol_ok = vol_pct_now >= min_vol_pct
+        # ── Filtro volumen ────────────────────────────────────────────────────
+        vol_pct_now = float(p["vol_pct"].iloc[-1])
+        if np.isnan(vol_pct_now):
+            vol_pct_now = 50.0
+        vol_ok = vol_pct_now >= c.get("min_volume_percentile", 30)
 
-        # ── Señales raw con cooldown ──────────────────────────────────────
+        # ── Señales con cooldown ──────────────────────────────────────────────
         raw_bull = bool(p["full_bull"].iloc[-1]) and not bool(p["full_bull"].iloc[-2]) if n > 0 else False
         raw_bear = bool(p["full_bear"].iloc[-1]) and not bool(p["full_bear"].iloc[-2]) if n > 0 else False
 
@@ -254,10 +243,10 @@ class Conflux4Engine:
         if sig_bull or sig_bear:
             self._last_signal_bar = n
 
-        # ── Cálculo stop y TPs ────────────────────────────────────────────
+        # ── Niveles ───────────────────────────────────────────────────────────
         close_now = float(p["close"].iloc[-1])
-        st_now = float(p["st_val"].iloc[-1])
-        atr_now = float(p["atr"].iloc[-1])
+        st_now    = float(p["st_val"].iloc[-1])
+        atr_now   = float(p["atr"].iloc[-1])
 
         stop_mode = c["stop_mode"]
         raw_d = abs(close_now - st_now)
@@ -276,7 +265,7 @@ class Conflux4Engine:
         tp3 = entry + stop_dist * c["rr3"] if is_bull else entry - stop_dist * c["rr3"]
         tp4 = entry + stop_dist * c["rr4"] if is_bull else entry - stop_dist * c["rr4"]
 
-        # ── Score de calidad 0-10 ─────────────────────────────────────────
+        # ── Score calidad ─────────────────────────────────────────────────────
         signal = "BULL" if sig_bull else ("BEAR" if sig_bear else None)
         confluence = sum([
             bool(p["trend_bull"].iloc[-1]) or bool(p["trend_bear"].iloc[-1]),
@@ -286,29 +275,22 @@ class Conflux4Engine:
         ])
         quality = 0
         if signal:
-            quality += confluence * 2           # máx 8 (4 filtros × 2)
+            quality += confluence * 2
             if mtf_ok:
                 quality = min(10, quality + 1)
             if vol_pct_now > 60:
                 quality = min(10, quality + 1)
 
-        trend = "BULL" if bool(p["full_bull"].iloc[-1]) else ("BEAR" if bool(p["full_bear"].iloc[-1]) else "NEUTRAL")
+        trend = "BULL" if bool(p["full_bull"].iloc[-1]) else (
+                "BEAR" if bool(p["full_bear"].iloc[-1]) else "NEUTRAL")
 
         return SignalResult(
-            signal=signal,
-            quality=quality,
-            trend=trend,
-            close=close_now,
-            atr_val=atr_now,
-            stop_dist=stop_dist,
-            entry=entry,
-            stop=stop_price,
+            signal=signal, quality=quality, trend=trend,
+            close=close_now, atr_val=atr_now, stop_dist=stop_dist,
+            entry=entry, stop=stop_price,
             tp1=tp1, tp2=tp2, tp3=tp3, tp4=tp4,
             rsi_val=float(p["rsi"].iloc[-1]),
             adx_val=float(p["adx"].iloc[-1]),
-            confluence=confluence,
-            volume_pct=vol_pct_now,
-            st_val=st_now,
-            mtf_ok=mtf_ok,
-            funding_ok=funding_ok,
+            confluence=confluence, volume_pct=vol_pct_now,
+            st_val=st_now, mtf_ok=mtf_ok, funding_ok=funding_ok,
         )
