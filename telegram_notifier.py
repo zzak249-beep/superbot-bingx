@@ -1,6 +1,9 @@
 """
-Telegram Notifier v2 — Conflux 4 Bot
-Incluye: señales enriquecidas, alertas de riesgo, P&L dashboard, actualizaciones de trade activo.
+Telegram Notifier v3 — Conflux 4 Bot
+Mejoras v3:
+  - Señales incluyen MACD, BB, CVD, HMA y régimen de mercado
+  - Dashboard muestra top señales del scan
+  - Notificación al rotar lista de símbolos
 """
 
 import httpx
@@ -27,7 +30,7 @@ class TelegramNotifier:
             logger.error(f"Telegram error: {e}")
             return False
 
-    # ── Señal principal ────────────────────────────────────────────────────
+    # ── Señal principal v3 ────────────────────────────────────────────────
     def signal(self, result, symbol: str, interval: str, preset: str,
                risk_dec=None, quality: int = 0) -> str:
         sig = result.signal
@@ -49,10 +52,16 @@ class TelegramNotifier:
                 f"  Kelly: <code>{risk_dec.Kelly_fraction*100:.2f}%</code>"
             )
 
-        # Calcular R/R en texto
         sl_dist = abs(result.entry - result.stop)
         rr_tp2 = abs(result.tp2 - result.entry) / sl_dist if sl_dist > 0 else 0
         rr_tp4 = abs(result.tp4 - result.entry) / sl_dist if sl_dist > 0 else 0
+
+        # v3: indicadores adicionales
+        macd_e  = "✅" if result.macd_bull else "❌"
+        cvd_e   = "✅" if result.cvd_bull else "❌"
+        hma_e   = "✅" if result.hma_bull else "❌"
+        regime_e = "📈 Trend" if result.regime_trend else "↔️ Range"
+        bb_txt  = {"low": "🔵 zona baja", "mid": "⚪ zona media", "high": "🔴 zona alta"}.get(result.bb_position, "")
 
         msg = (
             f"{emoji}<b>CONFLUX 4 — {sig} SIGNAL</b>{emoji}\n"
@@ -63,14 +72,14 @@ class TelegramNotifier:
             f"💵 Entrada:         <code>{fmt(result.entry)}</code>\n"
             f"🛑 Stop Loss:       <code>{fmt(result.stop)}</code> ({sl_dist/result.entry*100:.2f}%)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 TP1 — 25% salida: <code>{fmt(result.tp1)}</code>\n"
-            f"🎯 TP2 — 25% salida: <code>{fmt(result.tp2)}</code> (RR {rr_tp2:.1f}×)\n"
-            f"🎯 TP3 — 25% salida: <code>{fmt(result.tp3)}</code>\n"
-            f"🎯 TP4 — 25% salida: <code>{fmt(result.tp4)}</code> (RR {rr_tp4:.1f}×)\n"
+            f"🎯 TP1 — 25%: <code>{fmt(result.tp1)}</code>\n"
+            f"🎯 TP2 — 25%: <code>{fmt(result.tp2)}</code> (RR {rr_tp2:.1f}×)\n"
+            f"🎯 TP3 — 25%: <code>{fmt(result.tp3)}</code>\n"
+            f"🎯 TP4 — 25%: <code>{fmt(result.tp4)}</code> (RR {rr_tp4:.1f}×)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📈 RSI: {result.rsi_val:.1f}  "
-            f"ADX: {result.adx_val:.1f}  "
-            f"Conf: {result.confluence}/4\n"
+            f"📈 RSI: {result.rsi_val:.1f}  ADX: {result.adx_val:.1f}  Conf: {result.confluence}/4\n"
+            f"📊 MACD: {macd_e}  CVD: {cvd_e}  HMA: {hma_e}\n"
+            f"🎯 BB: {bb_txt}  |  Régimen: {regime_e}\n"
             f"📊 Vol%ile: {result.volume_pct:.0f}  "
             f"MTF: {'✅' if result.mtf_ok else '❌'}  "
             f"Funding: {'✅' if result.funding_ok else '❌'}"
@@ -81,7 +90,21 @@ class TelegramNotifier:
         self.send(msg)
         return msg
 
-    # ── Actualización de trade activo (TP parcial, BE move, trailing) ─────
+    # ── Notificación de rotación de símbolos ──────────────────────────────
+    def symbols_updated(self, symbols: list, min_vol: float, top_n: int):
+        syms_txt = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(symbols[:15]))
+        extra = f"\n  ... y {len(symbols)-15} más" if len(symbols) > 15 else ""
+        msg = (
+            f"🔄 <b>Lista de pares actualizada</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📡 Escaneando top {top_n} pares por volumen\n"
+            f"💧 Vol mínimo: {min_vol/1e6:.1f}M USDT/24h\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{syms_txt}{extra}"
+        )
+        self.send(msg)
+
+    # ── Actualización de trade activo ─────────────────────────────────────
     def trade_update(self, symbol: str, events: list, price: float, pnl_approx: float = None):
         if not events:
             return
@@ -123,13 +146,25 @@ class TelegramNotifier:
         s = risk_summary
         wr_pct = s.get("winrate", 0) * 100
 
-        bars = lambda v, mx: "█" * int(v / mx * 10) + "░" * (10 - int(v / mx * 10)) if mx > 0 else "░" * 10
+        def bars(v, mx):
+            if mx <= 0: return "░" * 10
+            filled = int(v / mx * 10)
+            return "█" * filled + "░" * (10 - filled)
+
+        # Top señales: ordenar por calidad desc
+        sorted_results = sorted(
+            symbol_results.items(),
+            key=lambda x: x[1].quality,
+            reverse=True
+        )
 
         pairs_txt = ""
-        for sym, res in symbol_results.items():
+        for sym, res in sorted_results[:10]:  # máx 10 en dashboard
             trend_e = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "⚪"}.get(res.trend, "⚪")
-            pairs_txt += f"\n  {trend_e} <b>{sym}</b>: {res.trend} | RSI {res.rsi_val:.0f} | ADX {res.adx_val:.0f}"
+            sig_e = f" ⚡Q{res.quality}" if res.signal else ""
+            pairs_txt += f"\n  {trend_e} <b>{sym}</b>: {res.trend} | RSI {res.rsi_val:.0f} | ADX {res.adx_val:.0f}{sig_e}"
 
+        total_scanned = len(symbol_results)
         msg = (
             f"📊 <b>CONFLUX 4 — Performance Report</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -143,44 +178,45 @@ class TelegramNotifier:
             f"🔢 Trades totales: {s['all_trades']}\n"
             f"🔓 Posiciones abiertas: {s['open_positions']}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>Mercado actual:</b>{pairs_txt}"
+            f"<b>Top mercados ({total_scanned} pares escaneados):</b>{pairs_txt}"
         )
         self.send(msg)
 
-    # ── Señal rechazada por riesgo (solo log interno) ─────────────────────
     def signal_rejected(self, symbol: str, reason: str):
         msg = f"🚫 <b>Señal rechazada [{symbol}]</b>\n<i>{reason}</i>"
         self.send(msg)
 
-    # ── Startup ───────────────────────────────────────────────────────────
-    def startup(self, symbols: list, interval: str, preset: str, balance: float):
-        syms = "  " + "\n  ".join(f"• {s}" for s in symbols)
+    def startup(self, symbols: list, interval: str, preset: str, balance: float,
+                dynamic_scan: bool = True, top_n: int = 50):
+        mode_txt = (
+            f"🔍 Modo: <b>Scanner dinámico</b> (top {top_n} pares por volumen)"
+            if dynamic_scan else
+            f"📌 Modo: <b>Lista fija</b> ({len(symbols)} pares)"
+        )
+        syms_preview = "  " + "\n  ".join(f"• {s}" for s in symbols[:10])
+        extra = f"\n  ... y {len(symbols)-10} más" if len(symbols) > 10 else ""
         msg = (
-            f"🚀 <b>Conflux 4 Bot v2 — Iniciado</b>\n"
+            f"🚀 <b>Conflux 4 Bot v3 — Iniciado</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💰 Balance: <code>{balance:.2f} USDT</code>\n"
             f"⏱ Intervalo: {interval}  |  Preset: {preset}\n"
-            f"📊 Pares:\n{syms}\n"
+            f"{mode_txt}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ Motor de señales Conflux 4 activo\n"
+            f"<b>Pares iniciales:</b>\n{syms_preview}{extra}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Motor Conflux 4 v3 activo\n"
             f"🛡 Risk Manager activo\n"
             f"📊 Multi-timeframe: activado\n"
-            f"💸 Funding rate filter: activado"
+            f"💸 Funding rate filter: activado\n"
+            f"📈 MACD + BB + CVD + HMA: activado\n"
+            f"🌐 Régimen de mercado: activado"
         )
         self.send(msg)
 
     def error(self, msg: str):
         self.send(f"🚨 <b>ERROR</b>\n<code>{msg[:300]}</code>")
 
-
-    # ── Limpieza de webhook (llamar al inicio) ─────────────────────────────
     def delete_webhook(self) -> bool:
-        """
-        Elimina cualquier webhook activo de Telegram.
-        Necesario para usar polling REST sin conflictos.
-        El error 'WS error: server rejected WebSocket connection: HTTP 200'
-        ocurre cuando hay un webhook configurado que interfiere.
-        """
         try:
             r = httpx.post(
                 f"{self.base}/deleteWebhook",
@@ -199,7 +235,6 @@ class TelegramNotifier:
             return False
 
     def get_bot_info(self) -> dict:
-        """Verifica que el token es válido y devuelve info del bot."""
         try:
             r = httpx.get(f"{self.base}/getMe", timeout=10)
             data = r.json()

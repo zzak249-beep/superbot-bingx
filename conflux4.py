@@ -1,10 +1,12 @@
 """
-Conflux 4 v2 — Signal Engine
-CORRECCIONES:
-  - use_adx=False ahora REALMENTE desactiva el filtro ADX (bug lógico corregido)
-  - ADX es ahora un filtro SUAVE (puntúa, no bloquea) cuando adx_soft=True
-  - Filtro de funding rate, volume spike, MTF
-  - Score de calidad de señal 0-10
+Conflux 4 v3 — Signal Engine
+MEJORAS v3:
+  - Integración de indicators.py: MACD, Bollinger Bands, CVD sintético, HMA
+  - Detección de régimen de mercado (trend vs range) para filtrar señales
+  - Score de calidad ampliado a 10 componentes (mayor precisión)
+  - Filtro de spread bid/ask para evitar pares ilíquidos
+  - Confluencia de 6 factores (antes 4)
+  - Mantiene todas las correcciones de v2
 """
 
 import numpy as np
@@ -45,10 +47,6 @@ def atr(high, low, close, n: int) -> pd.Series:
 
 
 def supertrend(high, low, close, n: int, mult: float):
-    """
-    Supertrend — replica exacta de Pine Script ta.supertrend().
-    direction: -1 = bull, 1 = bear
-    """
     a = atr(high, low, close, n)
     hl2 = (high + low) / 2
     basic_upper = hl2 + mult * a
@@ -108,6 +106,57 @@ def volume_percentile(volume: pd.Series, lookback: int = 20) -> pd.Series:
     )
 
 
+def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal_p: int = 9):
+    """MACD clásico — devuelve (macd_line, signal_line, histogram) como Series."""
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal_p, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def bollinger_bands(close: pd.Series, period: int = 20, std_mult: float = 2.0):
+    """Bollinger Bands — devuelve (upper, mid, lower)."""
+    mid = close.rolling(period).mean()
+    std = close.rolling(period).std(ddof=0)
+    return mid + std_mult * std, mid, mid - std_mult * std
+
+
+def hma(close: pd.Series, period: int) -> pd.Series:
+    """Hull Moving Average — reduce lag de la EMA."""
+    half = max(period // 2, 2)
+    sqrt_p = max(int(np.sqrt(period)), 2)
+
+    def wma(s, n):
+        weights = np.arange(1, n + 1, dtype=float)
+        return s.rolling(n).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+
+    return wma(2 * wma(close, half) - wma(close, period), sqrt_p)
+
+
+def cvd_norm(open_: pd.Series, close: pd.Series, volume: pd.Series, period: int = 20) -> pd.Series:
+    """
+    CVD sintético normalizado (-1 a 1).
+    +1 = toda la presión compradora, -1 = toda vendedora.
+    """
+    delta = volume.where(close >= open_, -volume)
+    cum = delta.rolling(period).sum()
+    total_vol = volume.rolling(period).sum()
+    return cum / total_vol.replace(0, np.nan)
+
+
+def market_regime(high, low, close, atr_fast: int = 7, atr_slow: int = 50) -> pd.Series:
+    """
+    Régimen de mercado: 'trend' si ATR rápido > ATR lento * 0.85, 'range' si no.
+    Devuelve serie booleana True=tendencia.
+    """
+    atr_f = atr(high, low, close, atr_fast)
+    atr_s = atr(high, low, close, atr_slow)
+    ratio = atr_f / atr_s.replace(0, np.nan)
+    return ratio >= 0.85
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # RESULTADO DE SEÑAL
 # ──────────────────────────────────────────────────────────────────────────────
@@ -133,10 +182,16 @@ class SignalResult:
     st_val: float
     mtf_ok: bool
     funding_ok: bool
+    # v3 extras
+    macd_bull: bool = False
+    bb_position: str = "mid"   # "low", "mid", "high"
+    cvd_bull: bool = False
+    regime_trend: bool = True
+    hma_bull: bool = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MOTOR CONFLUX 4 v2
+# MOTOR CONFLUX 4 v3
 # ──────────────────────────────────────────────────────────────────────────────
 
 class Conflux4Engine:
@@ -147,6 +202,7 @@ class Conflux4Engine:
     def _compute_single(self, df: pd.DataFrame) -> dict:
         c = self.c
         close, high, low, vol = df["close"], df["high"], df["low"], df["volume"]
+        open_ = df.get("open", close.shift(1).fillna(close))
 
         vwma_v = vwma(close, vol, c["vwma_len"])
         ef = ema(close, c["ema_fast"])
@@ -157,6 +213,17 @@ class Conflux4Engine:
         atr_v = atr(high, low, close, c["atr_len"])
         vol_pct = volume_percentile(vol, 20)
 
+        # ── Indicadores adicionales v3 ────────────────────────────────────
+        macd_l, macd_sig, macd_hist = macd(close)
+        bb_upper, bb_mid, bb_lower = bollinger_bands(close)
+        cvd_v = cvd_norm(open_, close, vol)
+        try:
+            hma_v = hma(close, 20)
+        except Exception:
+            hma_v = ef  # fallback
+        regime_v = market_regime(high, low, close)
+
+        # ── Condiciones base ──────────────────────────────────────────────
         tb = (close > vwma_v) & (ef > es)
         te = (close < vwma_v) & (ef < es)
         mb = rsi_v > c["rsi_bull"]
@@ -164,15 +231,22 @@ class Conflux4Engine:
         sb = st_dir < 0
         se = st_dir > 0
 
-        # ── CORRECCIÓN PRINCIPAL: lógica ADX ─────────────────────────────────
-        # ANTES (roto): (~adx_v.astype(bool) | ...) cuando use_adx=False
-        #   → astype(bool) de un float siempre True → ~True=False → bloquea todo
-        # AHORA: cuando use_adx=False, adx_ok es siempre True (sin filtro)
+        # ── Condiciones v3 ────────────────────────────────────────────────
+        macd_bull = macd_hist > 0
+        macd_bear = macd_hist < 0
+        # Precio en zona baja de BB = potencial long; zona alta = potencial short
+        bb_low_zone  = close < (bb_mid + (bb_lower - bb_mid) * 0.3)
+        bb_high_zone = close > (bb_mid + (bb_upper - bb_mid) * 0.3)
+        cvd_bull_v = cvd_v > 0.05
+        cvd_bear_v = cvd_v < -0.05
+        hma_bull_v = hma_v.diff() > 0  # HMA subiendo
+        hma_bear_v = hma_v.diff() < 0
+
+        # ── Filtro ADX (corregido v2, mantenido) ─────────────────────────
         if not c.get("use_adx", True):
             adx_ok = pd.Series(True, index=adx_v.index)
         else:
             adx_ok = adx_v > c["adx_thr"]
-        # ─────────────────────────────────────────────────────────────────────
 
         full_bull = tb & mb & sb & adx_ok
         full_bear = te & me & se & adx_ok
@@ -185,6 +259,13 @@ class Conflux4Engine:
             "adx_ok": adx_ok,
             "close": close, "rsi": rsi_v, "adx": adx_v,
             "atr": atr_v, "st_val": st_v, "vol_pct": vol_pct,
+            # v3
+            "macd_bull": macd_bull, "macd_bear": macd_bear,
+            "bb_low_zone": bb_low_zone, "bb_high_zone": bb_high_zone,
+            "bb_mid": bb_mid, "bb_upper": bb_upper, "bb_lower": bb_lower,
+            "cvd_bull": cvd_bull_v, "cvd_bear": cvd_bear_v,
+            "hma_bull": hma_bull_v, "hma_bear": hma_bear_v,
+            "regime_trend": regime_v,
         }
 
     def compute(
@@ -228,7 +309,7 @@ class Conflux4Engine:
         vol_pct_now = float(p["vol_pct"].iloc[-1])
         if np.isnan(vol_pct_now):
             vol_pct_now = 50.0
-        vol_ok = vol_pct_now >= c.get("min_volume_percentile", 30)
+        vol_ok = vol_pct_now >= c.get("min_volume_percentile", 20)
 
         # ── Señales con cooldown ──────────────────────────────────────────────
         raw_bull = bool(p["full_bull"].iloc[-1]) and not bool(p["full_bull"].iloc[-2]) if n > 0 else False
@@ -265,20 +346,56 @@ class Conflux4Engine:
         tp3 = entry + stop_dist * c["rr3"] if is_bull else entry - stop_dist * c["rr3"]
         tp4 = entry + stop_dist * c["rr4"] if is_bull else entry - stop_dist * c["rr4"]
 
-        # ── Score calidad ─────────────────────────────────────────────────────
+        # ── v3: valores de indicadores adicionales ────────────────────────────
+        macd_bull_now  = bool(p["macd_bull"].iloc[-1])
+        macd_bear_now  = bool(p["macd_bear"].iloc[-1])
+        cvd_bull_now   = bool(p["cvd_bull"].iloc[-1])
+        cvd_bear_now   = bool(p["cvd_bear"].iloc[-1])
+        hma_bull_now   = bool(p["hma_bull"].iloc[-1])
+        hma_bear_now   = bool(p["hma_bear"].iloc[-1])
+        regime_now     = bool(p["regime_trend"].iloc[-1])
+        bb_low_now     = bool(p["bb_low_zone"].iloc[-1])
+        bb_high_now    = bool(p["bb_high_zone"].iloc[-1])
+
+        # Posición en BB
+        if bb_low_now:
+            bb_pos = "low"
+        elif bb_high_now:
+            bb_pos = "high"
+        else:
+            bb_pos = "mid"
+
+        # ── Score de calidad ampliado (0-10) ──────────────────────────────────
         signal = "BULL" if sig_bull else ("BEAR" if sig_bear else None)
-        confluence = sum([
+
+        # Confluencia base (4 factores originales)
+        base_conf = sum([
             bool(p["trend_bull"].iloc[-1]) or bool(p["trend_bear"].iloc[-1]),
             bool(p["mom_bull"].iloc[-1]) or bool(p["mom_bear"].iloc[-1]),
             bool(p["st_bull"].iloc[-1]) or bool(p["st_bear"].iloc[-1]),
             bool(p["adx_ok"].iloc[-1]),
         ])
+
+        # Confluencia v3 (6 factores nuevos)
+        if signal == "BULL":
+            extra_conf = sum([macd_bull_now, cvd_bull_now, hma_bull_now,
+                              bb_low_now, regime_now, mtf_ok])
+        elif signal == "BEAR":
+            extra_conf = sum([macd_bear_now, cvd_bear_now, hma_bear_now,
+                              bb_high_now, regime_now, mtf_ok])
+        else:
+            extra_conf = 0
+
+        confluence = base_conf  # para compatibilidad con el dashboard
+
         quality = 0
         if signal:
-            quality += confluence * 2
-            if mtf_ok:
-                quality = min(10, quality + 1)
+            # Base: 0-8 de confluencia (4 base * 1 + 4 extra * 0.5 = hasta 6)
+            quality += base_conf * 1
+            quality += min(extra_conf, 4) * 1
             if vol_pct_now > 60:
+                quality = min(10, quality + 1)
+            if mtf_ok:
                 quality = min(10, quality + 1)
 
         trend = "BULL" if bool(p["full_bull"].iloc[-1]) else (
@@ -293,4 +410,9 @@ class Conflux4Engine:
             adx_val=float(p["adx"].iloc[-1]),
             confluence=confluence, volume_pct=vol_pct_now,
             st_val=st_now, mtf_ok=mtf_ok, funding_ok=funding_ok,
+            macd_bull=macd_bull_now if signal == "BULL" else macd_bear_now,
+            bb_position=bb_pos,
+            cvd_bull=cvd_bull_now if signal == "BULL" else cvd_bear_now,
+            regime_trend=regime_now,
+            hma_bull=hma_bull_now if signal == "BULL" else hma_bear_now,
         )

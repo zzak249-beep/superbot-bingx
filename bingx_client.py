@@ -1,17 +1,18 @@
 """
-BingX Client v2
+BingX Client v3
 - OHLCV para múltiples timeframes (MTF)
 - Funding rate actual
 - Order book para detectar liquidez
 - Retry automático con backoff exponencial
 - Cálculo de cantidad por USDT de posición
+- get_all_symbols(): obtiene TODOS los pares perpetuos activos de BingX
 """
 
 import hashlib
 import hmac
 import time
 import urllib.parse
-from typing import Optional
+from typing import Optional, List
 import httpx
 import pandas as pd
 import numpy as np
@@ -42,7 +43,7 @@ class BingXClient:
         url = self.base + path
         for attempt in range(retries):
             try:
-                r = httpx.get(url, params=params or {}, timeout=12)
+                r = httpx.get(url, params=params or {}, timeout=15)
                 r.raise_for_status()
                 data = r.json()
                 if data.get("code") not in (0, None, "0", ""):
@@ -77,6 +78,87 @@ class BingXClient:
         r.raise_for_status()
         return r.json()
 
+    # ── TODOS LOS SÍMBOLOS ACTIVOS ────────────────────────────────────────
+    def get_all_symbols(
+        self,
+        min_volume_usdt: float = 5_000_000,
+        top_n: int = 50,
+        blacklist: set = None,
+    ) -> List[str]:
+        """
+        Obtiene todos los contratos perpetuos USDT de BingX,
+        filtra por volumen 24h y devuelve el top N ordenado por volumen.
+
+        Args:
+            min_volume_usdt: Volumen mínimo 24h en USDT (default: 5M)
+            top_n: Máximo de símbolos a devolver (default: 50)
+            blacklist: Conjunto de símbolos a excluir
+        """
+        _blacklist = blacklist or {
+            "USDC-USDT", "BUSD-USDT", "TUSD-USDT", "DAI-USDT",
+            "USDP-USDT", "FDUSD-USDT", "USDT-USDT",
+        }
+
+        try:
+            data = self._get_public("/openApi/swap/v2/quote/ticker")
+            tickers = data.get("data", [])
+
+            if not tickers:
+                logger.warning("get_all_symbols: no se recibieron tickers")
+                return []
+
+            candidates = []
+            for t in tickers:
+                symbol = t.get("symbol", "")
+                if not symbol.endswith("-USDT"):
+                    continue
+                if symbol in _blacklist:
+                    continue
+
+                try:
+                    quote_vol = float(
+                        t.get("quoteVolume") or
+                        t.get("turnover") or
+                        t.get("volume", 0)
+                    )
+                    # Si viene en unidades base, multiplicar por precio
+                    if quote_vol < 1000 and t.get("lastPrice"):
+                        quote_vol = float(t.get("volume", 0)) * float(t.get("lastPrice", 0))
+                except (ValueError, TypeError):
+                    continue
+
+                if quote_vol < min_volume_usdt:
+                    continue
+
+                candidates.append((symbol, quote_vol))
+
+            if not candidates:
+                logger.warning(
+                    f"0 símbolos superaron {min_volume_usdt:,.0f} USDT — usando fallback sin filtro"
+                )
+                for t in tickers:
+                    s = t.get("symbol", "")
+                    if s.endswith("-USDT") and s not in _blacklist:
+                        try:
+                            v = float(t.get("quoteVolume") or t.get("volume", 0))
+                            candidates.append((s, v))
+                        except Exception:
+                            pass
+
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            result = [s for s, _ in candidates[:top_n]]
+
+            logger.info(
+                f"📡 Símbolos activos ({len(result)}): "
+                + ", ".join(result[:10])
+                + (f"... +{len(result)-10} más" if len(result) > 10 else "")
+            )
+            return result
+
+        except Exception as e:
+            logger.error(f"Error obteniendo símbolos: {e}")
+            return []
+
     # ── OHLCV ─────────────────────────────────────────────────────────────
     def get_klines(self, symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
         data = self._get_public(
@@ -96,18 +178,11 @@ class BingXClient:
             df.columns = (base_cols + extra_cols)[:n_cols]
         else:
             rename = {
-                "time": "open_time",
-                "t":    "open_time",
-                "T":    "open_time",
-                "o":    "open",
-                "h":    "high",
-                "l":    "low",
-                "c":    "close",
-                "v":    "volume",
+                "time": "open_time", "t": "open_time", "T": "open_time",
+                "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume",
             }
             df = df.rename(columns=rename)
             if "open_time" not in df.columns:
-                logger.warning(f"Columna 'open_time' no encontrada. Asignación posicional.")
                 cols = list(df.columns)
                 base_cols = ["open_time", "open", "high", "low", "close", "volume"]
                 for i, c in enumerate(base_cols):
@@ -132,17 +207,10 @@ class BingXClient:
 
     # ── Funding rate ──────────────────────────────────────────────────────
     def get_funding_rate(self, symbol: str) -> float:
-        """
-        CORRECCIÓN: BingX puede devolver data["data"] como lista o dict.
-        - Lista: [{"fundingRate": "0.0001", "symbol": "BTC-USDT", ...}]
-        - Dict:  {"fundingRate": "0.0001", ...}
-        Ambos casos se manejan correctamente.
-        """
         try:
             data = self._get_public("/openApi/swap/v2/quote/fundingRate", {"symbol": symbol})
             d = data.get("data", {})
             if isinstance(d, list):
-                # Lista → tomar primer elemento
                 return float(d[0].get("fundingRate", 0)) if d else 0.0
             if isinstance(d, dict):
                 return float(d.get("fundingRate", 0))
