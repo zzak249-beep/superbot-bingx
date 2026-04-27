@@ -81,30 +81,73 @@ class BingXClient:
 
     # ── OHLCV ─────────────────────────────────────────────────────────────
     def get_klines(self, symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
+        """
+        CORRECCIÓN: BingX v3 devuelve dicts con clave 'time' (no 't' ni 'open_time').
+        Se maneja cualquier formato: lista de listas o lista de dicts con cualquier clave.
+        """
         data = self._get_public(
             "/openApi/swap/v3/quote/klines",
             {"symbol": symbol, "interval": interval, "limit": limit}
         )
-        rows = data.get("data") or data.get("data", [])
+        rows = data.get("data") or []
         if not rows:
             raise ValueError(f"Sin datos klines para {symbol} {interval}")
 
         df = pd.DataFrame(rows)
-        # BingX v3 devuelve dict con keys: o/h/l/c/v o columnas numéricas
-        if isinstance(rows[0], list):
-            df.columns = ["open_time","open","high","low","close","volume","close_time","qv"]
-        else:
-            rename = {"t": "open_time", "o": "open", "h": "high", "l": "low",
-                      "c": "close", "v": "volume"}
-            df = df.rename(columns=rename)
-            # fallback si devuelve columnas posicionales
-            if "open" not in df.columns:
-                df.columns = ["open_time","open","high","low","close","volume","close_time","qv"][:len(df.columns)]
 
-        df = df[["open_time","open","high","low","close","volume"]].copy()
-        for col in ["open","high","low","close","volume"]:
+        if isinstance(rows[0], list):
+            # ── Lista de listas ──────────────────────────────────────────
+            # BingX v3 devuelve [time, open, high, low, close, volume, ...]
+            # Asignamos solo tantos nombres como columnas haya (sin asumir 8)
+            n_cols = len(df.columns)
+            base_cols = ["open_time", "open", "high", "low", "close", "volume"]
+            extra_cols = [f"_extra_{i}" for i in range(max(0, n_cols - len(base_cols)))]
+            df.columns = (base_cols + extra_cols)[:n_cols]
+
+        else:
+            # ── Lista de dicts ───────────────────────────────────────────
+            # BingX puede devolver distintas claves según versión/endpoint:
+            #   "time"  → clave real observada en v3 swap
+            #   "t"     → clave corta alternativa
+            #   "T"     → variante mayúscula
+            #   "o","h","l","c","v" → abreviaturas
+            rename = {
+                "time": "open_time",    # ← CORRECCIÓN PRINCIPAL
+                "t":    "open_time",
+                "T":    "open_time",
+                "o":    "open",
+                "h":    "high",
+                "l":    "low",
+                "c":    "close",
+                "v":    "volume",
+            }
+            df = df.rename(columns=rename)
+
+            # Fallback posicional si open_time sigue sin estar
+            if "open_time" not in df.columns:
+                logger.warning(
+                    f"Columna 'open_time' no encontrada en {list(df.columns)[:6]}. "
+                    f"Aplicando asignación posicional."
+                )
+                cols = list(df.columns)
+                base_cols = ["open_time", "open", "high", "low", "close", "volume"]
+                for i, c in enumerate(base_cols):
+                    if i < len(cols):
+                        cols[i] = c
+                df.columns = cols
+
+        # ── Seleccionar y limpiar columnas finales ────────────────────────
+        df = df[["open_time", "open", "high", "low", "close", "volume"]].copy()
+        for col in ["open", "high", "low", "close", "volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", errors="coerce")
+
+        # open_time puede llegar como int (ms), string numérico o ya datetime
+        df["open_time"] = pd.to_datetime(
+            pd.to_numeric(df["open_time"], errors="coerce"),
+            unit="ms",
+            errors="coerce"
+        )
+
         df.dropna(inplace=True)
         df.set_index("open_time", inplace=True)
         return df
@@ -146,7 +189,6 @@ class BingXClient:
         if price is None:
             price = self.get_price(symbol)
         qty = position_usdt / price
-        # Redondeo conservador a 3 decimales
         return round(qty, 3)
 
     # ── Balance ───────────────────────────────────────────────────────────
@@ -210,7 +252,6 @@ class BingXClient:
     # ── Actualizar stop loss ───────────────────────────────────────────────
     def update_stop_loss(self, symbol: str, side: str, stop_price: float) -> dict:
         """Cancela SL existente y coloca uno nuevo."""
-        # Cancelar todos los stops del símbolo
         try:
             self._post_signed("/openApi/swap/v2/trade/allOpenOrders",
                                {"symbol": symbol, "type": "STOP_MARKET"})

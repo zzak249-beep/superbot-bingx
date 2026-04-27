@@ -1,4 +1,4 @@
-# Forzar uso del Dockerfile en lugar de nixpacks auto-detection
+# nixpacks.toml — solo usado si railway.toml no activa Dockerfile
 [phases.setup]
 nixPkgs = ["python311"]
 
@@ -6,4 +6,5 @@ nixPkgs = ["python311"]
 cmds = ["pip install --no-cache-dir -r requirements.txt"]
 
 [start]
-cmd = "python src/main.py"
+# CORRECCIÓN: main.py está en la raíz, no en src/
+cmd = "python main.py"

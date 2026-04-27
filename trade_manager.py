@@ -8,6 +8,7 @@ Gestiona trades activos en tiempo real:
 """
 
 import json
+import numpy as np  # ← CORRECCIÓN: import al inicio, no al final
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, Optional
@@ -89,7 +90,6 @@ class TradeManager:
         # ── Cancelación por inversión de trend (Supertrend flip) ─────────
         trend_flip = (is_long and not st_bull) or (not is_long and st_bull)
         if trend_flip and not t.tp1_hit:
-            # Solo cancelar antes de TP1 si el trend se invierte
             actions["close_full"] = True
             actions["events"].append(f"⚡ Trend flip — salida sin TP @ {price:.4f}")
             self._close(symbol)
@@ -103,7 +103,6 @@ class TradeManager:
             t.tp1_hit = True
             partial_qty = t.quantity * 0.25
             partial_reason = f"TP1 @ {t.tp1:.4f}"
-            # Mover stop a breakeven
             if not t.be_moved:
                 t.stop = t.entry
                 t.be_moved = True
@@ -138,7 +137,8 @@ class TradeManager:
             actions["partial_close"] = {"qty": partial_qty, "reason": partial_reason}
 
         # ── Trailing stop con Supertrend (solo después de TP1) ────────────
-        if t.tp1_hit and not np.isnan(st_val) if 'np' in dir() else t.tp1_hit:
+        # CORRECCIÓN: numpy ya está importado al inicio, condición simplificada
+        if t.tp1_hit and not np.isnan(float(st_val)):
             if is_long and st_bull and st_val > t.stop:
                 t.stop = st_val
                 actions["update_stop"] = st_val
@@ -158,10 +158,3 @@ class TradeManager:
 
     def all_trades(self) -> Dict[str, ActiveTrade]:
         return self.trades
-
-
-# Importamos numpy aquí para el trailing stop
-try:
-    import numpy as np
-except ImportError:
-    pass
