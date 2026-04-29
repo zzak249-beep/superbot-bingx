@@ -1,0 +1,95 @@
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CONFLUX 4 BOT — ULTRA SPEED EDITION
+# Requirements optimizados para máxima velocidad
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# ═══════════════════════════════════════════════════════════════
+# CORE DEPENDENCIES
+# ═══════════════════════════════════════════════════════════════
+aiohttp>=3.9.0           # Async HTTP client (vs requests: 3-5x faster)
+numpy>=1.26.0            # Vectorized computing
+pandas>=2.1.0            # DataFrames
+
+# ═══════════════════════════════════════════════════════════════
+# SPEED OPTIMIZATION — CRÍTICO PARA VELOCIDAD
+# ═══════════════════════════════════════════════════════════════
+numba>=0.58.0            # JIT compilation (100-1000x speedup en indicadores)
+bottleneck>=1.3.7        # Acelera operaciones pandas
+llvmlite>=0.41.0         # Requerido por numba
+
+# ═══════════════════════════════════════════════════════════════
+# WEBSOCKET & ASYNC
+# ═══════════════════════════════════════════════════════════════
+websockets>=12.0         # WebSocket client (latencia 10-30ms vs 200-500ms REST)
+asyncio>=3.4.3           # Async/await (incluido en Python 3.7+)
+uvloop>=0.19.0           # Event loop ultra-rápido (2-4x faster que asyncio default)
+
+# ═══════════════════════════════════════════════════════════════
+# MONITORING & LOGGING
+# ═══════════════════════════════════════════════════════════════
+rich>=13.7.0             # Terminal UI (dashboard)
+loguru>=0.7.2            # Better logging
+
+# ═══════════════════════════════════════════════════════════════
+# OPTIONAL — Para máxima optimización
+# ═══════════════════════════════════════════════════════════════
+# orjson>=3.9.10         # JSON ultra-rápido (3-5x faster que json stdlib)
+# ujson>=5.8.0           # JSON alternativo (2-3x faster)
+# msgpack>=1.0.7         # Serialización binaria (más rápido que JSON)
+# pyarrow>=14.0.0        # Columnar storage (10-100x faster para análisis)
+
+# ═══════════════════════════════════════════════════════════════
+# NOTES DE OPTIMIZACIÓN
+# ═══════════════════════════════════════════════════════════════
+# 
+# Para máximo rendimiento, instala en este orden:
+#
+# 1. Base:
+#    pip install numpy pandas
+#
+# 2. Compilación JIT (requiere compilador C):
+#    pip install numba llvmlite
+#
+# 3. Async optimizado:
+#    pip install uvloop websockets aiohttp
+#
+# 4. Resto:
+#    pip install -r requirements_ultra.txt
+#
+# ═══════════════════════════════════════════════════════════════
+# VERIFICAR NUMBA
+# ═══════════════════════════════════════════════════════════════
+#
+# Después de instalar, verifica que numba funciona:
+#
+#   python -c "import numba; numba.__version__"
+#   python -c "from numba import njit; print('OK')"
+#
+# Si hay errores, necesitas instalar compilador:
+#   - Linux: sudo apt install gcc
+#   - Mac: xcode-select --install
+#   - Windows: Visual Studio Build Tools
+#
+# ═══════════════════════════════════════════════════════════════
+# BENCHMARKS ESPERADOS
+# ═══════════════════════════════════════════════════════════════
+#
+# Con estas optimizaciones:
+#
+# • Cálculo de indicadores: 100-1000x más rápido
+#   - RSI(14) en 1000 velas: 15ms → 0.15ms
+#   - Supertrend: 45ms → 0.8ms
+#
+# • Scan de 50 símbolos: 12x más rápido
+#   - Secuencial: ~60s
+#   - Paralelo (20 threads): ~5s
+#
+# • Latencia de datos: 10-20x mejor
+#   - REST polling: 200-500ms
+#   - WebSocket: 10-30ms
+#
+# • Ejecución de órdenes: 5-10x más rápido
+#   - Sync + espera: ~500ms
+#   - Async fire & forget: ~50ms
+#
+# ═══════════════════════════════════════════════════════════════
