@@ -1,50 +1,65 @@
 """
-Configuración Conflux 4 Bot v3
-MEJORAS v3:
-  - Escaneo dinámico de TODOS los pares BingX (no lista fija)
-  - Variables de entorno para controlar el scanner dinámico
-  - TOP_N_SYMBOLS: cuántos pares escanear (default 50)
-  - MIN_VOLUME_USDT: volumen mínimo 24h para incluir un par (default 5M)
-  - SYMBOL_REFRESH_HOURS: cada cuántas horas rotar la lista (default 4h)
-  - FIXED_SYMBOLS: si se define, usa lista fija (compatible con versión anterior)
-  - Mantenemos todos los ajustes de señal de v2
+Configuración Conflux 4 Bot v3.1 (MEJORADO)
+
+Cambios sobre v3:
+  - adx_min=22: filtro ADX siempre activo (era use_adx=False en presets)
+  - R/R mínimo 2.0 (era 1.0 en Daytrader)
+  - sl_atr_mult=1.5: SL basado en ATR real
+  - RSI por zonas (rsi_bull_lo/hi, rsi_bear_lo/hi)
+  - funding_threshold=0.03 (más conservador, era 0.05)
+  - min_volume_percentile=30 (era 20)
+  - Log completo de config al arranque
+  - Nuevas env vars: ADX_MIN, SL_ATR_MULT, MIN_RR, RSI_BULL_LO/HI, RSI_BEAR_LO/HI
 """
 
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
+from loguru import logger
 
 
 PRESETS = {
     "Scalp": {
         "cooldown": 3,
-        "use_adx": False, "adx_thr": 15,
-        "stop_mode": "ATR Cap",
-        "stop_atr_mult": 1.0, "stop_fixed_pct": 0.2,
-        "rr1": 0.5, "rr2": 1.0, "rr3": 1.5, "rr4": 2.0,
-        "leverage": 10, "max_risk_per_trade_pct": 1.0,
-        "max_daily_loss_pct": 2.0, "min_signal_quality": 4,
-        "rsi_bull": 50, "rsi_bear": 50,
+        "adx_min": 22,           # ADX mínimo siempre activo
+        "adx_thr": 22,
+        "stop_mode": "ATR",
+        "sl_atr_mult": 1.2,
+        "stop_fixed_pct": 0.2,
+        "min_rr": 1.5,           # Scalp puede tener RR menor
+        "rr1": 0.5, "rr2": 1.5, "rr3": 2.5, "rr4": 3.5,
+        "leverage": 10, "max_risk_per_trade_pct": 0.8,
+        "max_daily_loss_pct": 2.0, "min_signal_quality": 5,
+        "rsi_bull_lo": 47, "rsi_bull_hi": 65,
+        "rsi_bear_lo": 35, "rsi_bear_hi": 53,
     },
     "Daytrader": {
         "cooldown": 5,
-        "use_adx": False, "adx_thr": 18,
-        "stop_mode": "Supertrend",
-        "stop_atr_mult": 1.5, "stop_fixed_pct": 0.3,
-        "rr1": 0.5, "rr2": 1.0, "rr3": 2.0, "rr4": 3.0,
+        "adx_min": 22,
+        "adx_thr": 22,
+        "stop_mode": "ATR",
+        "sl_atr_mult": 1.5,
+        "stop_fixed_pct": 0.3,
+        "min_rr": 2.0,           # R/R mínimo 2.0 (MEJORA CLAVE)
+        "rr1": 0.5, "rr2": 2.0, "rr3": 3.0, "rr4": 4.5,
         "leverage": 5, "max_risk_per_trade_pct": 1.5,
-        "max_daily_loss_pct": 3.0, "min_signal_quality": 4,
-        "rsi_bull": 52, "rsi_bear": 48,
+        "max_daily_loss_pct": 3.0, "min_signal_quality": 5,
+        "rsi_bull_lo": 45, "rsi_bull_hi": 68,
+        "rsi_bear_lo": 32, "rsi_bear_hi": 55,
     },
     "Swing": {
         "cooldown": 10,
-        "use_adx": False, "adx_thr": 15,
-        "stop_mode": "Fixed %",
-        "stop_atr_mult": 1.5, "stop_fixed_pct": 0.5,
-        "rr1": 1.0, "rr2": 1.5, "rr3": 2.5, "rr4": 3.5,
+        "adx_min": 20,           # Swing permite tendencias algo más débiles
+        "adx_thr": 20,
+        "stop_mode": "ATR",
+        "sl_atr_mult": 2.0,      # SL más amplio para swing
+        "stop_fixed_pct": 0.5,
+        "min_rr": 2.5,
+        "rr1": 1.0, "rr2": 2.5, "rr3": 4.0, "rr4": 6.0,
         "leverage": 3, "max_risk_per_trade_pct": 2.0,
-        "max_daily_loss_pct": 4.0, "min_signal_quality": 4,
-        "rsi_bull": 50, "rsi_bear": 50,
+        "max_daily_loss_pct": 4.0, "min_signal_quality": 6,
+        "rsi_bull_lo": 45, "rsi_bull_hi": 65,
+        "rsi_bear_lo": 35, "rsi_bear_hi": 55,
     },
 }
 
@@ -71,18 +86,15 @@ class BotConfig:
     bingx_testnet: bool = False
     auto_trade: bool = False
 
-    # ── Scanner dinámico de pares ─────────────────────────────────────────
-    # Si fixed_symbols está vacío → usa scanner dinámico automático
+    # ── Scanner dinámico ──────────────────────────────────────────────────
     fixed_symbols: List[str] = field(default_factory=list)
-    top_n_symbols: int = 50           # Cuántos pares escanear del top por volumen
-    min_volume_usdt: float = 5_000_000  # Volumen mínimo 24h en USDT
-    symbol_refresh_hours: int = 4     # Cada cuántas horas actualizar la lista
+    top_n_symbols: int = 50
+    min_volume_usdt: float = 5_000_000
+    symbol_refresh_hours: int = 4
     symbol_blacklist: List[str] = field(default_factory=lambda: [
         "USDC-USDT", "BUSD-USDT", "TUSD-USDT", "DAI-USDT",
         "USDP-USDT", "FDUSD-USDT", "USDT-USDT",
     ])
-
-    # ── Pares actuales (se rellena en runtime) ────────────────────────────
     symbols: List[str] = field(default_factory=lambda: ["BTC-USDT", "ETH-USDT"])
 
     # ── Timeframe ─────────────────────────────────────────────────────────
@@ -98,28 +110,37 @@ class BotConfig:
     ema_fast: int = 21
     ema_slow: int = 50
     rsi_len: int = 14
-    rsi_bull: int = 52
-    rsi_bear: int = 48
     atr_len: int = 10
     st_mult: float = 3.5
-    use_adx: bool = False
     adx_len: int = 14
-    adx_thr: int = 18
 
-    # ── Señal ─────────────────────────────────────────────────────────────
+    # ── Filtros de señal mejorados ────────────────────────────────────────
+    adx_min: int = 22                # ADX mínimo para emitir señal
+    adx_thr: int = 22                # Alias compatible con v2
+    sl_atr_mult: float = 1.5         # SL = ATR × este multiplicador
+    sl_min_pct: float = 0.5          # SL mínimo como % del precio
+    min_rr: float = 2.0              # R/R mínimo garantizado
+
+    # Zonas RSI válidas por dirección
+    rsi_bull_lo: int = 45
+    rsi_bull_hi: int = 68
+    rsi_bear_lo: int = 32
+    rsi_bear_hi: int = 55
+
+    # ── TPs ───────────────────────────────────────────────────────────────
     cooldown: int = 5
-    stop_mode: str = "Supertrend"
+    stop_mode: str = "ATR"
     stop_atr_mult: float = 1.5
     stop_fixed_pct: float = 0.3
     rr1: float = 0.5
-    rr2: float = 1.0
-    rr3: float = 2.0
-    rr4: float = 3.0
+    rr2: float = 2.0                 # Era 1.0, subido a 2.0
+    rr3: float = 3.0
+    rr4: float = 4.5
 
     # ── Filtros extra ─────────────────────────────────────────────────────
     use_mtf: bool = True
-    min_volume_percentile: int = 20
-    funding_threshold: float = 0.05
+    min_volume_percentile: int = 30   # Era 20, subido a 30
+    funding_threshold: float = 0.03   # Era 0.05, bajado a 0.03
 
     # ── Riesgo ────────────────────────────────────────────────────────────
     starting_balance: float = 1000.0
@@ -130,7 +151,11 @@ class BotConfig:
     max_daily_loss_pct: float = 3.0
     max_weekly_loss_pct: float = 8.0
     max_drawdown_pct: float = 15.0
-    min_signal_quality: int = 4
+    min_signal_quality: int = 5       # Era 4, subido a 5
+
+    # Cooldown post-SL: no re-entrar N scans en el mismo par tras un stop
+    post_sl_cooldown_scans: int = 2
+
     use_session_filter: bool = True
     avoid_hours_utc: List[int] = field(default_factory=lambda: [0, 1, 2, 3])
 
@@ -153,53 +178,29 @@ def load_config() -> BotConfig:
     cfg.auto_trade       = os.environ.get("AUTO_TRADE", "false").lower() == "true"
 
     # ── Scanner dinámico ──────────────────────────────────────────────────
-    # FIXED_SYMBOLS="BTC-USDT,ETH-USDT" → lista fija (modo legacy)
-    # Sin FIXED_SYMBOLS → scanner dinámico automático
     if "FIXED_SYMBOLS" in os.environ:
         cfg.fixed_symbols = [s.strip() for s in os.environ["FIXED_SYMBOLS"].split(",") if s.strip()]
     elif "SYMBOLS" in os.environ:
-        # Compatibilidad con variable antigua SYMBOLS
         cfg.fixed_symbols = [s.strip() for s in os.environ["SYMBOLS"].split(",") if s.strip()]
 
-    if "TOP_N_SYMBOLS" in os.environ:
-        cfg.top_n_symbols = int(os.environ["TOP_N_SYMBOLS"])
-    if "MIN_VOLUME_USDT" in os.environ:
-        cfg.min_volume_usdt = float(os.environ["MIN_VOLUME_USDT"])
-    if "SYMBOL_REFRESH_HOURS" in os.environ:
-        cfg.symbol_refresh_hours = int(os.environ["SYMBOL_REFRESH_HOURS"])
+    _env_int(cfg, "TOP_N_SYMBOLS",       "top_n_symbols")
+    _env_float(cfg, "MIN_VOLUME_USDT",   "min_volume_usdt")
+    _env_int(cfg, "SYMBOL_REFRESH_HOURS","symbol_refresh_hours")
 
-    # Si hay lista fija, usarla directamente
     if cfg.fixed_symbols:
         cfg.symbols = cfg.fixed_symbols
 
-    if "INTERVAL" in os.environ:
-        cfg.interval = os.environ["INTERVAL"]
-    if "PRESET" in os.environ:
-        cfg.preset = os.environ["PRESET"]
-    if "SCAN_SECONDS" in os.environ:
-        cfg.scan_seconds = int(os.environ["SCAN_SECONDS"])
-    if "STARTING_BALANCE" in os.environ:
-        cfg.starting_balance = float(os.environ["STARTING_BALANCE"])
-    if "MAX_DAILY_LOSS_PCT" in os.environ:
-        cfg.max_daily_loss_pct = float(os.environ["MAX_DAILY_LOSS_PCT"])
-    if "MAX_DRAWDOWN_PCT" in os.environ:
-        cfg.max_drawdown_pct = float(os.environ["MAX_DRAWDOWN_PCT"])
-    if "VWMA_LEN" in os.environ:
-        cfg.vwma_len = int(os.environ["VWMA_LEN"])
-    if "USE_ADX" in os.environ:
-        cfg.use_adx = os.environ["USE_ADX"].lower() == "true"
-    if "ADX_THR" in os.environ:
-        cfg.adx_thr = int(os.environ["ADX_THR"])
-    if "RSI_BULL" in os.environ:
-        cfg.rsi_bull = int(os.environ["RSI_BULL"])
-    if "RSI_BEAR" in os.environ:
-        cfg.rsi_bear = int(os.environ["RSI_BEAR"])
-    if "MIN_VOL_PCT" in os.environ:
-        cfg.min_volume_percentile = int(os.environ["MIN_VOL_PCT"])
-    if "MIN_QUALITY" in os.environ:
-        cfg.min_signal_quality = int(os.environ["MIN_QUALITY"])
-    if "MAX_OPEN_TRADES" in os.environ:
-        cfg.max_open_trades = int(os.environ["MAX_OPEN_TRADES"])
+    _env_str(cfg,   "INTERVAL",           "interval")
+    _env_str(cfg,   "PRESET",             "preset")
+    _env_int(cfg,   "SCAN_SECONDS",       "scan_seconds")
+    _env_float(cfg, "STARTING_BALANCE",   "starting_balance")
+    _env_float(cfg, "MAX_DAILY_LOSS_PCT", "max_daily_loss_pct")
+    _env_float(cfg, "MAX_DRAWDOWN_PCT",   "max_drawdown_pct")
+    _env_int(cfg,   "VWMA_LEN",           "vwma_len")
+    _env_int(cfg,   "MIN_VOL_PCT",        "min_volume_percentile")
+    _env_int(cfg,   "MIN_QUALITY",        "min_signal_quality")
+    _env_int(cfg,   "MAX_OPEN_TRADES",    "max_open_trades")
+    _env_int(cfg,   "POST_SL_COOLDOWN",   "post_sl_cooldown_scans")
 
     # Aplicar preset
     p = PRESETS.get(cfg.preset, PRESETS["Daytrader"])
@@ -207,33 +208,106 @@ def load_config() -> BotConfig:
         if hasattr(cfg, k):
             setattr(cfg, k, v)
 
-    # Env vars tienen prioridad sobre preset
-    if "USE_ADX" in os.environ:
-        cfg.use_adx = os.environ["USE_ADX"].lower() == "true"
-    if "ADX_THR" in os.environ:
-        cfg.adx_thr = int(os.environ["ADX_THR"])
-    if "RSI_BULL" in os.environ:
-        cfg.rsi_bull = int(os.environ["RSI_BULL"])
-    if "RSI_BEAR" in os.environ:
-        cfg.rsi_bear = int(os.environ["RSI_BEAR"])
+    # Env vars tienen prioridad FINAL sobre preset
+    _env_int(cfg,   "ADX_MIN",        "adx_min")
+    _env_int(cfg,   "ADX_THR",        "adx_thr")
+    _env_float(cfg, "SL_ATR_MULT",    "sl_atr_mult")
+    _env_float(cfg, "SL_MIN_PCT",     "sl_min_pct")
+    _env_float(cfg, "MIN_RR",         "min_rr")
+    _env_int(cfg,   "RSI_BULL_LO",    "rsi_bull_lo")
+    _env_int(cfg,   "RSI_BULL_HI",    "rsi_bull_hi")
+    _env_int(cfg,   "RSI_BEAR_LO",    "rsi_bear_lo")
+    _env_int(cfg,   "RSI_BEAR_HI",    "rsi_bear_hi")
+    _env_float(cfg, "FUNDING_THR",    "funding_threshold")
+
+    # adx_thr sincronizado con adx_min (compatibilidad)
+    cfg.adx_thr = cfg.adx_min
 
     # MTF automático
     htf1, htf2 = MTF_MAP.get(cfg.interval, ("1h", "4h"))
     cfg.htf1 = htf1 or cfg.interval
     cfg.htf2 = htf2 or cfg.htf1
 
+    _log_config(cfg)
     return cfg
+
+
+# ── Helpers de env vars ───────────────────────────────────────────────────────
+
+def _env_int(cfg, env_key: str, attr: str):
+    if env_key in os.environ:
+        try:
+            setattr(cfg, attr, int(os.environ[env_key]))
+        except ValueError:
+            logger.warning(f"Env var {env_key} inválida: {os.environ[env_key]}")
+
+def _env_float(cfg, env_key: str, attr: str):
+    if env_key in os.environ:
+        try:
+            setattr(cfg, attr, float(os.environ[env_key]))
+        except ValueError:
+            logger.warning(f"Env var {env_key} inválida: {os.environ[env_key]}")
+
+def _env_str(cfg, env_key: str, attr: str):
+    if env_key in os.environ:
+        setattr(cfg, attr, os.environ[env_key])
+
+def _env_bool(cfg, env_key: str, attr: str):
+    if env_key in os.environ:
+        setattr(cfg, attr, os.environ[env_key].lower() == "true")
+
+
+def _log_config(cfg: BotConfig):
+    """Log completo de config al arranque — detecta conflictos entre env y defaults."""
+    logger.info("══════════════════ CONFIG ACTIVA ══════════════════")
+    logger.info(f"  Preset:          {cfg.preset}")
+    logger.info(f"  Interval:        {cfg.interval} | HTF1={cfg.htf1} HTF2={cfg.htf2}")
+    logger.info(f"  Pares:           {'dinámico top-' + str(cfg.top_n_symbols) if not cfg.fixed_symbols else str(len(cfg.symbols)) + ' fijos'}")
+    logger.info(f"  ADX mínimo:      {cfg.adx_min}  (filtro tendencia)")
+    logger.info(f"  RSI BULL:        [{cfg.rsi_bull_lo}-{cfg.rsi_bull_hi}]")
+    logger.info(f"  RSI BEAR:        [{cfg.rsi_bear_lo}-{cfg.rsi_bear_hi}]")
+    logger.info(f"  SL ATR mult:     {cfg.sl_atr_mult}x  (mín {cfg.sl_min_pct}%)")
+    logger.info(f"  R/R mínimo:      {cfg.min_rr}  | TPs: {cfg.rr1}/{cfg.rr2}/{cfg.rr3}/{cfg.rr4}")
+    logger.info(f"  Leverage:        {cfg.leverage}x")
+    logger.info(f"  Riesgo/trade:    {cfg.max_risk_per_trade_pct}%")
+    logger.info(f"  Max posición:    {cfg.max_position_usdt} USDT")
+    logger.info(f"  Max trades:      {cfg.max_open_trades}")
+    logger.info(f"  Calidad mínima:  {cfg.min_signal_quality}/10")
+    logger.info(f"  Auto-trade:      {'SÍ ⚡' if cfg.auto_trade else 'NO (solo señales)'}")
+    logger.info(f"  Testnet:         {cfg.bingx_testnet}")
+    logger.info(f"  Daily loss lím:  {cfg.max_daily_loss_pct}%")
+    logger.info(f"  Drawdown lím:    {cfg.max_drawdown_pct}%")
+    logger.info(f"  Funding umbral:  {cfg.funding_threshold}")
+    logger.info(f"  Vol percentil:   {cfg.min_volume_percentile}%")
+    logger.info("═══════════════════════════════════════════════════")
 
 
 def config_to_engine(cfg: BotConfig) -> dict:
     return {
-        "vwma_len": cfg.vwma_len, "ema_fast": cfg.ema_fast, "ema_slow": cfg.ema_slow,
-        "rsi_len": cfg.rsi_len, "rsi_bull": cfg.rsi_bull, "rsi_bear": cfg.rsi_bear,
-        "atr_len": cfg.atr_len, "st_mult": cfg.st_mult,
-        "use_adx": cfg.use_adx, "adx_len": cfg.adx_len, "adx_thr": cfg.adx_thr,
-        "cooldown": cfg.cooldown, "stop_mode": cfg.stop_mode,
-        "stop_atr_mult": cfg.stop_atr_mult, "stop_fixed_pct": cfg.stop_fixed_pct,
-        "rr1": cfg.rr1, "rr2": cfg.rr2, "rr3": cfg.rr3, "rr4": cfg.rr4,
+        "vwma_len": cfg.vwma_len,
+        "ema_fast": cfg.ema_fast,
+        "ema_slow": cfg.ema_slow,
+        "rsi_len": cfg.rsi_len,
+        "atr_len": cfg.atr_len,
+        "st_mult": cfg.st_mult,
+        "adx_len": cfg.adx_len,
+        # Filtros mejorados
+        "adx_min": cfg.adx_min,
+        "sl_atr_mult": cfg.sl_atr_mult,
+        "sl_min_pct": cfg.sl_min_pct,
+        "min_rr": cfg.min_rr,
+        "rsi_bull_lo": cfg.rsi_bull_lo,
+        "rsi_bull_hi": cfg.rsi_bull_hi,
+        "rsi_bear_lo": cfg.rsi_bear_lo,
+        "rsi_bear_hi": cfg.rsi_bear_hi,
+        "cooldown": cfg.cooldown,
+        "stop_mode": cfg.stop_mode,
+        "stop_atr_mult": cfg.sl_atr_mult,
+        "stop_fixed_pct": cfg.stop_fixed_pct,
+        "rr1": cfg.rr1,
+        "rr2": cfg.rr2,
+        "rr3": cfg.rr3,
+        "rr4": cfg.rr4,
         "min_volume_percentile": cfg.min_volume_percentile,
         "funding_threshold": cfg.funding_threshold,
     }
@@ -253,4 +327,5 @@ def config_to_risk(cfg: BotConfig) -> dict:
         "use_session_filter": cfg.use_session_filter,
         "avoid_hours_utc": cfg.avoid_hours_utc,
         "rr2": cfg.rr2,
+        "post_sl_cooldown_scans": cfg.post_sl_cooldown_scans,
     }

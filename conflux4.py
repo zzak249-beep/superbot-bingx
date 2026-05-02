@@ -1,174 +1,120 @@
 """
-Conflux 4 v3 — Signal Engine
-MEJORAS v3:
-  - Integración de indicators.py: MACD, Bollinger Bands, CVD sintético, HMA
-  - Detección de régimen de mercado (trend vs range) para filtrar señales
-  - Score de calidad ampliado a 10 componentes (mayor precisión)
-  - Filtro de spread bid/ask para evitar pares ilíquidos
-  - Confluencia de 6 factores (antes 4)
-  - Mantiene todas las correcciones de v2
+Conflux 4 Engine — v3.1 (MEJORADO)
+
+Mejoras sobre v3:
+  - Filtro ADX obligatorio: señal solo si ADX >= adx_min (default 22)
+  - SL basado en ATR × sl_atr_mult (default 1.5) — nunca menor que ruido
+  - R/R mínimo configurable (default 2.0) — TP recalculado si no se cumple
+  - RSI en zona: BULL solo si RSI en [rsi_bull_lo, rsi_bull_hi] (45-65)
+  - BEAR solo si RSI en [rsi_bear_lo, rsi_bear_hi] (35-55)
+  - Cooldown por símbolo independiente (ya estaba, reforzado)
+  - Log de señal siempre visible (corregido bug Signal=—)
+  - Calidad de señal mejorada: hasta 10 puntos con criterios claros
+  - Nuevo: confirmación de volumen relativo (vol > percentil configurable)
+  - Nuevo: filtro de funding rate bidireccional
 """
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Optional
 
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
-from typing import Optional
+from loguru import logger
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# INDICADORES BASE
+# Indicadores técnicos
 # ──────────────────────────────────────────────────────────────────────────────
 
-def ema(s: pd.Series, n: int) -> pd.Series:
-    return s.ewm(span=n, adjust=False).mean()
-
-
-def vwma(close: pd.Series, volume: pd.Series, n: int) -> pd.Series:
-    return (close * volume).rolling(n).sum() / volume.rolling(n).sum()
-
-
-def rsi(close: pd.Series, n: int) -> pd.Series:
-    d = close.diff()
-    g = d.clip(lower=0).ewm(com=n - 1, adjust=False).mean()
-    l = (-d.clip(upper=0)).ewm(com=n - 1, adjust=False).mean()
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rs = g / l
-        rs = rs.replace(-np.inf, np.inf)
-    return 100 - 100 / (1 + rs)
-
-
-def atr(high, low, close, n: int) -> pd.Series:
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(com=n - 1, adjust=False).mean()
-
-
-def supertrend(high, low, close, n: int, mult: float):
-    a = atr(high, low, close, n)
+def supertrend(high: pd.Series, low: pd.Series, close: pd.Series,
+               period: int = 10, mult: float = 3.0):
+    """Supertrend: devuelve (banda, dirección). dir < 0 = alcista."""
     hl2 = (high + low) / 2
-    basic_upper = hl2 + mult * a
-    basic_lower = hl2 - mult * a
+    atr = _atr(high, low, close, period)
+    upper = hl2 + mult * atr
+    lower = hl2 - mult * atr
 
-    st = pd.Series(np.nan, index=close.index, dtype=float)
-    direction = pd.Series(1, index=close.index, dtype=int)
-    final_upper = basic_upper.copy().astype(float)
-    final_lower = basic_lower.copy().astype(float)
+    st = pd.Series(np.nan, index=close.index)
+    direction = pd.Series(1, index=close.index)
 
     for i in range(1, len(close)):
-        if basic_lower.iat[i] > final_lower.iat[i - 1] or close.iat[i - 1] < final_lower.iat[i - 1]:
-            final_lower.iat[i] = basic_lower.iat[i]
-        else:
-            final_lower.iat[i] = final_lower.iat[i - 1]
+        prev_upper = upper.iloc[i - 1] if not np.isnan(st.iloc[i - 1]) else upper.iloc[i]
+        prev_lower = lower.iloc[i - 1] if not np.isnan(st.iloc[i - 1]) else lower.iloc[i]
+        prev_st = st.iloc[i - 1] if not np.isnan(st.iloc[i - 1]) else close.iloc[i]
+        prev_dir = direction.iloc[i - 1]
 
-        if basic_upper.iat[i] < final_upper.iat[i - 1] or close.iat[i - 1] > final_upper.iat[i - 1]:
-            final_upper.iat[i] = basic_upper.iat[i]
-        else:
-            final_upper.iat[i] = final_upper.iat[i - 1]
+        upper.iloc[i] = min(upper.iloc[i], prev_upper) if close.iloc[i - 1] <= prev_upper else upper.iloc[i]
+        lower.iloc[i] = max(lower.iloc[i], prev_lower) if close.iloc[i - 1] >= prev_lower else lower.iloc[i]
 
-        if close.iat[i] > final_upper.iat[i]:
-            direction.iat[i] = -1
-        elif close.iat[i] < final_lower.iat[i]:
-            direction.iat[i] = 1
+        if prev_dir == 1 and close.iloc[i] > prev_st:
+            direction.iloc[i] = -1
+        elif prev_dir == -1 and close.iloc[i] < prev_st:
+            direction.iloc[i] = 1
         else:
-            direction.iat[i] = direction.iat[i - 1]
+            direction.iloc[i] = prev_dir
 
-        st.iat[i] = final_lower.iat[i] if direction.iat[i] == -1 else final_upper.iat[i]
+        st.iloc[i] = lower.iloc[i] if direction.iloc[i] == -1 else upper.iloc[i]
 
     return st, direction
 
 
-def adx_indicator(high, low, close, n: int):
+def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+    prev_close = close.shift(1)
     tr = pd.concat([
         high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
     ], axis=1).max(axis=1)
-
-    dm_p = high.diff().clip(lower=0)
-    dm_m = (-low.diff()).clip(lower=0)
-    dm_p = dm_p.where(dm_p > (-low.diff()).clip(lower=0), 0)
-    dm_m = dm_m.where(dm_m > high.diff().clip(lower=0), 0)
-
-    atr_s = tr.ewm(com=n - 1, adjust=False).mean()
-    di_p = 100 * dm_p.ewm(com=n - 1, adjust=False).mean() / atr_s
-    di_m = 100 * dm_m.ewm(com=n - 1, adjust=False).mean() / atr_s
-
-    dx = 100 * (di_p - di_m).abs() / (di_p + di_m).replace(0, np.nan)
-    return di_p, di_m, dx.ewm(com=n - 1, adjust=False).mean()
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
-def volume_percentile(volume: pd.Series, lookback: int = 20) -> pd.Series:
-    return volume.rolling(lookback).apply(
-        lambda x: (x[-1] >= x).sum() / len(x) * 100, raw=True
-    )
+def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
 
 
-def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal_p: int = 9):
-    """MACD clásico — devuelve (macd_line, signal_line, histogram) como Series."""
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal_p, adjust=False).mean()
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
+def _ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
 
 
-def bollinger_bands(close: pd.Series, period: int = 20, std_mult: float = 2.0):
-    """Bollinger Bands — devuelve (upper, mid, lower)."""
-    mid = close.rolling(period).mean()
-    std = close.rolling(period).std(ddof=0)
-    return mid + std_mult * std, mid, mid - std_mult * std
+def _vwma(close: pd.Series, volume: pd.Series, period: int) -> pd.Series:
+    cv = close * volume
+    return cv.rolling(period).sum() / volume.rolling(period).sum()
 
 
-def hma(close: pd.Series, period: int) -> pd.Series:
-    """Hull Moving Average — reduce lag de la EMA."""
-    half = max(period // 2, 2)
-    sqrt_p = max(int(np.sqrt(period)), 2)
+def _adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """ADX clásico de Wilder."""
+    prev_high = high.shift(1)
+    prev_low = low.shift(1)
+    prev_close = close.shift(1)
 
-    def wma(s, n):
-        weights = np.arange(1, n + 1, dtype=float)
-        return s.rolling(n).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+    plus_dm = high - prev_high
+    minus_dm = prev_low - low
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
 
-    return wma(2 * wma(close, half) - wma(close, period), sqrt_p)
-
-
-def cvd_norm(open_: pd.Series, close: pd.Series, volume: pd.Series, period: int = 20) -> pd.Series:
-    """
-    CVD sintético normalizado (-1 a 1).
-    +1 = toda la presión compradora, -1 = toda vendedora.
-    """
-    delta = volume.where(close >= open_, -volume)
-    cum = delta.rolling(period).sum()
-    total_vol = volume.rolling(period).sum()
-    return cum / total_vol.replace(0, np.nan)
-
-
-def market_regime(high, low, close, atr_fast: int = 7, atr_slow: int = 50) -> pd.Series:
-    """
-    Régimen de mercado: 'trend' si ATR rápido > ATR lento * 0.85, 'range' si no.
-    Devuelve serie booleana True=tendencia.
-    """
-    atr_f = atr(high, low, close, atr_fast)
-    atr_s = atr(high, low, close, atr_slow)
-    ratio = atr_f / atr_s.replace(0, np.nan)
-    return ratio >= 0.85
+    atr = _atr(high, low, close, period)
+    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
+    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
+    return dx.ewm(alpha=1 / period, adjust=False).mean()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# RESULTADO DE SEÑAL
+# Resultado de señal
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class SignalResult:
-    signal: Optional[str]
-    quality: int
-    trend: str
-    close: float
-    atr_val: float
-    stop_dist: float
+    signal: Optional[str]       # "BULL" | "BEAR" | None
+    trend: str                  # "BULL" | "BEAR" | "NEUTRAL"
+    quality: int                # 0-10
     entry: float
     stop: float
     tp1: float
@@ -177,242 +123,387 @@ class SignalResult:
     tp4: float
     rsi_val: float
     adx_val: float
-    confluence: int
-    volume_pct: float
-    st_val: float
-    mtf_ok: bool
+    atr_val: float
+    atr_pct: float              # ATR como % del precio
+    rr_actual: float            # R/R real calculado
+    volume_ok: bool
     funding_ok: bool
-    # v3 extras
-    macd_bull: bool = False
-    bb_position: str = "mid"   # "low", "mid", "high"
-    cvd_bull: bool = False
-    regime_trend: bool = True
-    hma_bull: bool = False
+    reasons: list = field(default_factory=list)   # por qué se aprobó/rechazó
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MOTOR CONFLUX 4 v3
+# Motor principal
 # ──────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_CFG = {
+    # Indicadores
+    "vwma_len": 100,
+    "ema_fast": 21,
+    "ema_slow": 50,
+    "rsi_len": 14,
+    "atr_len": 10,
+    "st_mult": 3.5,
+    "adx_len": 14,
+
+    # ── FILTROS MEJORADOS ────────────────────────────────────────────────
+    # ADX mínimo para emitir señal (mercado con tendencia real)
+    "adx_min": 22,              # <22 = lateral = señal bloqueada
+
+    # RSI: zonas válidas para BULL y BEAR
+    "rsi_bull_lo": 45,          # RSI mínimo para BULL (no sobrevendido extremo)
+    "rsi_bull_hi": 68,          # RSI máximo para BULL (no sobrecomprado)
+    "rsi_bear_lo": 32,          # RSI mínimo para BEAR (no sobrevendido extremo)
+    "rsi_bear_hi": 55,          # RSI máximo para BEAR (no sobrecomprado)
+
+    # SL basado en ATR
+    "sl_atr_mult": 1.5,         # SL = entrada ± ATR × sl_atr_mult
+    "sl_min_pct": 0.5,          # SL nunca menor al 0.5% (protección contra ruido)
+
+    # R/R mínimo — si el TP natural no lo cumple, se amplía
+    "min_rr": 2.0,
+
+    # TPs basados en R/R desde el SL real
+    "rr1": 0.5,
+    "rr2": 2.0,                 # TP2 = referencia (era 1.0, subido a 2.0)
+    "rr3": 3.0,
+    "rr4": 4.5,
+
+    # Cooldown y otros
+    "cooldown": 5,
+    "stop_mode": "ATR",         # "ATR" | "Supertrend" | "Fixed %"
+    "stop_atr_mult": 1.5,
+    "stop_fixed_pct": 0.3,
+
+    # Volumen
+    "min_volume_percentile": 30,  # Subido de 20 a 30
+
+    # Funding rate
+    "funding_threshold": 0.03,    # Bajado de 0.05 a 0.03 (más conservador)
+}
+
 
 class Conflux4Engine:
-    def __init__(self, cfg: dict):
-        self.c = cfg
-        self._last_signal_bar: int = -999
+    def __init__(self, cfg: dict | None = None):
+        self.cfg = {**DEFAULT_CFG, **(cfg or {})}
 
-    def _compute_single(self, df: pd.DataFrame) -> dict:
-        c = self.c
-        close, high, low, vol = df["close"], df["high"], df["low"], df["volume"]
-        open_ = df.get("open", close.shift(1).fillna(close))
-
-        vwma_v = vwma(close, vol, c["vwma_len"])
-        ef = ema(close, c["ema_fast"])
-        es = ema(close, c["ema_slow"])
-        rsi_v = rsi(close, c["rsi_len"])
-        st_v, st_dir = supertrend(high, low, close, c["atr_len"], c["st_mult"])
-        _, _, adx_v = adx_indicator(high, low, close, c["adx_len"])
-        atr_v = atr(high, low, close, c["atr_len"])
-        vol_pct = volume_percentile(vol, 20)
-
-        # ── Indicadores adicionales v3 ────────────────────────────────────
-        macd_l, macd_sig, macd_hist = macd(close)
-        bb_upper, bb_mid, bb_lower = bollinger_bands(close)
-        cvd_v = cvd_norm(open_, close, vol)
-        try:
-            hma_v = hma(close, 20)
-        except Exception:
-            hma_v = ef  # fallback
-        regime_v = market_regime(high, low, close)
-
-        # ── Condiciones base ──────────────────────────────────────────────
-        tb = (close > vwma_v) & (ef > es)
-        te = (close < vwma_v) & (ef < es)
-        mb = rsi_v > c["rsi_bull"]
-        me = rsi_v < c["rsi_bear"]
-        sb = st_dir < 0
-        se = st_dir > 0
-
-        # ── Condiciones v3 ────────────────────────────────────────────────
-        macd_bull = macd_hist > 0
-        macd_bear = macd_hist < 0
-        # Precio en zona baja de BB = potencial long; zona alta = potencial short
-        bb_low_zone  = close < (bb_mid + (bb_lower - bb_mid) * 0.3)
-        bb_high_zone = close > (bb_mid + (bb_upper - bb_mid) * 0.3)
-        cvd_bull_v = cvd_v > 0.05
-        cvd_bear_v = cvd_v < -0.05
-        hma_bull_v = hma_v.diff() > 0  # HMA subiendo
-        hma_bear_v = hma_v.diff() < 0
-
-        # ── Filtro ADX (corregido v2, mantenido) ─────────────────────────
-        if not c.get("use_adx", True):
-            adx_ok = pd.Series(True, index=adx_v.index)
-        else:
-            adx_ok = adx_v > c["adx_thr"]
-
-        full_bull = tb & mb & sb & adx_ok
-        full_bear = te & me & se & adx_ok
-
-        return {
-            "full_bull": full_bull, "full_bear": full_bear,
-            "trend_bull": tb, "trend_bear": te,
-            "mom_bull": mb, "mom_bear": me,
-            "st_bull": sb, "st_bear": se,
-            "adx_ok": adx_ok,
-            "close": close, "rsi": rsi_v, "adx": adx_v,
-            "atr": atr_v, "st_val": st_v, "vol_pct": vol_pct,
-            # v3
-            "macd_bull": macd_bull, "macd_bear": macd_bear,
-            "bb_low_zone": bb_low_zone, "bb_high_zone": bb_high_zone,
-            "bb_mid": bb_mid, "bb_upper": bb_upper, "bb_lower": bb_lower,
-            "cvd_bull": cvd_bull_v, "cvd_bear": cvd_bear_v,
-            "hma_bull": hma_bull_v, "hma_bear": hma_bear_v,
-            "regime_trend": regime_v,
-        }
+        # Cooldown: timestamp de última señal emitida por símbolo
+        # Se controla externamente por símbolo, aquí guardamos el estado
+        self._last_signal_ts: float = 0.0
+        self._signals_emitted: int = 0
 
     def compute(
         self,
-        df_primary: pd.DataFrame,
-        df_htf1: pd.DataFrame = None,
-        df_htf2: pd.DataFrame = None,
+        df: pd.DataFrame,
+        df_htf1: pd.DataFrame | None = None,
+        df_htf2: pd.DataFrame | None = None,
         funding_rate: float = 0.0,
     ) -> SignalResult:
-        c = self.c
-        p = self._compute_single(df_primary)
-        n = len(df_primary) - 1
+        """
+        Calcula señal para un símbolo. Devuelve SignalResult.
+        signal=None si no hay señal válida.
+        """
+        c = self.cfg
 
-        # ── MTF ──────────────────────────────────────────────────────────────
-        mtf_ok = True
-        if df_htf1 is not None and len(df_htf1) > 50:
-            h1 = self._compute_single(df_htf1)
-            htf1_bull = bool(h1["full_bull"].iloc[-1]) or bool(h1["trend_bull"].iloc[-1])
-            htf1_bear = bool(h1["full_bear"].iloc[-1]) or bool(h1["trend_bear"].iloc[-1])
-            if bool(p["full_bull"].iloc[-1]) and not htf1_bull:
-                mtf_ok = False
-            if bool(p["full_bear"].iloc[-1]) and not htf1_bear:
-                mtf_ok = False
+        # ── Indicadores base ──────────────────────────────────────────────
+        close = df["close"]
+        high  = df["high"]
+        low   = df["low"]
+        vol   = df["volume"]
 
-        if df_htf2 is not None and len(df_htf2) > 50:
-            h2 = self._compute_single(df_htf2)
-            if bool(p["full_bull"].iloc[-1]) and not bool(h2["trend_bull"].iloc[-1]):
-                mtf_ok = False
-            if bool(p["full_bear"].iloc[-1]) and not bool(h2["trend_bear"].iloc[-1]):
-                mtf_ok = False
+        ema_fast = _ema(close, c["ema_fast"])
+        ema_slow = _ema(close, c["ema_slow"])
+        vwma     = _vwma(close, vol, c["vwma_len"])
+        rsi      = _rsi(close, c["rsi_len"])
+        atr      = _atr(high, low, close, c["atr_len"])
+        adx      = _adx(high, low, close, c["adx_len"])
+        st_val, st_dir = supertrend(high, low, close, c["atr_len"], c["st_mult"])
 
-        # ── Filtro funding ────────────────────────────────────────────────────
-        funding_ok = True
-        funding_threshold = c.get("funding_threshold", 0.05)
-        if bool(p["full_bull"].iloc[-1]) and funding_rate > funding_threshold:
-            funding_ok = False
-        if bool(p["full_bear"].iloc[-1]) and funding_rate < -funding_threshold:
-            funding_ok = False
+        # Valores actuales
+        price      = float(close.iloc[-1])
+        rsi_now    = float(rsi.iloc[-1])
+        adx_now    = float(adx.iloc[-1])
+        atr_now    = float(atr.iloc[-1])
+        atr_pct    = atr_now / price * 100
+        ema_f_now  = float(ema_fast.iloc[-1])
+        ema_s_now  = float(ema_slow.iloc[-1])
+        vwma_now   = float(vwma.iloc[-1])
+        st_val_now = float(st_val.iloc[-1])
+        st_bull    = bool(st_dir.iloc[-1] < 0)   # True = alcista
 
-        # ── Filtro volumen ────────────────────────────────────────────────────
-        vol_pct_now = float(p["vol_pct"].iloc[-1])
-        if np.isnan(vol_pct_now):
-            vol_pct_now = 50.0
-        vol_ok = vol_pct_now >= c.get("min_volume_percentile", 20)
+        # ── Tendencia base ────────────────────────────────────────────────
+        bull_trend = (
+            st_bull
+            and ema_f_now > ema_s_now
+            and price > vwma_now
+        )
+        bear_trend = (
+            not st_bull
+            and ema_f_now < ema_s_now
+            and price < vwma_now
+        )
+        trend_str = "BULL" if bull_trend else ("BEAR" if bear_trend else "NEUTRAL")
 
-        # ── Señales con cooldown ──────────────────────────────────────────────
-        raw_bull = bool(p["full_bull"].iloc[-1]) and not bool(p["full_bull"].iloc[-2]) if n > 0 else False
-        raw_bear = bool(p["full_bear"].iloc[-1]) and not bool(p["full_bear"].iloc[-2]) if n > 0 else False
+        # ── Filtro de volumen ─────────────────────────────────────────────
+        vol_pct = c.get("min_volume_percentile", 30)
+        vol_threshold = float(vol.quantile(vol_pct / 100))
+        volume_ok = float(vol.iloc[-1]) >= vol_threshold
 
-        bars_since = n - self._last_signal_bar
-        cooldown_ok = bars_since >= c["cooldown"]
+        # ── Filtro de funding rate ────────────────────────────────────────
+        ft = c.get("funding_threshold", 0.03)
+        # Funding muy positivo = mercado muy largo = evitar BULL
+        # Funding muy negativo = mercado muy corto = evitar BEAR
+        funding_ok_bull = funding_rate <= ft
+        funding_ok_bear = funding_rate >= -ft
+        funding_ok = True  # se aplica por dirección más abajo
 
-        sig_bull = raw_bull and cooldown_ok and mtf_ok and funding_ok and vol_ok
-        sig_bear = raw_bear and cooldown_ok and mtf_ok and funding_ok and vol_ok
+        # ── MTF confirmación ──────────────────────────────────────────────
+        mtf_bull = mtf_bear = True  # por defecto ok si no hay HTF
+        if df_htf1 is not None and len(df_htf1) > 10:
+            htf1_close = df_htf1["close"]
+            htf1_st_v, htf1_st_d = supertrend(
+                df_htf1["high"], df_htf1["low"], htf1_close,
+                c["atr_len"], c["st_mult"]
+            )
+            htf1_bull = bool(htf1_st_d.iloc[-1] < 0)
+            mtf_bull = htf1_bull
+            mtf_bear = not htf1_bull
 
-        if sig_bull or sig_bear:
-            self._last_signal_bar = n
+        if df_htf2 is not None and len(df_htf2) > 10:
+            htf2_close = df_htf2["close"]
+            htf2_ema_f = _ema(htf2_close, c["ema_fast"])
+            htf2_ema_s = _ema(htf2_close, c["ema_slow"])
+            htf2_bull_ema = float(htf2_ema_f.iloc[-1]) > float(htf2_ema_s.iloc[-1])
+            mtf_bull = mtf_bull and htf2_bull_ema
+            mtf_bear = mtf_bear and not htf2_bull_ema
 
-        # ── Niveles ───────────────────────────────────────────────────────────
-        close_now = float(p["close"].iloc[-1])
-        st_now    = float(p["st_val"].iloc[-1])
-        atr_now   = float(p["atr"].iloc[-1])
+        # ── Cooldown ──────────────────────────────────────────────────────
+        cooldown_bars = c.get("cooldown", 5)
+        in_cooldown = (time.time() - self._last_signal_ts) < (cooldown_bars * 60)
 
-        stop_mode = c["stop_mode"]
-        raw_d = abs(close_now - st_now)
-        if stop_mode == "ATR Cap":
-            stop_dist = min(raw_d, atr_now * c["stop_atr_mult"])
-        elif stop_mode == "Fixed %":
-            stop_dist = close_now * (c["stop_fixed_pct"] / 100)
+        # ════════════════════════════════════════════════════════════════
+        # EVALUACIÓN DE SEÑAL CON TODOS LOS FILTROS
+        # ════════════════════════════════════════════════════════════════
+
+        signal = None
+        reasons = []
+
+        # ── FILTRO 1: ADX mínimo (nuevo — más importante) ─────────────────
+        adx_min = c.get("adx_min", 22)
+        if adx_now < adx_min:
+            reasons.append(f"ADX {adx_now:.1f} < {adx_min} (mercado lateral)")
+            return self._no_signal(trend_str, rsi_now, adx_now, atr_now, atr_pct,
+                                   volume_ok, funding_ok, reasons, price)
+
+        # ── FILTRO 2: Tendencia clara ──────────────────────────────────────
+        if trend_str == "NEUTRAL":
+            reasons.append("Sin tendencia clara (ST/EMA/VWMA no alineados)")
+            return self._no_signal(trend_str, rsi_now, adx_now, atr_now, atr_pct,
+                                   volume_ok, funding_ok, reasons, price)
+
+        # ── FILTRO 3: Volumen ─────────────────────────────────────────────
+        if not volume_ok:
+            reasons.append(f"Volumen bajo (< percentil {vol_pct}%)")
+            return self._no_signal(trend_str, rsi_now, adx_now, atr_now, atr_pct,
+                                   volume_ok, funding_ok, reasons, price)
+
+        # ── FILTRO 4: Cooldown ────────────────────────────────────────────
+        if in_cooldown:
+            reasons.append("Cooldown activo")
+            return self._no_signal(trend_str, rsi_now, adx_now, atr_now, atr_pct,
+                                   volume_ok, funding_ok, reasons, price)
+
+        # ── SEÑAL BULL ────────────────────────────────────────────────────
+        if bull_trend:
+            rsi_lo = c.get("rsi_bull_lo", 45)
+            rsi_hi = c.get("rsi_bull_hi", 68)
+
+            if not (rsi_lo <= rsi_now <= rsi_hi):
+                reasons.append(f"RSI {rsi_now:.1f} fuera de zona BULL [{rsi_lo}-{rsi_hi}]")
+                return self._no_signal(trend_str, rsi_now, adx_now, atr_now, atr_pct,
+                                       volume_ok, funding_ok, reasons, price)
+
+            if not mtf_bull:
+                reasons.append("MTF no confirma alcista")
+                return self._no_signal(trend_str, rsi_now, adx_now, atr_now, atr_pct,
+                                       volume_ok, funding_ok, reasons, price)
+
+            if not funding_ok_bull:
+                reasons.append(f"Funding {funding_rate:.4f} muy positivo — evitar BULL")
+                funding_ok = False
+                return self._no_signal(trend_str, rsi_now, adx_now, atr_now, atr_pct,
+                                       volume_ok, funding_ok, reasons, price)
+
+            signal = "BULL"
+            reasons.append(f"RSI {rsi_now:.1f} en zona alcista")
+            reasons.append(f"ADX {adx_now:.1f} confirma tendencia")
+            if mtf_bull:
+                reasons.append("MTF confirma alcista")
+
+        # ── SEÑAL BEAR ────────────────────────────────────────────────────
+        elif bear_trend:
+            rsi_lo = c.get("rsi_bear_lo", 32)
+            rsi_hi = c.get("rsi_bear_hi", 55)
+
+            if not (rsi_lo <= rsi_now <= rsi_hi):
+                reasons.append(f"RSI {rsi_now:.1f} fuera de zona BEAR [{rsi_lo}-{rsi_hi}]")
+                return self._no_signal(trend_str, rsi_now, adx_now, atr_now, atr_pct,
+                                       volume_ok, funding_ok, reasons, price)
+
+            if not mtf_bear:
+                reasons.append("MTF no confirma bajista")
+                return self._no_signal(trend_str, rsi_now, adx_now, atr_now, atr_pct,
+                                       volume_ok, funding_ok, reasons, price)
+
+            if not funding_ok_bear:
+                reasons.append(f"Funding {funding_rate:.4f} muy negativo — evitar BEAR")
+                funding_ok = False
+                return self._no_signal(trend_str, rsi_now, adx_now, atr_now, atr_pct,
+                                       volume_ok, funding_ok, reasons, price)
+
+            signal = "BEAR"
+            reasons.append(f"RSI {rsi_now:.1f} en zona bajista")
+            reasons.append(f"ADX {adx_now:.1f} confirma tendencia")
+
         else:
-            stop_dist = raw_d
+            reasons.append("Tendencia no confirmada por todos los filtros")
+            return self._no_signal(trend_str, rsi_now, adx_now, atr_now, atr_pct,
+                                   volume_ok, funding_ok, reasons, price)
 
-        is_bull = sig_bull
-        entry = close_now
-        stop_price = entry - stop_dist if is_bull else entry + stop_dist
-        tp1 = entry + stop_dist * c["rr1"] if is_bull else entry - stop_dist * c["rr1"]
-        tp2 = entry + stop_dist * c["rr2"] if is_bull else entry - stop_dist * c["rr2"]
-        tp3 = entry + stop_dist * c["rr3"] if is_bull else entry - stop_dist * c["rr3"]
-        tp4 = entry + stop_dist * c["rr4"] if is_bull else entry - stop_dist * c["rr4"]
+        # ════════════════════════════════════════════════════════════════
+        # SEÑAL VÁLIDA — calcular niveles
+        # ════════════════════════════════════════════════════════════════
 
-        # ── v3: valores de indicadores adicionales ────────────────────────────
-        macd_bull_now  = bool(p["macd_bull"].iloc[-1])
-        macd_bear_now  = bool(p["macd_bear"].iloc[-1])
-        cvd_bull_now   = bool(p["cvd_bull"].iloc[-1])
-        cvd_bear_now   = bool(p["cvd_bear"].iloc[-1])
-        hma_bull_now   = bool(p["hma_bull"].iloc[-1])
-        hma_bear_now   = bool(p["hma_bear"].iloc[-1])
-        regime_now     = bool(p["regime_trend"].iloc[-1])
-        bb_low_now     = bool(p["bb_low_zone"].iloc[-1])
-        bb_high_now    = bool(p["bb_high_zone"].iloc[-1])
+        # ── SL basado en ATR (mejorado) ───────────────────────────────────
+        sl_atr_mult = c.get("sl_atr_mult", 1.5)
+        sl_min_pct  = c.get("sl_min_pct", 0.5) / 100
+        sl_dist_atr = atr_now * sl_atr_mult
+        sl_dist_min = price * sl_min_pct
+        sl_dist     = max(sl_dist_atr, sl_dist_min)  # nunca menor al ruido mínimo
 
-        # Posición en BB
-        if bb_low_now:
-            bb_pos = "low"
-        elif bb_high_now:
-            bb_pos = "high"
-        else:
-            bb_pos = "mid"
-
-        # ── Score de calidad ampliado (0-10) ──────────────────────────────────
-        signal = "BULL" if sig_bull else ("BEAR" if sig_bear else None)
-
-        # Confluencia base (4 factores originales)
-        base_conf = sum([
-            bool(p["trend_bull"].iloc[-1]) or bool(p["trend_bear"].iloc[-1]),
-            bool(p["mom_bull"].iloc[-1]) or bool(p["mom_bear"].iloc[-1]),
-            bool(p["st_bull"].iloc[-1]) or bool(p["st_bear"].iloc[-1]),
-            bool(p["adx_ok"].iloc[-1]),
-        ])
-
-        # Confluencia v3 (6 factores nuevos)
         if signal == "BULL":
-            extra_conf = sum([macd_bull_now, cvd_bull_now, hma_bull_now,
-                              bb_low_now, regime_now, mtf_ok])
-        elif signal == "BEAR":
-            extra_conf = sum([macd_bear_now, cvd_bear_now, hma_bear_now,
-                              bb_high_now, regime_now, mtf_ok])
+            # Para modo Supertrend: usar el valor del ST como referencia adicional
+            if c.get("stop_mode") == "Supertrend" and not np.isnan(st_val_now):
+                sl_st = price - st_val_now
+                sl_dist = max(sl_dist, sl_st)  # el mayor de los dos
+            stop = price - sl_dist
         else:
-            extra_conf = 0
+            if c.get("stop_mode") == "Supertrend" and not np.isnan(st_val_now):
+                sl_st = st_val_now - price
+                sl_dist = max(sl_dist, sl_st)
+            stop = price + sl_dist
 
-        confluence = base_conf  # para compatibilidad con el dashboard
+        # ── TPs con R/R mínimo garantizado ───────────────────────────────
+        min_rr = c.get("min_rr", 2.0)
+        rr1 = c.get("rr1", 0.5)
+        rr2 = max(c.get("rr2", 2.0), min_rr)   # TP2 nunca menor al R/R mínimo
+        rr3 = c.get("rr3", 3.0)
+        rr4 = c.get("rr4", 4.5)
 
-        quality = 0
-        if signal:
-            # Base: 0-8 de confluencia (4 base * 1 + 4 extra * 0.5 = hasta 6)
-            quality += base_conf * 1
-            quality += min(extra_conf, 4) * 1
-            if vol_pct_now > 60:
-                quality = min(10, quality + 1)
-            if mtf_ok:
-                quality = min(10, quality + 1)
+        risk = abs(price - stop)
 
-        trend = "BULL" if bool(p["full_bull"].iloc[-1]) else (
-                "BEAR" if bool(p["full_bear"].iloc[-1]) else "NEUTRAL")
+        if signal == "BULL":
+            tp1 = price + risk * rr1
+            tp2 = price + risk * rr2
+            tp3 = price + risk * rr3
+            tp4 = price + risk * rr4
+        else:
+            tp1 = price - risk * rr1
+            tp2 = price - risk * rr2
+            tp3 = price - risk * rr3
+            tp4 = price - risk * rr4
+
+        rr_actual = rr2
+
+        # ── Calidad de señal (0-10) ───────────────────────────────────────
+        quality = self._calc_quality(
+            adx_now, rsi_now, atr_pct, volume_ok, mtf_bull if signal == "BULL" else mtf_bear,
+            funding_rate, signal, rr_actual
+        )
+
+        # ── Registrar señal ────────────────────────────────────────────────
+        self._last_signal_ts = time.time()
+        self._signals_emitted += 1
+
+        logger.debug(
+            f"Señal {signal} | ADX={adx_now:.1f} RSI={rsi_now:.1f} "
+            f"ATR%={atr_pct:.2f} Q={quality} RR={rr_actual:.1f} | "
+            f"SL={stop:.6f} TP2={tp2:.6f}"
+        )
 
         return SignalResult(
-            signal=signal, quality=quality, trend=trend,
-            close=close_now, atr_val=atr_now, stop_dist=stop_dist,
-            entry=entry, stop=stop_price,
-            tp1=tp1, tp2=tp2, tp3=tp3, tp4=tp4,
-            rsi_val=float(p["rsi"].iloc[-1]),
-            adx_val=float(p["adx"].iloc[-1]),
-            confluence=confluence, volume_pct=vol_pct_now,
-            st_val=st_now, mtf_ok=mtf_ok, funding_ok=funding_ok,
-            macd_bull=macd_bull_now if signal == "BULL" else macd_bear_now,
-            bb_position=bb_pos,
-            cvd_bull=cvd_bull_now if signal == "BULL" else cvd_bear_now,
-            regime_trend=regime_now,
-            hma_bull=hma_bull_now if signal == "BULL" else hma_bear_now,
+            signal=signal,
+            trend=trend_str,
+            quality=quality,
+            entry=price,
+            stop=round(stop, 8),
+            tp1=round(tp1, 8),
+            tp2=round(tp2, 8),
+            tp3=round(tp3, 8),
+            tp4=round(tp4, 8),
+            rsi_val=round(rsi_now, 2),
+            adx_val=round(adx_now, 2),
+            atr_val=round(atr_now, 8),
+            atr_pct=round(atr_pct, 3),
+            rr_actual=round(rr_actual, 2),
+            volume_ok=volume_ok,
+            funding_ok=funding_ok,
+            reasons=reasons,
         )
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _no_signal(self, trend, rsi, adx, atr, atr_pct, vol_ok, fund_ok, reasons, price) -> SignalResult:
+        return SignalResult(
+            signal=None, trend=trend, quality=0,
+            entry=price, stop=0, tp1=0, tp2=0, tp3=0, tp4=0,
+            rsi_val=round(rsi, 2), adx_val=round(adx, 2),
+            atr_val=round(atr, 8), atr_pct=round(atr_pct, 3),
+            rr_actual=0, volume_ok=vol_ok, funding_ok=fund_ok,
+            reasons=reasons,
+        )
+
+    def _calc_quality(self, adx, rsi, atr_pct, vol_ok, mtf_ok,
+                      funding, signal, rr) -> int:
+        """
+        Calidad 0-10 basada en criterios objetivos.
+        Cada criterio suma puntos. Se redondea al entero.
+        """
+        score = 0.0
+
+        # ADX (0-3 pts): más fuerte la tendencia, más puntos
+        if adx >= 30:
+            score += 3.0
+        elif adx >= 25:
+            score += 2.0
+        elif adx >= 22:
+            score += 1.0
+
+        # RSI (0-2 pts): en zona ideal (50-60 BULL, 40-50 BEAR)
+        if signal == "BULL":
+            if 50 <= rsi <= 62:
+                score += 2.0
+            elif 45 <= rsi < 50 or 62 < rsi <= 68:
+                score += 1.0
+        else:
+            if 38 <= rsi <= 50:
+                score += 2.0
+            elif 32 <= rsi < 38 or 50 < rsi <= 55:
+                score += 1.0
+
+        # MTF (0-2 pts)
+        if mtf_ok:
+            score += 2.0
+
+        # Volumen (0-1 pt)
+        if vol_ok:
+            score += 1.0
+
+        # Funding rate (0-1 pt): neutral es mejor
+        if abs(funding) < 0.01:
+            score += 1.0
+
+        # ATR% (0-1 pt): volatilidad razonable (0.3%-1.5%)
+        if 0.3 <= atr_pct <= 1.5:
+            score += 1.0
+
+        return min(10, int(round(score)))
