@@ -1,160 +1,127 @@
 """
-Live Trade Manager — Conflux 4 v2
-Gestiona trades activos en tiempo real:
-  - Mover stop a breakeven cuando se alcanza TP1
-  - Salida parcial en cada TP (25% en TP1, 25% TP2, 25% TP3, 25% TP4)
-  - Trailing stop dinámico basado en Supertrend
-  - Cancela posición si el trend se invierte completamente
+Trade Manager — Conflux 4 Bot
+Gestiona posiciones abiertas: TP1 parcial, trailing stop, cierre total
 """
-
 import json
-import numpy as np  # ← CORRECCIÓN: import al inicio, no al final
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from loguru import logger
 
 
 @dataclass
 class ActiveTrade:
-    symbol: str
-    direction: str              # 'BULL' | 'BEAR'
-    entry: float
-    stop: float
-    tp1: float
-    tp2: float
-    tp3: float
-    tp4: float
-    quantity: float             # cantidad total
-    quantity_remaining: float   # cantidad pendiente
-    tp1_hit: bool = False
-    tp2_hit: bool = False
-    tp3_hit: bool = False
-    tp4_hit: bool = False
-    be_moved: bool = False      # stop movido a breakeven
-    partial_usdt_locked: float = 0.0   # beneficio ya asegurado
+    symbol:             str
+    direction:          str    # BULL | BEAR
+    entry:              float
+    stop:               float
+    tp1:                float
+    tp2:                float
+    tp3:                float
+    tp4:                float
+    quantity:           float
+    quantity_remaining: float
+    leverage:           int   = 5
+    position_usdt:      float = 0.0
+    quality:            int   = 0
+    tp1_done:           bool  = False
+    be_done:            bool  = False
 
 
 class TradeManager:
     def __init__(self, data_path: str = "data/trades.json"):
-        self.data_path = Path(data_path)
-        self.trades: Dict[str, ActiveTrade] = self._load()
+        self._path   = Path(data_path)
+        self._trades: Dict[str, ActiveTrade] = {}
+        self._load()
 
-    def _load(self) -> Dict[str, ActiveTrade]:
-        if self.data_path.exists():
+    def _load(self):
+        if self._path.exists():
             try:
-                with open(self.data_path) as f:
+                with open(self._path) as f:
                     raw = json.load(f)
-                return {k: ActiveTrade(**v) for k, v in raw.items()}
-            except Exception:
-                pass
-        return {}
+                for sym, d in raw.items():
+                    self._trades[sym] = ActiveTrade(**{
+                        k: v for k, v in d.items()
+                        if k in ActiveTrade.__dataclass_fields__
+                    })
+                logger.info(f"Trades cargados: {len(self._trades)}")
+            except Exception as e:
+                logger.warning(f"No se pudieron cargar trades: {e}")
 
-    def save(self):
-        self.data_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.data_path, "w") as f:
-            json.dump({k: asdict(v) for k, v in self.trades.items()}, f, indent=2)
+    def _save(self):
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._path, "w") as f:
+            json.dump({s: asdict(t) for s, t in self._trades.items()}, f, indent=2)
 
-    # ── Registrar nuevo trade ──────────────────────────────────────────────
     def open_trade(self, trade: ActiveTrade):
-        self.trades[trade.symbol] = trade
-        self.save()
-        logger.info(f"Trade abierto: {trade.symbol} {trade.direction} @ {trade.entry}")
+        self._trades[trade.symbol] = trade
+        self._save()
+        logger.info(f"Trade registrado: {trade.symbol} {trade.direction} @ {trade.entry:.4f}")
 
-    # ── Actualizar con precio actual y Supertrend ─────────────────────────
-    def update(self, symbol: str, price: float, st_val: float, st_bull: bool) -> dict:
-        """
-        Devuelve dict con acciones a tomar:
-          - close_full: cerrar toda la posición
-          - partial_close: {qty: float, reason: str}
-          - update_stop: nuevo nivel de stop
-          - events: lista de strings para logging/Telegram
-        """
-        if symbol not in self.trades:
-            return {}
-
-        t = self.trades[symbol]
-        actions = {"close_full": False, "partial_close": None,
-                   "update_stop": None, "events": []}
-
-        is_long = t.direction == "BULL"
-
-        # ── Chequeo de stop hit ───────────────────────────────────────────
-        stop_hit = (is_long and price <= t.stop) or (not is_long and price >= t.stop)
-        if stop_hit:
-            actions["close_full"] = True
-            actions["events"].append(f"🛑 STOP HIT @ {price:.4f}")
-            self._close(symbol)
-            return actions
-
-        # ── Cancelación por inversión de trend (Supertrend flip) ─────────
-        trend_flip = (is_long and not st_bull) or (not is_long and st_bull)
-        if trend_flip and not t.tp1_hit:
-            actions["close_full"] = True
-            actions["events"].append(f"⚡ Trend flip — salida sin TP @ {price:.4f}")
-            self._close(symbol)
-            return actions
-
-        # ── Hits de TP y salidas parciales (escalonado 25/25/25/25) ───────
-        partial_qty = 0.0
-        partial_reason = ""
-
-        if not t.tp1_hit and ((is_long and price >= t.tp1) or (not is_long and price <= t.tp1)):
-            t.tp1_hit = True
-            partial_qty = t.quantity * 0.25
-            partial_reason = f"TP1 @ {t.tp1:.4f}"
-            if not t.be_moved:
-                t.stop = t.entry
-                t.be_moved = True
-                actions["update_stop"] = t.entry
-                actions["events"].append(f"🔒 Stop movido a BE @ {t.entry:.4f}")
-            actions["events"].append(f"🎯 {partial_reason} — salida 25%")
-
-        elif not t.tp2_hit and ((is_long and price >= t.tp2) or (not is_long and price <= t.tp2)):
-            t.tp2_hit = True
-            partial_qty = t.quantity * 0.25
-            partial_reason = f"TP2 @ {t.tp2:.4f}"
-            actions["events"].append(f"🎯 {partial_reason} — salida 25%")
-
-        elif not t.tp3_hit and ((is_long and price >= t.tp3) or (not is_long and price <= t.tp3)):
-            t.tp3_hit = True
-            partial_qty = t.quantity * 0.25
-            partial_reason = f"TP3 @ {t.tp3:.4f}"
-            actions["events"].append(f"🎯 {partial_reason} — salida 25%")
-
-        elif not t.tp4_hit and ((is_long and price >= t.tp4) or (not is_long and price <= t.tp4)):
-            t.tp4_hit = True
-            partial_qty = t.quantity_remaining
-            partial_reason = f"TP4 @ {t.tp4:.4f}"
-            actions["events"].append(f"🏆 {partial_reason} — salida 100% restante")
-            actions["close_full"] = True
-            self._close(symbol)
-            self.save()
-            return actions
-
-        if partial_qty > 0:
-            t.quantity_remaining = max(0, t.quantity_remaining - partial_qty)
-            actions["partial_close"] = {"qty": partial_qty, "reason": partial_reason}
-
-        # ── Trailing stop con Supertrend (solo después de TP1) ────────────
-        # CORRECCIÓN: numpy ya está importado al inicio, condición simplificada
-        if t.tp1_hit and not np.isnan(float(st_val)):
-            if is_long and st_bull and st_val > t.stop:
-                t.stop = st_val
-                actions["update_stop"] = st_val
-            elif not is_long and not st_bull and st_val < t.stop:
-                t.stop = st_val
-                actions["update_stop"] = st_val
-
-        self.save()
-        return actions
-
-    def _close(self, symbol: str):
-        self.trades.pop(symbol, None)
-        self.save()
-
-    def get_trade(self, symbol: str) -> Optional[ActiveTrade]:
-        return self.trades.get(symbol)
+    def remove(self, symbol: str):
+        self._trades.pop(symbol, None)
+        self._save()
 
     def all_trades(self) -> Dict[str, ActiveTrade]:
-        return self.trades
+        return dict(self._trades)
+
+    def update(self, symbol: str, current_price: float,
+               st_val: float, st_bull: bool) -> dict:
+        """
+        Evalúa la posición y devuelve acciones a ejecutar.
+        Returns dict con keys: events, close_full, partial_close, update_stop
+        """
+        trade = self._trades.get(symbol)
+        if not trade:
+            return {}
+
+        actions  = {"events": [], "close_full": False,
+                    "partial_close": None, "update_stop": None}
+        price    = current_price
+        is_bull  = trade.direction == "BULL"
+
+        # ── Check TP1 (cierre parcial 50%) ────────────────────────────────
+        if not trade.tp1_done:
+            hit_tp1 = (price >= trade.tp1) if is_bull else (price <= trade.tp1)
+            if hit_tp1:
+                qty_close = round(trade.quantity * 0.5, 6)
+                trade.quantity_remaining -= qty_close
+                trade.tp1_done = True
+                actions["events"].append("TP1 parcial 50%")
+                actions["partial_close"] = {"qty": qty_close}
+                logger.info(f"TP1 alcanzado: {symbol} cierre parcial {qty_close}")
+
+        # ── Breakeven tras TP1 ────────────────────────────────────────────
+        if trade.tp1_done and not trade.be_done:
+            trade.stop    = trade.entry
+            trade.be_done = True
+            actions["events"].append("SL → Breakeven")
+            actions["update_stop"] = trade.entry
+            logger.info(f"Breakeven: {symbol} SL → {trade.entry:.4f}")
+
+        # ── Trailing stop: Supertrend flip ────────────────────────────────
+        if trade.be_done:
+            if is_bull and not st_bull:
+                actions["events"].append("Trailing SELL (Supertrend flip)")
+                actions["close_full"] = True
+                logger.info(f"Trail BULL→BEAR: {symbol} @ {price:.4f}")
+            elif not is_bull and st_bull:
+                actions["events"].append("Trailing BUY (Supertrend flip)")
+                actions["close_full"] = True
+                logger.info(f"Trail BEAR→BULL: {symbol} @ {price:.4f}")
+
+        # ── TP2 definitivo ────────────────────────────────────────────────
+        if not actions["close_full"]:
+            hit_tp2 = (price >= trade.tp2) if is_bull else (price <= trade.tp2)
+            if hit_tp2:
+                actions["events"].append("TP2 alcanzado")
+                actions["close_full"] = True
+                logger.info(f"TP2 alcanzado: {symbol} @ {price:.4f}")
+
+        # Si se cierra, eliminar del registro
+        if actions["close_full"]:
+            self.remove(symbol)
+        elif actions["events"]:
+            self._save()
+
+        return actions
