@@ -1,21 +1,24 @@
 """
-Conflux 4 Bot — main.py v3.2
+Conflux 4 Bot — main.py v4.0
 Loop principal: scan → señal → trade → gestión → notificación Telegram
+
+CAMBIOS v4.0:
+  ✓ Pasa symbol= a engine.compute() para cooldown per-símbolo correcto
+  ✓ Compatible con conflux4.py v4.0
 """
-import asyncio
 import sys
 import time
 import signal as _signal
 import logging
 from loguru import logger
 
-from config          import load_config, config_to_engine, config_to_risk
-from bingx_client    import BingXClient
+from config           import load_config, config_to_engine, config_to_risk
+from bingx_client     import BingXClient
 from telegram_notifier import TelegramNotifier
-from risk_manager    import RiskManager
-from trade_manager   import TradeManager, ActiveTrade
-from symbol_scanner  import SymbolScanner
-from conflux4        import Conflux4Engine as ConfluxEngine, supertrend
+from risk_manager     import RiskManager
+from trade_manager    import TradeManager, ActiveTrade
+from symbol_scanner   import SymbolScanner
+from conflux4         import Conflux4Engine as ConfluxEngine, supertrend
 
 # ── logging stdout (Railway) ──────────────────────────────────────────────────
 logging.basicConfig(
@@ -35,7 +38,6 @@ def _on_signal(signum, frame):
     logger.info(f"Señal {signum} → shutdown")
     _shutdown = True
 
-# ── helper de klines para un símbolo ─────────────────────────────────────────
 
 def _scan_symbol(symbol, bingx, engine, cfg):
     """Pide klines y calcula señal. Retorna (result, df_base) o (None, None)."""
@@ -53,7 +55,8 @@ def _scan_symbol(symbol, bingx, engine, cfg):
             except Exception:
                 pass
         funding = bingx.get_funding_rate(symbol)
-        result  = engine.compute(df, df_htf1, df_htf2, funding_rate=funding)
+        # ✅ FIX: pasar symbol= para cooldown per-símbolo
+        result  = engine.compute(df, df_htf1, df_htf2, funding_rate=funding, symbol=symbol)
         return result, df
     except Exception as e:
         logger.warning(f"scan_symbol {symbol}: {e}")
@@ -66,27 +69,23 @@ def main():
     _signal.signal(_signal.SIGINT,  _on_signal)
 
     logger.info("═══════════════════════════════════════════════")
-    logger.info("        Conflux 4 Bot v3.2 — Arrancando        ")
+    logger.info("        Conflux 4 Bot v4.0 — Arrancando        ")
     logger.info("═══════════════════════════════════════════════")
 
-    # ── Config ────────────────────────────────────────────────────────────────
     try:
         cfg = load_config()
     except Exception as e:
         logger.critical(f"Error de config: {e}")
         sys.exit(1)
 
-    # ── Clientes ──────────────────────────────────────────────────────────────
     bingx = BingXClient(cfg.bingx_api_key, cfg.bingx_secret, testnet=cfg.bingx_testnet)
     tg    = TelegramNotifier(cfg.telegram_token, cfg.telegram_chat_id)
 
-    # Verificar bot Telegram
     bot_info = tg.get_bot_info()
     if not bot_info:
         logger.warning("No se pudo verificar el bot Telegram — continúa de todos modos")
     tg.delete_webhook()
 
-    # ── Piezas del bot ────────────────────────────────────────────────────────
     engine    = ConfluxEngine(config_to_engine(cfg))
     risk      = RiskManager(config_to_risk(cfg))
     trade_mgr = TradeManager()
@@ -96,7 +95,6 @@ def main():
         refresh_seconds  = cfg.symbol_refresh_hours * 3600,
     )
 
-    # ── Símbolos iniciales ────────────────────────────────────────────────────
     dynamic_scan = not bool(cfg.fixed_symbols)
     if dynamic_scan:
         try:
@@ -105,7 +103,6 @@ def main():
         except Exception as e:
             logger.warning(f"Scanner inicial: {e} — usando fallback")
 
-    # ── Balance inicial ───────────────────────────────────────────────────────
     if cfg.bingx_api_key:
         try:
             live_balance = bingx.get_balance()
@@ -119,7 +116,6 @@ def main():
         except Exception as e:
             logger.warning(f"Balance inicial: {e}")
 
-    # ── Notificación de arranque ──────────────────────────────────────────────
     tg.startup(
         symbols      = cfg.symbols,
         interval     = cfg.interval,
@@ -137,16 +133,12 @@ def main():
             "<code>BINGX_API_KEY</code> para operar en real."
         )
 
-    # ── Variables de loop ─────────────────────────────────────────────────────
     scan_count         = 0
     last_results: dict = {}
 
     logger.info(f"Loop iniciado — scan cada {cfg.scan_seconds}s | "
                 f"{'OPERANDO' if cfg.auto_trade else 'SOLO SEÑALES'}")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # LOOP PRINCIPAL
-    # ══════════════════════════════════════════════════════════════════════════
     while not _shutdown:
         loop_start = time.time()
         scan_count += 1
@@ -174,21 +166,18 @@ def main():
                 if price <= 0:
                     continue
 
-                # Supertrend del timeframe base para trailing
-                df_quick  = bingx.get_klines(symbol, cfg.interval, limit=50)
+                df_quick   = bingx.get_klines(symbol, cfg.interval, limit=50)
                 st_v, st_d = supertrend(df_quick["high"], df_quick["low"],
                                         df_quick["close"], cfg.atr_len, cfg.st_mult)
-                st_val_now = float(st_v.iloc[-1])
+                st_val_now  = float(st_v.iloc[-1])
                 st_bull_now = bool(st_d.iloc[-1] < 0)
 
                 actions = trade_mgr.update(symbol, price, st_val_now, st_bull_now)
-
                 if not actions:
                     continue
 
                 open_side = "BUY" if trade.direction == "BULL" else "SELL"
 
-                # Notificar eventos
                 if actions.get("events"):
                     pnl_approx = ((price - trade.entry) / trade.entry
                                   * risk.state.current_balance * 0.1
@@ -197,7 +186,6 @@ def main():
                                   * risk.state.current_balance * 0.1)
                     tg.trade_update(symbol, actions["events"], price, pnl_approx)
 
-                # Cierre total
                 if actions.get("close_full") and cfg.auto_trade and cfg.bingx_api_key:
                     try:
                         close_side = "SELL" if trade.direction == "BULL" else "BUY"
@@ -207,17 +195,14 @@ def main():
                                if trade.direction == "BULL"
                                else (trade.entry - price) / trade.entry
                                * trade.position_usdt * cfg.leverage)
-                        won = pnl >= 0
-                        reason = (actions["events"][-1]
-                                  if actions.get("events") else "Cierre")
+                        won    = pnl >= 0
+                        reason = actions["events"][-1] if actions.get("events") else "Cierre"
                         risk.register_close(symbol, pnl, won)
-                        tg.trade_closed(symbol, trade.direction, trade.entry,
-                                        price, pnl, reason)
+                        tg.trade_closed(symbol, trade.direction, trade.entry, price, pnl, reason)
                     except Exception as e:
                         logger.error(f"close_full {symbol}: {e}")
                         tg.error(f"Error cerrando {symbol}: {str(e)[:150]}")
 
-                # Cierre parcial (TP1)
                 elif actions.get("partial_close") and cfg.auto_trade and cfg.bingx_api_key:
                     try:
                         close_side = "SELL" if trade.direction == "BULL" else "BUY"
@@ -226,7 +211,6 @@ def main():
                     except Exception as e:
                         logger.error(f"partial_close {symbol}: {e}")
 
-                # Actualizar SL
                 if actions.get("update_stop") and cfg.auto_trade and cfg.bingx_api_key:
                     try:
                         bingx.update_stop_loss(symbol, open_side, actions["update_stop"])
@@ -243,8 +227,6 @@ def main():
         for symbol in cfg.symbols:
             if _shutdown:
                 break
-
-            # Saltarse si ya tenemos posición abierta en este par
             if symbol in trade_mgr.all_trades():
                 continue
 
@@ -255,7 +237,6 @@ def main():
 
             last_results[symbol] = result
 
-            # Sin señal
             if not result.signal:
                 logger.debug(
                     f"{symbol} {result.trend} | RSI={result.rsi_val:.0f} "
@@ -270,16 +251,13 @@ def main():
                 f"RR={result.rr_actual:.1f}"
             )
 
-            # ── Aprobación de riesgo ──────────────────────────────────────────
             risk_dec = risk.approve(symbol, direction, result.quality, result)
             if not risk_dec.approved:
                 logger.info(f"Risk REJECT {symbol}: {risk_dec.reason}")
                 continue
 
-            # ── Notificar señal aprobada ──────────────────────────────────────
             tg.signal(result, symbol, cfg.interval, cfg.preset, risk_dec, result.quality)
 
-            # ── Ejecutar orden ────────────────────────────────────────────────
             if cfg.auto_trade and cfg.bingx_api_key:
                 try:
                     price = bingx.get_price(symbol)
@@ -295,15 +273,14 @@ def main():
                         continue
 
                     order = bingx.place_market_order(
-                        symbol     = symbol,
-                        side       = side,
-                        quantity   = qty,
-                        stop_loss  = result.stop,
-                        take_profit= result.tp2,
-                        leverage   = cfg.leverage,
+                        symbol      = symbol,
+                        side        = side,
+                        quantity    = qty,
+                        stop_loss   = result.stop,
+                        take_profit = result.tp2,
+                        leverage    = cfg.leverage,
                     )
 
-                    # Registrar trade
                     trade = ActiveTrade(
                         symbol             = symbol,
                         direction          = direction,
@@ -322,7 +299,6 @@ def main():
                     trade_mgr.open_trade(trade)
                     risk.register_open(symbol, direction)
 
-                    # ── Notificación de trade abierto ─────────────────────────
                     tg.trade_opened(
                         symbol        = symbol,
                         direction     = direction,
@@ -344,7 +320,6 @@ def main():
                     logger.error(f"open_order {symbol}: {e}")
                     tg.error(f"Error abriendo {symbol}: {str(e)[:200]}")
 
-            # Pequeña pausa entre pares para no saturar la API
             time.sleep(0.3)
 
         # ── Alertas de error rate ─────────────────────────────────────────────
@@ -363,7 +338,7 @@ def main():
         # ── Alertas de drawdown / racha ───────────────────────────────────────
         dd     = risk.state.drawdown_pct
         max_dd = risk.cfg.get("max_drawdown_pct", 15)
-        if dd >= max_dd * 0.8:  # Alerta al 80% del límite
+        if dd >= max_dd * 0.8:
             tg.risk_alert(
                 "Drawdown alto",
                 f"Drawdown actual: {dd:.1f}% (límite: {max_dd}%)\n"
@@ -384,17 +359,14 @@ def main():
         signals_cnt = sum(1 for r in last_results.values() if r.signal)
         trades_open = len(trade_mgr.all_trades())
         logger.info(
-            f"Scan #{scan_count} | {total_syms} pares | "
-            f"Señales: {signals_cnt} | Trades abiertos: {trades_open} | "
-            f"WR: {risk.state.all_time_winrate*100:.0f}% | "
-            f"{elapsed:.1f}s"
+            f"Scan #{scan_count} completado | {total_syms} pares | "
+            f"Señales: {signals_cnt} | WR: {risk.state.all_time_winrate*100:.0f}% | "
+            f"Esperando {cfg.scan_seconds}s..."
         )
 
-        # ── Espera hasta siguiente scan ───────────────────────────────────────
         wait = max(0, cfg.scan_seconds - elapsed)
         time.sleep(wait)
 
-    # ── Shutdown limpio ───────────────────────────────────────────────────────
     logger.info("Shutdown limpio")
     tg._send("🛑 <b>Bot detenido.</b> Las posiciones en BingX permanecen abiertas.")
 
