@@ -1,10 +1,8 @@
-# nixpacks.toml — solo usado si railway.toml no activa Dockerfile
 [phases.setup]
-nixPkgs = ["python311"]
+nixPkgs = ["python311", "python311Packages.pip"]
 
 [phases.install]
-cmds = ["pip install --no-cache-dir -r requirements.txt"]
+cmds = ["pip install -r requirements.txt"]
 
 [start]
-# CORRECCIÓN: main.py está en la raíz, no en src/
 cmd = "python main.py"

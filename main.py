@@ -1,187 +1,234 @@
-"""main.py — Sniper Bot V49 Definitivo
-Loop principal: fetch → indicadores → señal → orden → Telegram
 """
-import time
+main.py — Punto de entrada del Sniper Bot V49 Híbrido.
+
+Flujo por ciclo:
+  1. Obtener velas de Binance Futures
+  2. Analizar con HybridStrategy (Sniper V49 + Kotegawa)
+  3. Gestión de riesgo (can_trade, sizing, barreras)
+  4. Ejecutar órdenes en Binance
+  5. Notificar resultados a Telegram
+  6. Heartbeat horario con resumen de estado
+"""
+import asyncio
 import logging
-import colorlog
-from datetime import datetime, date
-from config import (
-    SYMBOL, TIMEFRAME, LOOP_INTERVAL, MODE,
-    ATR_MULT_TP, ATR_MULT_SL, MAX_BARS_HOLD,
-)
-from indicators import compute, MarkovEngine
-from exchange  import (
-    build_exchange, fetch_ohlcv, get_balance,
-    calc_qty, open_long, open_short,
-    close_position, get_position,
-)
-import telegram_bot as tg
+import sys
+from datetime import datetime, timezone
+
+from config import Config
+from bot.strategy import HybridStrategy, SignalResult
+from bot.binance_client import BinanceClient
+from bot.risk_manager import RiskManager, PositionState
+from bot.telegram_notifier import TelegramNotifier
+from bot.utils import setup_logging, timeframe_to_seconds
+
+setup_logging("INFO")
+logger = logging.getLogger("main")
 
 
-# ── Logger con colores ────────────────────────────────────────
-def setup_logger() -> logging.Logger:
-    handler = colorlog.StreamHandler()
-    handler.setFormatter(colorlog.ColoredFormatter(
-        "%(log_color)s%(asctime)s [%(levelname)s]%(reset)s %(message)s",
-        datefmt="%H:%M:%S",
-        log_colors={"DEBUG": "cyan", "INFO": "green",
-                    "WARNING": "yellow", "ERROR": "red"},
-    ))
-    fh = logging.FileHandler("logs/bot.log")
-    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    logger.addHandler(handler)
-    logger.addHandler(fh)
-    return logger
+class SniperBot:
 
-
-log = setup_logger()
-
-
-# ── Estado del bot ────────────────────────────────────────────
-class BotState:
     def __init__(self):
-        self.position      = None    # "long" | "short" | None
-        self.entry_price   = 0.0
-        self.entry_qty     = 0.0
-        self.entry_bar     = 0
-        self.bar_count     = 0
-        self.trades_today  = 0
-        self.last_hb_date  = None    # fecha último heartbeat diario
-        self.last_signal   = None    # evita señales duplicadas
+        self.cfg      = Config()
+        self.client   = BinanceClient(
+            self.cfg.BINANCE_API_KEY,
+            self.cfg.BINANCE_SECRET_KEY,
+            testnet=self.cfg.TESTNET
+        )
+        self.strategy  = HybridStrategy(self.cfg)
+        self.risk      = RiskManager(self.cfg)
+        self.notifier  = TelegramNotifier(
+            self.cfg.TELEGRAM_TOKEN, self.cfg.TELEGRAM_CHAT_ID
+        )
+        # Estado de posiciones abiertas por símbolo
+        self._pos_state: dict[str, PositionState] = {}
+        self._last_signals: dict[str, SignalResult] = {}
+        self._last_heartbeat: datetime = datetime.min.replace(tzinfo=timezone.utc)
+        self._current_bar: int = 0
+        self._daily_pnl: float = 0.0
 
+    # ─────────────────────────────────────────
+    # ARRANQUE
+    # ─────────────────────────────────────────
 
-state = BotState()
-markov = MarkovEngine()
+    async def start(self) -> None:
+        logger.info(f"Iniciando Sniper Bot — {self.cfg}")
+        await self.client.connect()
 
+        for symbol in self.cfg.SYMBOLS:
+            await self.client.setup_symbol(symbol, self.cfg.LEVERAGE)
 
-# ── Loop principal ────────────────────────────────────────────
-def tick(ex):
-    global state, markov
-    state.bar_count += 1
+        await self.notifier.send_startup(self.cfg)
+        await self._main_loop()
 
-    # 1. Datos
-    df = fetch_ohlcv(ex, SYMBOL, TIMEFRAME)
-    if df.empty or len(df) < 210:
-        log.warning("No hay suficientes velas. Esperando...")
-        return
+    # ─────────────────────────────────────────
+    # BUCLE PRINCIPAL
+    # ─────────────────────────────────────────
 
-    # 2. Indicadores V49
-    ind = compute(df, markov)
-    log.info(
-        f"[{SYMBOL}] close={ind['close']:.4f} | "
-        f"slope={ind['slope']:.1f} adx={ind['adx']:.1f} | "
-        f"bull={ind['prob_bull']:.1f}% bear={ind['prob_bear']:.1f}% | "
-        f"rvol={ind['rvol']:.2f}x stc={ind['stc']:.1f} | "
-        f"dense={'✓' if ind['is_dense'] else '✗'}"
-    )
+    async def _main_loop(self) -> None:
+        while True:
+            try:
+                self._current_bar += 1
+                balance = await self.client.get_balance()
 
-    balance = get_balance(ex)
+                for symbol in self.cfg.SYMBOLS:
+                    await self._process_symbol(symbol, balance)
 
-    # 3. Heartbeat diario a las 08:00 UTC
-    now = datetime.utcnow()
-    if now.hour == 8 and state.last_hb_date != date.today():
-        tg.send(tg.msg_heartbeat(ind, balance, state.trades_today))
-        state.last_hb_date = date.today()
+                await self._maybe_heartbeat(balance)
+                await asyncio.sleep(self.cfg.LOOP_INTERVAL)
 
-    # 4. Gestión de posición abierta
-    if state.position:
-        bars_held   = state.bar_count - state.entry_bar
-        price_now   = ind["close"]
-        atr_now     = ind["atr14"]
-        tp_price    = (state.entry_price + atr_now * ATR_MULT_TP
-                       if state.position == "long"
-                       else state.entry_price - atr_now * ATR_MULT_TP)
-        sl_price    = (state.entry_price - atr_now * ATR_MULT_SL
-                       if state.position == "long"
-                       else state.entry_price + atr_now * ATR_MULT_SL)
+            except KeyboardInterrupt:
+                logger.info("Apagado por usuario")
+                await self.notifier.send_paused("Apagado manual")
+                break
+            except Exception as e:
+                logger.exception(f"Error en bucle principal: {e}")
+                await self.notifier.send_error(str(e))
+                await asyncio.sleep(30)
 
-        hit_tp = (price_now >= tp_price if state.position == "long" else price_now <= tp_price)
-        hit_sl = (price_now <= sl_price if state.position == "long" else price_now >= sl_price)
-        hit_time = bars_held >= MAX_BARS_HOLD
+    # ─────────────────────────────────────────
+    # PROCESADO POR SÍMBOLO
+    # ─────────────────────────────────────────
 
-        reason = None
-        if hit_tp:   reason = "TP alcanzado"
-        elif hit_sl: reason = "SL alcanzado"
-        elif hit_time: reason = f"Tiempo máximo ({MAX_BARS_HOLD} velas)"
-
-        if reason:
-            close_position(ex, SYMBOL)
-            tg.send(tg.msg_close(
-                state.position, state.entry_price, price_now,
-                state.entry_qty, reason, get_balance(ex)
-            ))
-            state.position  = None
-            state.trades_today += 1
-            log.info(f"Posición cerrada: {reason} @ {price_now:.4f}")
-        return   # no busca nuevas señales con posición abierta
-
-    # 5. Señales de entrada
-    if ind["long"] and state.last_signal != "long":
-        qty = calc_qty(balance, ind["close"], ind["atr14"])
-        if qty <= 0:
-            log.warning("Cantidad calculada = 0. Revisa el balance.")
-            return
-        tp  = round(ind["close"] + ind["atr14"] * ATR_MULT_TP, 4)
-        sl  = round(ind["close"] - ind["atr14"] * ATR_MULT_SL, 4)
-
-        order = open_long(ex, SYMBOL, qty, ind["close"], ind["atr14"])
-        if order:
-            state.position    = "long"
-            state.entry_price = ind["close"]
-            state.entry_qty   = qty
-            state.entry_bar   = state.bar_count
-            state.last_signal = "long"
-            tg.send(tg.msg_signal("long", ind, ind["close"], qty, tp, sl, balance))
-            log.info(f"LONG abierto @ {ind['close']:.4f} | TP {tp} | SL {sl}")
-
-    elif ind["short"] and state.last_signal != "short":
-        qty = calc_qty(balance, ind["close"], ind["atr14"])
-        if qty <= 0:
-            log.warning("Cantidad calculada = 0. Revisa el balance.")
-            return
-        tp  = round(ind["close"] - ind["atr14"] * ATR_MULT_TP, 4)
-        sl  = round(ind["close"] + ind["atr14"] * ATR_MULT_SL, 4)
-
-        order = open_short(ex, SYMBOL, qty, ind["close"], ind["atr14"])
-        if order:
-            state.position    = "short"
-            state.entry_price = ind["close"]
-            state.entry_qty   = qty
-            state.entry_bar   = state.bar_count
-            state.last_signal = "short"
-            tg.send(tg.msg_signal("short", ind, ind["close"], qty, tp, sl, balance))
-            log.info(f"SHORT abierto @ {ind['close']:.4f} | TP {tp} | SL {sl}")
-
-    else:
-        state.last_signal = None   # reset para que la próxima señal válida entre
-
-
-def main():
-    log.info("═" * 50)
-    log.info("  Sniper Bot V49 Definitivo — Arrancando...")
-    log.info("═" * 50)
-
-    ex = build_exchange()
-    log.info(f"Exchange: BingX | Par: {SYMBOL} | TF: {TIMEFRAME} | Modo: {MODE.upper()}")
-
-    bal = get_balance(ex)
-    log.info(f"Balance inicial: ${bal:.2f} USDT")
-    tg.send(tg.msg_start(SYMBOL, TIMEFRAME, MODE))
-
-    while True:
+    async def _process_symbol(self, symbol: str, balance: float) -> None:
         try:
-            tick(ex)
-        except KeyboardInterrupt:
-            log.info("Bot detenido manualmente.")
-            tg.send("🔴 <b>Bot detenido manualmente.</b>")
-            break
-        except Exception as e:
-            log.error(f"Error en tick: {e}")
-            tg.send(tg.msg_error("tick principal", str(e)))
-        time.sleep(LOOP_INTERVAL)
+            # ── 1. Obtener datos ──
+            df = await self.client.get_klines(
+                symbol, self.cfg.TIMEFRAME, limit=300
+            )
+            if df is None or len(df) < 150:
+                logger.warning(f"{symbol}: datos insuficientes")
+                return
 
+            # ── 2. Analizar ──
+            signal = self.strategy.analyze(df, symbol)
+            self._last_signals[symbol] = signal
+
+            # ── 3. Verificar posición existente ──
+            position = await self.client.get_position(symbol)
+            has_position = position and abs(position["size"]) > 0
+
+            if has_position:
+                await self._manage_open_position(symbol, position, signal, balance, df)
+                return
+
+            # ── 4. Buscar nueva entrada ──
+            if not self.risk.can_trade(symbol):
+                return
+            if balance <= 0:
+                logger.warning(f"{symbol}: balance cero")
+                return
+
+            if signal.long:
+                await self._enter_long(symbol, signal, balance)
+            elif signal.short:
+                await self._enter_short(symbol, signal, balance)
+
+        except Exception as e:
+            logger.error(f"_process_symbol {symbol}: {e}", exc_info=True)
+
+    # ─────────────────────────────────────────
+    # GESTIÓN DE POSICIÓN ABIERTA
+    # ─────────────────────────────────────────
+
+    async def _manage_open_position(self, symbol: str, position: dict,
+                                    signal: SignalResult, balance: float,
+                                    df) -> None:
+        """
+        Revisa la barrera de tiempo (Binance gestiona TP/SL automáticamente).
+        """
+        state = self._pos_state.get(symbol)
+        if state is None:
+            # Posición abierta externamente — registrar
+            tp, sl = self.risk.compute_barriers(
+                position["entry_price"], signal.atr14, position["side"]
+            )
+            self._pos_state[symbol] = PositionState(
+                symbol=symbol, side=position["side"],
+                entry_price=position["entry_price"],
+                quantity=abs(position["size"]),
+                tp_price=tp, sl_price=sl,
+                entry_bar=self._current_bar
+            )
+            return
+
+        # Barrera de tiempo
+        if self.risk.check_time_exit(state, self._current_bar):
+            logger.info(f"{symbol}: barrera de tiempo — cerrando")
+            result = await self.client.close_position(symbol, position)
+            if result:
+                pnl = await self.client.get_last_trade_pnl(symbol)
+                pnl_pct = (pnl / balance * 100) if balance > 0 else 0.0
+                self._daily_pnl += pnl
+                self.risk.register_close(symbol, pnl_pct)
+                del self._pos_state[symbol]
+                await self.notifier.send_exit(
+                    symbol, "TIME", pnl, pnl_pct, balance
+                )
+
+    # ─────────────────────────────────────────
+    # ENTRADAS
+    # ─────────────────────────────────────────
+
+    async def _enter_long(self, symbol: str, signal: SignalResult,
+                          balance: float) -> None:
+        qty = self.risk.calculate_position_size(signal, balance)
+        tp, sl = self.risk.compute_barriers(
+            signal.entry_price, signal.atr14, "LONG"
+        )
+        order = await self.client.open_long(symbol, qty, tp, sl)
+        if order:
+            self.risk.register_open(symbol)
+            self._pos_state[symbol] = PositionState(
+                symbol=symbol, side="LONG",
+                entry_price=signal.entry_price, quantity=qty,
+                tp_price=tp, sl_price=sl,
+                entry_bar=self._current_bar
+            )
+            await self.notifier.send_entry(symbol, "LONG", order, signal, balance)
+
+    async def _enter_short(self, symbol: str, signal: SignalResult,
+                           balance: float) -> None:
+        qty = self.risk.calculate_position_size(signal, balance)
+        tp, sl = self.risk.compute_barriers(
+            signal.entry_price, signal.atr14, "SHORT"
+        )
+        order = await self.client.open_short(symbol, qty, tp, sl)
+        if order:
+            self.risk.register_open(symbol)
+            self._pos_state[symbol] = PositionState(
+                symbol=symbol, side="SHORT",
+                entry_price=signal.entry_price, quantity=qty,
+                tp_price=tp, sl_price=sl,
+                entry_bar=self._current_bar
+            )
+            await self.notifier.send_entry(symbol, "SHORT", order, signal, balance)
+
+    # ─────────────────────────────────────────
+    # HEARTBEAT HORARIO
+    # ─────────────────────────────────────────
+
+    async def _maybe_heartbeat(self, balance: float) -> None:
+        now = datetime.now(timezone.utc)
+        diff = (now - self._last_heartbeat).total_seconds()
+        if diff >= 3600:     # cada hora
+            self._last_heartbeat = now
+            await self.notifier.send_heartbeat(
+                balance        = balance,
+                daily_pnl      = self._daily_pnl,
+                open_pos       = self.risk.open_positions,
+                daily_loss_pct = self.risk.daily_loss_pct,
+                symbols_status = self._last_signals
+            )
+
+
+# ──────────────────────────────────────────────
+# ARRANQUE
+# ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-    main()
+    bot = SniperBot()
+    try:
+        asyncio.run(bot.start())
+    except KeyboardInterrupt:
+        logger.info("Bot detenido")
+        sys.exit(0)
