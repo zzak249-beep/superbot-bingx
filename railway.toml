@@ -1,8 +1,7 @@
 [build]
-builder = "DOCKERFILE"
+builder = "nixpacks"
 
 [deploy]
-healthcheckPath         = ""
-healthcheckTimeout      = 0
-restartPolicyType       = "ON_FAILURE"
+startCommand = "python main.py"
+restartPolicyType = "always"
 restartPolicyMaxRetries = 10

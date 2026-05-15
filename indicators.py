@@ -1,400 +1,239 @@
+"""indicators.py — Motor de indicadores Sniper Bot V49
+Porta fielmente la lógica Pine Script del V49 Definitivo.
 """
-utils/indicators.py — Indicadores técnicos en numpy (sin pandas en el hot path).
-Todos reciben arrays numpy y devuelven escalares o arrays.
-Velocidad máxima: no hay copies innecesarias, operaciones vectorizadas.
-"""
-
 import numpy as np
-from typing import Tuple, Optional
+import pandas as pd
+from config import (
+    SLOPE_MIN, LOOKBACK_MARKOV, PROB_THRESHOLD,
+    ADX_LEN, ADX_TREND, ADX_RANGE,
+    PIVOT_LEN, RVOL_MIN, POC_LOOKBACK,
+    ATR_MULT_TP, ATR_MULT_SL,
+)
 
 
-# ── EMA ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════════════════════
 
-def ema(arr: np.ndarray, period: int) -> np.ndarray:
-    """EMA usando el multiplicador estándar 2/(N+1). O(n), sin pandas."""
-    if len(arr) < period:
-        return np.full(len(arr), np.nan)
-    k = 2.0 / (period + 1)
-    out = np.empty(len(arr))
-    out[:period - 1] = np.nan
-    out[period - 1] = arr[:period].mean()
-    for i in range(period, len(arr)):
-        out[i] = arr[i] * k + out[i - 1] * (1 - k)
-    return out
+def _ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
 
 
-def ema_last(arr: np.ndarray, period: int) -> float:
-    """Solo el último valor de la EMA. Más rápido para el hot path."""
-    result = ema(arr, period)
-    return float(result[-1]) if not np.isnan(result[-1]) else float("nan")
+def _atr(df: pd.DataFrame, length: int) -> pd.Series:
+    h, l, c = df["high"], df["low"], df["close"]
+    prev_c = c.shift(1)
+    tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    return tr.ewm(span=length, adjust=False).mean()
 
 
+def _rma(series: pd.Series, length: int) -> pd.Series:
+    """RMA (Wilder's MA) — usado en ADX."""
+    alpha = 1 / length
+    return series.ewm(alpha=alpha, adjust=False).mean()
 
 
-# ── HMA (Hull Moving Average) ─────────────────────────────────────────────────
-
-def wma(arr: np.ndarray, period: int) -> np.ndarray:
-    """Weighted Moving Average — pesos lineales, más reciente pesa más."""
-    n = len(arr)
-    if n < period:
-        return np.full(n, np.nan)
-    weights = np.arange(1, period + 1, dtype=float)
-    out = np.full(n, np.nan)
-    for i in range(period - 1, n):
-        out[i] = np.dot(arr[i - period + 1:i + 1], weights) / weights.sum()
-    return out
-
-
-def wma_last(arr: np.ndarray, period: int) -> float:
-    result = wma(arr, period)
-    return float(result[-1]) if not np.isnan(result[-1]) else float("nan")
+def _adx(df: pd.DataFrame, length: int) -> pd.DataFrame:
+    h, l, c = df["high"], df["low"], df["close"]
+    up   = h - h.shift(1)
+    down = l.shift(1) - l
+    plus_dm  = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    atr14 = _rma(pd.Series(
+        pd.concat([h - l, (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1),
+        index=df.index), length)
+    plus_di  = 100 * _rma(pd.Series(plus_dm,  index=df.index), length) / atr14
+    minus_di = 100 * _rma(pd.Series(minus_dm, index=df.index), length) / atr14
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx_val  = _rma(dx.fillna(0), length)
+    return pd.DataFrame({"plus_di": plus_di, "minus_di": minus_di, "adx": adx_val}, index=df.index)
 
 
-def hma(arr: np.ndarray, period: int) -> np.ndarray:
+def _stoch(series: pd.Series, length: int) -> pd.Series:
+    lowest  = series.rolling(length).min()
+    highest = series.rolling(length).max()
+    denom   = (highest - lowest).replace(0, np.nan)
+    return 100 * (series - lowest) / denom
+
+
+def _stc(close: pd.Series, stoch_len=10, fast=23, slow=50) -> pd.Series:
+    """Schaff Trend Cycle."""
+    macd = _ema(close, fast) - _ema(close, slow)
+    st   = _stoch(macd, stoch_len)
+    return _ema(st.fillna(50), 3)
+
+
+def _vwap(df: pd.DataFrame) -> pd.Series:
+    tp  = (df["high"] + df["low"] + df["close"]) / 3
+    cum_v  = (tp * df["volume"]).cumsum()
+    cum_tv = df["volume"].cumsum()
+    return cum_v / cum_tv.replace(0, np.nan)
+
+
+def _pivot_high(df: pd.DataFrame, length: int) -> pd.Series:
+    highs = df["high"]
+    result = pd.Series(np.nan, index=df.index)
+    for i in range(length, len(df) - length):
+        window = highs.iloc[i - length: i + length + 1]
+        if highs.iloc[i] == window.max():
+            result.iloc[i] = highs.iloc[i]
+    return result
+
+
+def _pivot_low(df: pd.DataFrame, length: int) -> pd.Series:
+    lows = df["low"]
+    result = pd.Series(np.nan, index=df.index)
+    for i in range(length, len(df) - length):
+        window = lows.iloc[i - length: i + length + 1]
+        if lows.iloc[i] == window.min():
+            result.iloc[i] = lows.iloc[i]
+    return result
+
+
+def _poc(df: pd.DataFrame, lookback: int) -> float:
+    """Point of Control: precio con mayor volumen en ventana."""
+    sub = df.tail(lookback)
+    if sub.empty:
+        return float("nan")
+    return float(sub.loc[sub["volume"].idxmax(), "close"])
+
+
+# ══════════════════════════════════════════════════════════════
+#  MOTOR MARKOV
+# ══════════════════════════════════════════════════════════════
+
+class MarkovEngine:
+    """Cadena de Markov de orden-1 con ventana deslizante."""
+
+    def __init__(self, lookback: int = LOOKBACK_MARKOV):
+        self.lookback = lookback
+        self.matrix   = np.zeros(9, dtype=float)   # 3×3 aplanada
+
+    def _state(self, slope: float, threshold: float) -> int:
+        if slope > threshold:
+            return 0   # bull
+        if slope < -threshold:
+            return 1   # bear
+        return 2       # neutral
+
+    def update(self, slopes: pd.Series, adaptive_threshold: float) -> tuple[float, float]:
+        """
+        Recalcula la matriz completa sobre la ventana de slopes.
+        Devuelve (prob_bull, prob_bear) del estado actual.
+        """
+        self.matrix[:] = 0.0
+        window = slopes.dropna().values[-self.lookback:]
+        if len(window) < 2:
+            return 0.0, 0.0
+
+        states = np.array([self._state(s, adaptive_threshold) for s in window])
+        for i in range(1, len(states)):
+            idx = states[i - 1] * 3 + states[i]
+            self.matrix[idx] += 1.0
+
+        curr_s   = states[-1]
+        base     = curr_s * 3
+        total    = self.matrix[base] + self.matrix[base + 1] + self.matrix[base + 2]
+        if total == 0:
+            return 0.0, 0.0
+        return (self.matrix[base] / total) * 100, (self.matrix[base + 1] / total) * 100
+
+
+# ══════════════════════════════════════════════════════════════
+#  PIPELINE PRINCIPAL
+# ══════════════════════════════════════════════════════════════
+
+def compute(df: pd.DataFrame, markov: MarkovEngine) -> dict:
     """
-    Hull Moving Average: HMA(n) = WMA(2*WMA(n/2) − WMA(n)), length=sqrt(n).
-    Reduce el lag de la EMA manteniendo suavidad.
+    Recibe un DataFrame OHLCV y devuelve un dict con todos
+    los indicadores y las señales long/short del V49.
     """
-    if len(arr) < period:
-        return np.full(len(arr), np.nan)
-    half = max(period // 2, 2)
-    sqrt_p = max(int(np.sqrt(period)), 2)
-    wma_half = wma(arr, half)
-    wma_full = wma(arr, period)
-    diff = 2.0 * wma_half - wma_full
-    return wma(diff, sqrt_p)
-
-
-def hma_last(arr: np.ndarray, period: int) -> float:
-    """Solo el último valor del HMA."""
-    result = hma(arr, period)
-    return float(result[-1]) if not np.isnan(result[-1]) else float("nan")
-
-# ── ATR ──────────────────────────────────────────────────────────────────────
-
-def atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
-        period: int = 14) -> np.ndarray:
-    """ATR usando EMA del True Range."""
-    n = len(closes)
-    tr = np.empty(n)
-    tr[0] = highs[0] - lows[0]
-    for i in range(1, n):
-        tr[i] = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1])
-        )
-    return ema(tr, period)
-
-
-def atr_last(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
-             period: int = 14) -> float:
-    result = atr(highs, lows, closes, period)
-    return float(result[-1]) if not np.isnan(result[-1]) else float("nan")
-
-
-# ── Swing High / Low ─────────────────────────────────────────────────────────
-
-def swing_high(highs: np.ndarray, lookback: int = 5) -> float:
-    """Máximo más alto de las últimas `lookback` velas (excluye la actual)."""
-    if len(highs) < lookback + 1:
-        return float(highs.max())
-    return float(highs[-(lookback + 1):-1].max())
-
-
-def swing_low(lows: np.ndarray, lookback: int = 5) -> float:
-    """Mínimo más bajo de las últimas `lookback` velas (excluye la actual)."""
-    if len(lows) < lookback + 1:
-        return float(lows.min())
-    return float(lows[-(lookback + 1):-1].min())
-
-
-# ── Volume SMA ────────────────────────────────────────────────────────────────
-
-def vol_sma(volumes: np.ndarray, period: int = 20) -> float:
-    """Media de volumen."""
-    if len(volumes) < period:
-        return float(volumes.mean())
-    return float(volumes[-period:].mean())
-
-
-# ── Synthetic CVD ─────────────────────────────────────────────────────────────
-
-def cvd(opens: np.ndarray, closes: np.ndarray, volumes: np.ndarray,
-        period: int = 20) -> Tuple[np.ndarray, float]:
-    """
-    CVD sintético: aproximación del Cumulative Volume Delta usando velas OHLCV.
-    Delta por vela = volumen * signo(close - open).
-    Acumulado sobre `period` velas.
-    Devuelve (serie cvd, valor actual normalizado -1..1).
-    """
-    delta = np.where(closes >= opens, volumes, -volumes).astype(float)
-    if len(delta) < period:
-        cvd_series = np.cumsum(delta)
-    else:
-        cvd_series = np.convolve(delta, np.ones(period), mode='full')[:len(delta)]
-
-    last_cvd = float(cvd_series[-1])
-    # Normalizar respecto al volumen total del período para comparar entre activos
-    total_vol = float(volumes[-min(period, len(volumes)):].sum())
-    cvd_norm = last_cvd / total_vol if total_vol > 0 else 0.0
-    return cvd_series, cvd_norm
-
-
-def cvd_trend(opens: np.ndarray, closes: np.ndarray, volumes: np.ndarray,
-              period: int = 20) -> str:
-    """Retorna 'bull', 'bear' o 'neutral' según CVD normalizado."""
-    _, norm = cvd(opens, closes, volumes, period)
-    if norm > 0.10:
-        return "bull"
-    elif norm < -0.10:
-        return "bear"
-    return "neutral"
-
-
-# ── Market Regime ─────────────────────────────────────────────────────────────
-
-def regime(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
-           atr_fast: int = 7, atr_slow: int = 50) -> str:
-    """
-    Detecta si el mercado está en tendencia ('trend') o rango ('range').
-    Lógica: si ATR rápido > ATR lento * 0.85, hay expansión (tendencia).
-    """
-    if len(closes) < atr_slow + 1:
-        return "unknown"
-    atr_f = atr_last(highs, lows, closes, atr_fast)
-    atr_s = atr_last(highs, lows, closes, atr_slow)
-    if np.isnan(atr_f) or np.isnan(atr_s) or atr_s == 0:
-        return "unknown"
-    ratio = atr_f / atr_s
-    return "trend" if ratio >= 0.85 else "range"
-
-
-# ── Liquidity Sweep ───────────────────────────────────────────────────────────
-
-def has_liquidity_sweep_bull(lows: np.ndarray, lookback: int = 10) -> bool:
-    """
-    ¿Se barrió liquidez bajo el mínimo anterior antes de recuperar?
-    Señal: la penúltima vela hizo mínimo < swing_low, y el close actual > swing_low.
-    """
-    if len(lows) < lookback + 2:
-        return False
-    prev_low = swing_low(lows[:-2], lookback)
-    swept = lows[-2] < prev_low          # penúltima vela barrió
-    recovered = lows[-1] > prev_low      # actual recuperó
-    return bool(swept and recovered)
-
-
-def has_liquidity_sweep_bear(highs: np.ndarray, lookback: int = 10) -> bool:
-    """Barrido de liquidez sobre el máximo anterior."""
-    if len(highs) < lookback + 2:
-        return False
-    prev_high = swing_high(highs[:-2], lookback)
-    swept = highs[-2] > prev_high
-    recovered = highs[-1] < prev_high
-    return bool(swept and recovered)
-
-
-# ── Kelly Sizing ──────────────────────────────────────────────────────────────
-
-def kelly_fraction(win_rate: float, rr_ratio: float,
-                   max_fraction: float = 0.25) -> float:
-    """
-    Fracción de Kelly = (win_rate * rr_ratio - loss_rate) / rr_ratio.
-    Limitada a max_fraction para evitar over-betting.
-    """
-    loss_rate = 1.0 - win_rate
-    if rr_ratio <= 0:
-        return 0.0
-    k = (win_rate * rr_ratio - loss_rate) / rr_ratio
-    return max(0.0, min(k, max_fraction))
-
-
-def position_size_usdt(balance: float, risk_pct: float,
-                       sl_distance_pct: float, leverage: int,
-                       base_size: float) -> float:
-    """
-    Tamaño de posición basado en riesgo máximo en USDT.
-    risk_pct: fracción del balance a arriesgar (ej. 0.015 = 1.5%)
-    sl_distance_pct: distancia del SL como fracción del precio (ej. 0.005)
-    """
-    if sl_distance_pct <= 0:
-        return base_size
-    risk_usdt = balance * risk_pct
-    size = (risk_usdt / sl_distance_pct) / leverage
-    # Limitar entre base_size y 5x base para no sobre-escalar
-    return max(base_size, min(size, base_size * 5.0))
-
-
-# ── RSI ───────────────────────────────────────────────────────────────────────
-
-def rsi(closes: np.ndarray, period: int = 14) -> np.ndarray:
-    """RSI clásico de Wilder."""
-    n = len(closes)
-    out = np.full(n, np.nan)
-    if n < period + 1:
-        return out
-    deltas = np.diff(closes)
-    gains = np.where(deltas > 0, deltas, 0.0)
-    losses = np.where(deltas < 0, -deltas, 0.0)
-    avg_gain = gains[:period].mean()
-    avg_loss = losses[:period].mean()
-    for i in range(period, n - 1):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        rs = avg_gain / avg_loss if avg_loss > 0 else 0.0
-        out[i + 1] = 100.0 - (100.0 / (1.0 + rs))
-    return out
-
-
-def rsi_last(closes: np.ndarray, period: int = 14) -> float:
-    result = rsi(closes, period)
-    v = result[-1]
-    return float(v) if not np.isnan(v) else float("nan")
-
-
-# ── MACD ──────────────────────────────────────────────────────────────────────
-
-def macd(closes: np.ndarray,
-         fast: int = 12, slow: int = 26, signal_p: int = 9):
-    """Devuelve (macd_line, signal_line, histogram) como arrays."""
-    ema_fast = ema(closes, fast)
-    ema_slow = ema(closes, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = ema(macd_line, signal_p)
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
-
-
-def macd_last(closes: np.ndarray,
-              fast: int = 12, slow: int = 26, signal_p: int = 9):
-    """Devuelve (macd, signal, hist) escalares del último bar."""
-    ml, sl, hist = macd(closes, fast, slow, signal_p)
-    return float(ml[-1]), float(sl[-1]), float(hist[-1])
-
-
-# ── Bollinger Bands ───────────────────────────────────────────────────────────
-
-def bollinger(closes: np.ndarray, period: int = 20,
-              std_mult: float = 2.0):
-    """Devuelve (upper, mid, lower) como arrays."""
-    n = len(closes)
-    upper = np.full(n, np.nan)
-    mid   = np.full(n, np.nan)
-    lower = np.full(n, np.nan)
-    for i in range(period - 1, n):
-        window = closes[i - period + 1:i + 1]
-        m = window.mean()
-        s = window.std(ddof=0)
-        mid[i]   = m
-        upper[i] = m + std_mult * s
-        lower[i] = m - std_mult * s
-    return upper, mid, lower
-
-
-def bollinger_last(closes: np.ndarray, period: int = 20,
-                   std_mult: float = 2.0):
-    u, m, l = bollinger(closes, period, std_mult)
-    return float(u[-1]), float(m[-1]), float(l[-1])
-
-
-# ── VWAP (intraday approx) ────────────────────────────────────────────────────
-
-def vwap(highs: np.ndarray, lows: np.ndarray,
-         closes: np.ndarray, volumes: np.ndarray) -> np.ndarray:
-    """VWAP acumulado desde el inicio del array."""
-    typical = (highs + lows + closes) / 3.0
-    cum_tpv = np.cumsum(typical * volumes)
-    cum_vol = np.cumsum(volumes)
-    with np.errstate(invalid='ignore', divide='ignore'):
-        out = np.where(cum_vol > 0, cum_tpv / cum_vol, np.nan)
-    return out
-
-
-def vwap_last(highs, lows, closes, volumes) -> float:
-    result = vwap(np.array(highs), np.array(lows),
-                  np.array(closes), np.array(volumes))
-    v = result[-1]
-    return float(v) if not np.isnan(v) else float("nan")
-
-
-# ── Stochastic ────────────────────────────────────────────────────────────────
-
-def stochastic(highs: np.ndarray, lows: np.ndarray,
-               closes: np.ndarray, k_period: int = 14,
-               d_period: int = 3):
-    """Devuelve (%K, %D) como arrays."""
-    n = len(closes)
-    k = np.full(n, np.nan)
-    for i in range(k_period - 1, n):
-        h = highs[i - k_period + 1:i + 1].max()
-        l = lows[i - k_period + 1:i + 1].min()
-        k[i] = (closes[i] - l) / (h - l) * 100.0 if h != l else 50.0
-    d = ema(k, d_period)
-    return k, d
-
-
-# ── Donchian Channel ──────────────────────────────────────────────────────────
-
-def donchian(highs: np.ndarray, lows: np.ndarray,
-             period: int = 20):
-    """Devuelve (upper, lower) canal de Donchian."""
-    n = len(highs)
-    upper = np.full(n, np.nan)
-    lower = np.full(n, np.nan)
-    for i in range(period - 1, n):
-        upper[i] = highs[i - period + 1:i + 1].max()
-        lower[i] = lows[i - period + 1:i + 1].min()
-    return upper, lower
-
-
-# ── SuperTrend ────────────────────────────────────────────────────────────────
-
-def supertrend(highs: np.ndarray, lows: np.ndarray,
-               closes: np.ndarray, period: int = 10,
-               mult: float = 3.0):
-    """
-    SuperTrend clásico.
-    Devuelve (supertrend_arr, direction_arr) donde direction: 1=bull, -1=bear.
-    """
-    atr_arr = atr(highs, lows, closes, period)
-    hl2 = (highs + lows) / 2.0
-    upper_band = hl2 + mult * atr_arr
-    lower_band = hl2 - mult * atr_arr
-    n = len(closes)
-    st   = np.full(n, np.nan)
-    dire = np.ones(n)
-    for i in range(1, n):
-        if np.isnan(atr_arr[i]):
-            continue
-        # Ajustar bandas
-        if lower_band[i] > lower_band[i-1] or closes[i-1] < lower_band[i-1]:
-            lower_band[i] = lower_band[i]
-        else:
-            lower_band[i] = lower_band[i-1]
-        if upper_band[i] < upper_band[i-1] or closes[i-1] > upper_band[i-1]:
-            upper_band[i] = upper_band[i]
-        else:
-            upper_band[i] = upper_band[i-1]
-        # Dirección
-        if np.isnan(st[i-1]):
-            st[i] = lower_band[i]
-            dire[i] = 1
-        elif st[i-1] == upper_band[i-1]:
-            if closes[i] <= upper_band[i]:
-                st[i], dire[i] = upper_band[i], -1
-            else:
-                st[i], dire[i] = lower_band[i], 1
-        else:
-            if closes[i] >= lower_band[i]:
-                st[i], dire[i] = lower_band[i], 1
-            else:
-                st[i], dire[i] = upper_band[i], -1
-    return st, dire
-
-
-def supertrend_last(highs, lows, closes, period=10, mult=3.0):
-    st, dire = supertrend(np.array(highs), np.array(lows),
-                          np.array(closes), period, mult)
-    return float(st[-1]), int(dire[-1])
-
+    df = df.copy()
+
+    # ── Base ──────────────────────────────────────────────────
+    ema7        = _ema(df["close"], 7)
+    atr7        = _atr(df, 7)
+    atr14       = _atr(df, 14)
+    magic_slope = ((ema7 - ema7.shift(1)) / atr7.clip(lower=1e-9)) * 100
+
+    # ── ADX adaptativo ────────────────────────────────────────
+    adx_df      = _adx(df, ADX_LEN)
+    adx_val     = adx_df["adx"].iloc[-1]
+    is_trending = adx_val > ADX_TREND
+    is_ranging  = adx_val < ADX_RANGE
+    adaptive_slope = (
+        SLOPE_MIN * 1.30 if is_ranging else
+        SLOPE_MIN * 0.85 if is_trending else
+        SLOPE_MIN
+    )
+
+    # ── Markov ────────────────────────────────────────────────
+    prob_bull, prob_bear = markov.update(magic_slope, adaptive_slope)
+
+    # ── Filtros institucionales ───────────────────────────────
+    vwap_val    = _vwap(df)
+    vol_sma     = df["volume"].rolling(50).mean()
+    rvol        = (df["volume"] / vol_sma.replace(0, np.nan)).fillna(0)
+    is_dense    = rvol.iloc[-1] >= RVOL_MIN
+
+    poc_level   = _poc(df, POC_LOOKBACK)
+    stc_val     = _stc(df["close"]).iloc[-1]
+
+    ph_series   = _pivot_high(df, PIVOT_LEN)
+    pl_series   = _pivot_low(df, PIVOT_LEN)
+    peak        = ph_series.dropna().iloc[-1] if ph_series.dropna().shape[0] > 0 else float("nan")
+    valley      = pl_series.dropna().iloc[-1] if pl_series.dropna().shape[0] > 0 else float("nan")
+
+    # ── Última vela ───────────────────────────────────────────
+    last        = df.iloc[-1]
+    slope_now   = float(magic_slope.iloc[-1])
+    vwap_now    = float(vwap_val.iloc[-1])
+    rvol_now    = float(rvol.iloc[-1])
+    atr14_now   = float(atr14.iloc[-1])
+
+    # ── Umbral dinámico ───────────────────────────────────────
+    threshold   = PROB_THRESHOLD - 5.0 if is_dense else PROB_THRESHOLD
+
+    # ── Señales ───────────────────────────────────────────────
+    long_sig = (
+        not np.isnan(valley)           and
+        float(last["low"])  < valley   and
+        float(last["close"]) < vwap_now and
+        slope_now > adaptive_slope      and
+        is_dense                        and
+        prob_bull > threshold           and
+        stc_val < 75
+    )
+    short_sig = (
+        not np.isnan(peak)             and
+        float(last["high"]) > peak     and
+        float(last["close"]) > vwap_now and
+        slope_now < -adaptive_slope     and
+        is_dense                        and
+        prob_bear > threshold           and
+        stc_val > 25
+    )
+
+    return {
+        # señales
+        "long":          long_sig,
+        "short":         short_sig,
+        # precios
+        "close":         float(last["close"]),
+        "atr14":         atr14_now,
+        "vwap":          vwap_now,
+        "poc":           poc_level,
+        "peak":          peak,
+        "valley":        valley,
+        # indicadores
+        "slope":         slope_now,
+        "adaptive_slope": adaptive_slope,
+        "adx":           adx_val,
+        "is_trending":   is_trending,
+        "is_ranging":    is_ranging,
+        "prob_bull":     prob_bull,
+        "prob_bear":     prob_bear,
+        "rvol":          rvol_now,
+        "is_dense":      is_dense,
+        "stc":           stc_val,
+        "threshold":     threshold,
+    }
