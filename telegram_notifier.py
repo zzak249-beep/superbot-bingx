@@ -176,3 +176,17 @@ class TelegramNotifier:
             f"⏰ <i>{datetime.utcnow().strftime('%H:%M:%S UTC')}</i>"
         )
         await self._send(msg)
+
+    async def send_universe(self, symbols: list) -> None:
+        total  = len(symbols)
+        sample = ", ".join(symbols[:10])
+        msg = (
+            f"🌍 <b>UNIVERSO CARGADO — {total} pares</b>\n"
+            f"{'─'*30}\n"
+            f"<i>Top 10 por volumen:</i>\n"
+            f"<code>{sample}</code>\n"
+            f"{'─'*30}\n"
+            f"El bot escaneará <b>TODOS</b> en cada ciclo.\n"
+            f"⏰ <i>{datetime.utcnow().strftime('%H:%M:%S UTC')}</i>"
+        )
+        await self._send(msg)

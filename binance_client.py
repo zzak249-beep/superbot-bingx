@@ -384,3 +384,44 @@ class BinanceClient:
         if trades:
             return float(trades[-1].get("realizedPnl", 0))
         return 0.0
+
+    # ─────────────────────────────────────────
+    # UNIVERSO COMPLETO DE SÍMBOLOS
+    # ─────────────────────────────────────────
+
+    async def get_all_symbols(self) -> list[str]:
+        """
+        Devuelve todos los pares perpetuos USDT activos en BingX,
+        ordenados por volumen 24h descendente.
+        """
+        # Endpoint de tickers 24h para obtener volumen
+        path   = "/openApi/swap/v2/quote/ticker"
+        params = {"timestamp": self._ts()}
+        params["signature"] = self._sign(params)
+        url = self.base_url + path
+        try:
+            async with self._session.get(url, params=params,
+                                          headers=self._headers()) as r:
+                data = await r.json()
+        except Exception as e:
+            logger.error(f"get_all_symbols: {e}")
+            return []
+
+        if data.get("code") != 0:
+            logger.error(f"get_all_symbols API error: {data}")
+            return []
+
+        tickers = data.get("data", [])
+        # Filtrar solo pares USDT con volumen > 0
+        valid = []
+        for t in tickers:
+            sym = t.get("symbol", "")
+            vol = float(t.get("quoteVolume", 0) or 0)
+            if sym.endswith("-USDT") and vol > 500_000:   # min $500k vol 24h
+                valid.append((sym, vol))
+
+        # Ordenar por volumen descendente
+        valid.sort(key=lambda x: x[1], reverse=True)
+        symbols = [s[0] for s in valid]
+        logger.info(f"BingX universo: {len(symbols)} pares con vol>500k USDT")
+        return symbols
