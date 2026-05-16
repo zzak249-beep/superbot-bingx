@@ -1,1 +1,1 @@
-# exchange package
+# Sniper Bot package

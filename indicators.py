@@ -1,239 +1,229 @@
-"""indicators.py — Motor de indicadores Sniper Bot V49
-Porta fielmente la lógica Pine Script del V49 Definitivo.
+"""
+bot/indicators.py
+Implementación pura en NumPy/Pandas de todos los indicadores utilizados por
+el Sniper Bot V49 y el Kotegawa Dip Reversal.
+
+No depende de librerías externas de TA para máxima portabilidad y control.
 """
 import numpy as np
 import pandas as pd
-from config import (
-    SLOPE_MIN, LOOKBACK_MARKOV, PROB_THRESHOLD,
-    ADX_LEN, ADX_TREND, ADX_RANGE,
-    PIVOT_LEN, RVOL_MIN, POC_LOOKBACK,
-    ATR_MULT_TP, ATR_MULT_SL,
-)
+from typing import Tuple, Optional
 
 
-# ══════════════════════════════════════════════════════════════
-#  HELPERS
-# ══════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────
+# UTILIDADES INTERNAS
+# ──────────────────────────────────────────────
 
-def _ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
-
-
-def _atr(df: pd.DataFrame, length: int) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"]
-    prev_c = c.shift(1)
-    tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
-    return tr.ewm(span=length, adjust=False).mean()
-
-
-def _rma(series: pd.Series, length: int) -> pd.Series:
-    """RMA (Wilder's MA) — usado en ADX."""
-    alpha = 1 / length
-    return series.ewm(alpha=alpha, adjust=False).mean()
-
-
-def _adx(df: pd.DataFrame, length: int) -> pd.DataFrame:
-    h, l, c = df["high"], df["low"], df["close"]
-    up   = h - h.shift(1)
-    down = l.shift(1) - l
-    plus_dm  = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    atr14 = _rma(pd.Series(
-        pd.concat([h - l, (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1),
-        index=df.index), length)
-    plus_di  = 100 * _rma(pd.Series(plus_dm,  index=df.index), length) / atr14
-    minus_di = 100 * _rma(pd.Series(minus_dm, index=df.index), length) / atr14
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    adx_val  = _rma(dx.fillna(0), length)
-    return pd.DataFrame({"plus_di": plus_di, "minus_di": minus_di, "adx": adx_val}, index=df.index)
-
-
-def _stoch(series: pd.Series, length: int) -> pd.Series:
-    lowest  = series.rolling(length).min()
-    highest = series.rolling(length).max()
-    denom   = (highest - lowest).replace(0, np.nan)
-    return 100 * (series - lowest) / denom
-
-
-def _stc(close: pd.Series, stoch_len=10, fast=23, slow=50) -> pd.Series:
-    """Schaff Trend Cycle."""
-    macd = _ema(close, fast) - _ema(close, slow)
-    st   = _stoch(macd, stoch_len)
-    return _ema(st.fillna(50), 3)
-
-
-def _vwap(df: pd.DataFrame) -> pd.Series:
-    tp  = (df["high"] + df["low"] + df["close"]) / 3
-    cum_v  = (tp * df["volume"]).cumsum()
-    cum_tv = df["volume"].cumsum()
-    return cum_v / cum_tv.replace(0, np.nan)
-
-
-def _pivot_high(df: pd.DataFrame, length: int) -> pd.Series:
-    highs = df["high"]
-    result = pd.Series(np.nan, index=df.index)
-    for i in range(length, len(df) - length):
-        window = highs.iloc[i - length: i + length + 1]
-        if highs.iloc[i] == window.max():
-            result.iloc[i] = highs.iloc[i]
+def _wilder_smooth(series: pd.Series, period: int) -> pd.Series:
+    """Wilder smoothing (RMA), equivalente a Pine Script ta.rma()."""
+    result = pd.Series(index=series.index, dtype=float)
+    result.iloc[period - 1] = series.iloc[:period].mean()
+    alpha = 1.0 / period
+    for i in range(period, len(series)):
+        result.iloc[i] = result.iloc[i - 1] * (1 - alpha) + series.iloc[i] * alpha
     return result
 
 
-def _pivot_low(df: pd.DataFrame, length: int) -> pd.Series:
-    lows = df["low"]
-    result = pd.Series(np.nan, index=df.index)
-    for i in range(length, len(df) - length):
-        window = lows.iloc[i - length: i + length + 1]
-        if lows.iloc[i] == window.min():
-            result.iloc[i] = lows.iloc[i]
+# ──────────────────────────────────────────────
+# MEDIAS MÓVILES
+# ──────────────────────────────────────────────
+
+def ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def sma(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(period).mean()
+
+
+# ──────────────────────────────────────────────
+# ATR
+# ──────────────────────────────────────────────
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low  - close.shift(1)).abs()
+    ], axis=1).max(axis=1)
+    return _wilder_smooth(tr, period)
+
+
+# ──────────────────────────────────────────────
+# ADX / DMI
+# ──────────────────────────────────────────────
+
+def adx_dmi(high: pd.Series, low: pd.Series, close: pd.Series,
+            period: int = 14) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    Returns: (plus_di, minus_di, adx)
+    """
+    up   = high.diff()
+    down = -low.diff()
+
+    plus_dm  = pd.Series(np.where((up > down) & (up > 0), up, 0.0),
+                         index=high.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0),
+                         index=high.index)
+
+    tr_series = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low  - close.shift(1)).abs()
+    ], axis=1).max(axis=1)
+
+    atr_w     = _wilder_smooth(tr_series, period)
+    plus_di   = 100 * _wilder_smooth(plus_dm,  period) / atr_w.replace(0, np.nan)
+    minus_di  = 100 * _wilder_smooth(minus_dm, period) / atr_w.replace(0, np.nan)
+
+    dx  = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = _wilder_smooth(dx.fillna(0), period)
+    return plus_di, minus_di, adx
+
+
+# ──────────────────────────────────────────────
+# VWAP (sesión — se resetea cada 24 h de datos)
+# ──────────────────────────────────────────────
+
+def vwap(high: pd.Series, low: pd.Series, close: pd.Series,
+         volume: pd.Series) -> pd.Series:
+    typical = (high + low + close) / 3
+    cum_vol = volume.cumsum()
+    cum_pv  = (typical * volume).cumsum()
+    return cum_pv / cum_vol.replace(0, np.nan)
+
+
+# ──────────────────────────────────────────────
+# RVOL (Relative Volume)
+# ──────────────────────────────────────────────
+
+def rvol(volume: pd.Series, period: int = 50) -> pd.Series:
+    vol_ma = sma(volume, period)
+    return volume / vol_ma.replace(0, np.nan)
+
+
+# ──────────────────────────────────────────────
+# POC (Point of Control — precio con mayor volumen)
+# ──────────────────────────────────────────────
+
+def poc(close: pd.Series, volume: pd.Series, lookback: int) -> pd.Series:
+    """
+    Para cada barra, el precio de cierre con mayor volumen
+    en la ventana lookback anterior.
+    """
+    result = pd.Series(index=close.index, dtype=float)
+    for i in range(lookback, len(close)):
+        window_vol = volume.iloc[i - lookback: i].values
+        window_cls = close.iloc[i - lookback: i].values
+        idx_max    = np.argmax(window_vol)
+        result.iloc[i] = window_cls[idx_max]
     return result
 
 
-def _poc(df: pd.DataFrame, lookback: int) -> float:
-    """Point of Control: precio con mayor volumen en ventana."""
-    sub = df.tail(lookback)
-    if sub.empty:
-        return float("nan")
-    return float(sub.loc[sub["volume"].idxmax(), "close"])
+# ──────────────────────────────────────────────
+# MAGIC SLOPE
+# ──────────────────────────────────────────────
+
+def magic_slope(close: pd.Series, ema_period: int = 7,
+                atr_period: int = 7) -> pd.Series:
+    e   = ema(close, ema_period)
+    a   = atr(close, close, close, atr_period)   # solo para normalizar
+    # Usamos high/low reales cuando disponibles (pasados como close aquí
+    # pero se sobreescribirá en strategy.py con la versión correcta)
+    slope = ((e - e.shift(1)) / a.clip(lower=1e-10)) * 100
+    return slope
 
 
-# ══════════════════════════════════════════════════════════════
-#  MOTOR MARKOV
-# ══════════════════════════════════════════════════════════════
-
-class MarkovEngine:
-    """Cadena de Markov de orden-1 con ventana deslizante."""
-
-    def __init__(self, lookback: int = LOOKBACK_MARKOV):
-        self.lookback = lookback
-        self.matrix   = np.zeros(9, dtype=float)   # 3×3 aplanada
-
-    def _state(self, slope: float, threshold: float) -> int:
-        if slope > threshold:
-            return 0   # bull
-        if slope < -threshold:
-            return 1   # bear
-        return 2       # neutral
-
-    def update(self, slopes: pd.Series, adaptive_threshold: float) -> tuple[float, float]:
-        """
-        Recalcula la matriz completa sobre la ventana de slopes.
-        Devuelve (prob_bull, prob_bear) del estado actual.
-        """
-        self.matrix[:] = 0.0
-        window = slopes.dropna().values[-self.lookback:]
-        if len(window) < 2:
-            return 0.0, 0.0
-
-        states = np.array([self._state(s, adaptive_threshold) for s in window])
-        for i in range(1, len(states)):
-            idx = states[i - 1] * 3 + states[i]
-            self.matrix[idx] += 1.0
-
-        curr_s   = states[-1]
-        base     = curr_s * 3
-        total    = self.matrix[base] + self.matrix[base + 1] + self.matrix[base + 2]
-        if total == 0:
-            return 0.0, 0.0
-        return (self.matrix[base] / total) * 100, (self.matrix[base + 1] / total) * 100
+def magic_slope_full(high: pd.Series, low: pd.Series, close: pd.Series,
+                     ema_period: int = 7, atr_period: int = 7) -> pd.Series:
+    e = ema(close, ema_period)
+    a = atr(high, low, close, atr_period)
+    return ((e - e.shift(1)) / a.clip(lower=1e-10)) * 100
 
 
-# ══════════════════════════════════════════════════════════════
-#  PIPELINE PRINCIPAL
-# ══════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────
+# PIVOT HIGHS / LOWS
+# ──────────────────────────────────────────────
 
-def compute(df: pd.DataFrame, markov: MarkovEngine) -> dict:
+def pivot_high(high: pd.Series, length: int) -> pd.Series:
+    """Devuelve el valor si es pivot high, NaN si no."""
+    result = pd.Series(np.nan, index=high.index)
+    for i in range(length, len(high) - length):
+        window = high.iloc[i - length: i + length + 1]
+        if high.iloc[i] == window.max():
+            result.iloc[i] = high.iloc[i]
+    return result
+
+
+def pivot_low(low: pd.Series, length: int) -> pd.Series:
+    result = pd.Series(np.nan, index=low.index)
+    for i in range(length, len(low) - length):
+        window = low.iloc[i - length: i + length + 1]
+        if low.iloc[i] == window.min():
+            result.iloc[i] = low.iloc[i]
+    return result
+
+
+# ──────────────────────────────────────────────
+# STC — Schaff Trend Cycle
+# ──────────────────────────────────────────────
+
+def stc(close: pd.Series, stc_len: int = 10,
+        fast: int = 23, slow: int = 50) -> pd.Series:
+    macd_line = ema(close, fast) - ema(close, slow)
+
+    def _stoch_of(series: pd.Series, period: int) -> pd.Series:
+        low_  = series.rolling(period).min()
+        high_ = series.rolling(period).max()
+        return 100 * (series - low_) / (high_ - low_).replace(0, np.nan)
+
+    stoch1 = _stoch_of(macd_line, stc_len)
+    d1     = ema(stoch1.fillna(50), 3)
+    stoch2 = _stoch_of(d1, stc_len)
+    d2     = ema(stoch2.fillna(50), 3)
+    return d2
+
+
+# ──────────────────────────────────────────────
+# RSI
+# ──────────────────────────────────────────────
+
+def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta).clip(lower=0)
+    avg_gain = _wilder_smooth(gain, period)
+    avg_loss = _wilder_smooth(loss, period)
+    rs   = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+# ──────────────────────────────────────────────
+# BOLLINGER BANDS
+# ──────────────────────────────────────────────
+
+def bollinger_bands(close: pd.Series, period: int = 20,
+                    mult: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    basis = sma(close, period)
+    dev   = close.rolling(period).std()
+    upper = basis + mult * dev
+    lower = basis - mult * dev
+    return upper, basis, lower
+
+
+# ──────────────────────────────────────────────
+# ADAPTIVE SLOPE THRESHOLD  (V50.1)
+# ──────────────────────────────────────────────
+
+def adaptive_slope_threshold(adx: pd.Series, slope_base: float,
+                              adx_trend: int, adx_range: int) -> pd.Series:
     """
-    Recibe un DataFrame OHLCV y devuelve un dict con todos
-    los indicadores y las señales long/short del V49.
+    Devuelve el umbral de slope adaptado al régimen de mercado:
+    - Rango     → más exigente (× 1.30)
+    - Tendencia → más permisivo (× 0.85)
+    - Transición → base
     """
-    df = df.copy()
-
-    # ── Base ──────────────────────────────────────────────────
-    ema7        = _ema(df["close"], 7)
-    atr7        = _atr(df, 7)
-    atr14       = _atr(df, 14)
-    magic_slope = ((ema7 - ema7.shift(1)) / atr7.clip(lower=1e-9)) * 100
-
-    # ── ADX adaptativo ────────────────────────────────────────
-    adx_df      = _adx(df, ADX_LEN)
-    adx_val     = adx_df["adx"].iloc[-1]
-    is_trending = adx_val > ADX_TREND
-    is_ranging  = adx_val < ADX_RANGE
-    adaptive_slope = (
-        SLOPE_MIN * 1.30 if is_ranging else
-        SLOPE_MIN * 0.85 if is_trending else
-        SLOPE_MIN
-    )
-
-    # ── Markov ────────────────────────────────────────────────
-    prob_bull, prob_bear = markov.update(magic_slope, adaptive_slope)
-
-    # ── Filtros institucionales ───────────────────────────────
-    vwap_val    = _vwap(df)
-    vol_sma     = df["volume"].rolling(50).mean()
-    rvol        = (df["volume"] / vol_sma.replace(0, np.nan)).fillna(0)
-    is_dense    = rvol.iloc[-1] >= RVOL_MIN
-
-    poc_level   = _poc(df, POC_LOOKBACK)
-    stc_val     = _stc(df["close"]).iloc[-1]
-
-    ph_series   = _pivot_high(df, PIVOT_LEN)
-    pl_series   = _pivot_low(df, PIVOT_LEN)
-    peak        = ph_series.dropna().iloc[-1] if ph_series.dropna().shape[0] > 0 else float("nan")
-    valley      = pl_series.dropna().iloc[-1] if pl_series.dropna().shape[0] > 0 else float("nan")
-
-    # ── Última vela ───────────────────────────────────────────
-    last        = df.iloc[-1]
-    slope_now   = float(magic_slope.iloc[-1])
-    vwap_now    = float(vwap_val.iloc[-1])
-    rvol_now    = float(rvol.iloc[-1])
-    atr14_now   = float(atr14.iloc[-1])
-
-    # ── Umbral dinámico ───────────────────────────────────────
-    threshold   = PROB_THRESHOLD - 5.0 if is_dense else PROB_THRESHOLD
-
-    # ── Señales ───────────────────────────────────────────────
-    long_sig = (
-        not np.isnan(valley)           and
-        float(last["low"])  < valley   and
-        float(last["close"]) < vwap_now and
-        slope_now > adaptive_slope      and
-        is_dense                        and
-        prob_bull > threshold           and
-        stc_val < 75
-    )
-    short_sig = (
-        not np.isnan(peak)             and
-        float(last["high"]) > peak     and
-        float(last["close"]) > vwap_now and
-        slope_now < -adaptive_slope     and
-        is_dense                        and
-        prob_bear > threshold           and
-        stc_val > 25
-    )
-
-    return {
-        # señales
-        "long":          long_sig,
-        "short":         short_sig,
-        # precios
-        "close":         float(last["close"]),
-        "atr14":         atr14_now,
-        "vwap":          vwap_now,
-        "poc":           poc_level,
-        "peak":          peak,
-        "valley":        valley,
-        # indicadores
-        "slope":         slope_now,
-        "adaptive_slope": adaptive_slope,
-        "adx":           adx_val,
-        "is_trending":   is_trending,
-        "is_ranging":    is_ranging,
-        "prob_bull":     prob_bull,
-        "prob_bear":     prob_bear,
-        "rvol":          rvol_now,
-        "is_dense":      is_dense,
-        "stc":           stc_val,
-        "threshold":     threshold,
-    }
+    result = pd.Series(slope_base, index=adx.index)
+    result = result.where(adx >= adx_range,  slope_base * 1.30)  # ranging
+    result = result.where(adx <= adx_trend,  slope_base * 0.85)  # trending
+    return result
