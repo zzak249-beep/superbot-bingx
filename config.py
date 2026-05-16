@@ -16,8 +16,8 @@ def _require(key: str) -> str:
 
 class Config:
     # --- Binance ---
-    BINANCE_API_KEY: str  = _require("BINANCE_API_KEY")
-    BINANCE_SECRET_KEY: str = _require("BINANCE_SECRET_KEY")
+    BINGX_API_KEY: str  = _require("BINGX_API_KEY")
+    BINGX_SECRET_KEY: str = _require("BINGX_SECRET_KEY")
     TESTNET: bool         = os.getenv("TESTNET", "false").lower() == "true"
 
     # --- Telegram ---
