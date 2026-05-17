@@ -1,11 +1,6 @@
 .env
-logs/
+data/trades.json
+data/bot.log
 __pycache__/
 *.pyc
-*.pyo
 .DS_Store
-*.egg-info/
-dist/
-build/
-.venv/
-venv/
