@@ -1,159 +1,167 @@
-# 🎯 Sniper Bot V49 — Híbrido [Markov + Kotegawa]
+# 🎯 Sniper Bot V35: Golden Equilibrium
 
-Bot algorítmico de trading para **Binance Futures (USDT-M)** con notificaciones en **Telegram**, desplegable en **Railway** en minutos.
-
----
-
-## 🧠 Ventaja competitiva
-
-| Capa | Tecnología | Ventaja |
-|---|---|---|
-| **Motor Markov** | Matriz de transición 3×3 sliding | Probabilidad estadística de continuación de estado |
-| **ADX Adaptativo** | Régimen detection V50.1 | Parámetros dinámicos según volatilidad |
-| **Filtros institucionales** | VWAP + RVOL + POC | Detecta flujo de dinero inteligente |
-| **Kotegawa Dip** | MA25 + RSI + BB | Confluencia de reversión a la media |
-| **STC Oscillator** | Schaff Trend Cycle | Evita entradas en sobrecompra/sobreventa extrema |
-| **Kelly Fraccional** | 1/4 Kelly criterion | Sizing matemáticamente óptimo |
-| **Triple Barrera** | TP + SL + Tiempo | Exit multi-dimensión estilo ML |
-
-La señal requiere **≥55 puntos** de un scoring compuesto de 100. Dos capas independientes deben converger para activar una entrada.
+Bot de trading automatizado para BingX Perpetual Futures.  
+Implementa exactamente la estrategia V35 de TradingView (Pine Script), con motor de aprendizaje adaptativo y notificaciones en Telegram.
 
 ---
 
-## 🗂 Estructura del proyecto
+## 📁 Estructura
 
 ```
-sniper-bot/
-├── main.py                  # Bucle principal async
-├── config.py                # Variables de entorno
+sniper-bot-v35/
+├── main.py              # Orquestador principal
+├── config.py            # Variables de entorno centralizadas
+├── bingx_client.py      # Cliente BingX REST API (firmado HMAC-SHA256)
+├── strategy.py          # Estrategia V35: EMA 7/17/21 + Pivot + Vol + ADX
+├── scanner.py           # Top 20 monedas del día por volumen/momentum
+├── telegram_notifier.py # Notificaciones HTML enriquecidas
+├── risk_manager.py      # Tamaño de posición y control de exposición
+├── learning_engine.py   # Motor adaptativo: registra, analiza, ajusta
 ├── requirements.txt
-├── Procfile                 # Railway worker
-├── railway.json
+├── railway.toml
 ├── .env.example
-└── bot/
-    ├── indicators.py        # EMA, ATR, ADX, VWAP, RVOL, POC, STC, RSI, BB, Pivots
-    ├── markov.py            # Motor Markov con ventana deslizante
-    ├── strategy.py          # Fusión Sniper V49 + Kotegawa
-    ├── risk_manager.py      # Kelly + Triple Barrera + DD guard
-    ├── binance_client.py    # Binance Futures async (TP/SL automáticos)
-    ├── telegram_notifier.py # Mensajes ricos en Telegram
-    └── utils.py             # Logging con colores
+└── data/                # Auto-creado: trades.json, bot.log
 ```
 
 ---
 
-## ⚙️ Configuración paso a paso
+## ⚙️ Configuración
 
-### 1. Clonar el repositorio
+### 1. Clonar y preparar `.env`
+
 ```bash
-git clone https://github.com/TU_USUARIO/sniper-bot.git
-cd sniper-bot
-```
-
-### 2. Credenciales Binance Futures
-1. Ve a [Binance → Gestión de API](https://www.binance.com/es/my/settings/api-management)
-2. Crea una nueva API Key con permisos:
-   - ✅ **Leer**
-   - ✅ **Trading de futuros**
-   - ❌ **NO** habilites retiradas
-3. Restringe la IP a la IP de tu servidor Railway (opcional pero recomendado)
-
-### 3. Bot de Telegram
-```bash
-# 1. Habla con @BotFather en Telegram → /newbot → guarda el TOKEN
-# 2. Habla con @userinfobot → guarda tu CHAT_ID
-# O usa: https://api.telegram.org/bot<TOKEN>/getUpdates
-```
-
-### 4. Variables de entorno (local)
-```bash
+git clone https://github.com/TU_USUARIO/sniper-bot-v35.git
+cd sniper-bot-v35
 cp .env.example .env
-# Edita .env con tus credenciales reales
+nano .env   # rellena tus claves
 ```
+
+### 2. Variables de entorno obligatorias
+
+| Variable | Descripción | Ejemplo |
+|---|---|---|
+| `BINGX_API_KEY` | Clave API de BingX | `abc123...` |
+| `BINGX_SECRET_KEY` | Secret de BingX | `xyz789...` |
+| `TELEGRAM_TOKEN` | Token del bot de Telegram | `1234567:ABC...` |
+| `TELEGRAM_CHAT_ID` | Tu Chat ID de Telegram | `987654321` |
+
+### 3. Variables opcionales (ya tienen valores por defecto correctos)
+
+| Variable | Default | Descripción |
+|---|---|---|
+| `VOL_MULT` | `1.5` | Multiplicador de volumen (sync con Pine) |
+| `ADX_MIN` | `20` | Umbral ADX mínimo (sync con Pine) |
+| `LEVERAGE` | `5` | Apalancamiento |
+| `CAPITAL_PCT` | `2` | % de balance por operación |
+| `MAX_TRADES` | `3` | Máximo de trades simultáneos |
+| `DRY_RUN` | `false` | `true` para simular sin operar real |
 
 ---
 
-## 🚀 Deploy en Railway
+## 🔑 Cómo obtener las claves
 
-### Opción A — GitHub (recomendado)
-1. Sube el proyecto a GitHub
-2. En [railway.app](https://railway.app) → **New Project → Deploy from GitHub**
-3. Selecciona el repositorio
-4. En **Variables** agrega todas las del `.env.example`
-5. Railway detecta el `Procfile` y despliega automáticamente
+### BingX API
+1. Entra a BingX → Tu perfil → **API Management**
+2. Crear nueva API Key
+3. Permisos necesarios: **Trade** + **Read**
+4. Copia `API Key` y `Secret Key` al `.env`
 
-### Opción B — Railway CLI
+### Telegram Bot
+1. Habla con [@BotFather](https://t.me/BotFather) → `/newbot`
+2. Copia el **token** al `.env`
+3. Envía cualquier mensaje a tu bot, luego visita:  
+   `https://api.telegram.org/bot<TOKEN>/getUpdates`
+4. Copia el `chat.id` al `.env`
+
+---
+
+## 🚀 Despliegue en Railway
+
+### Opción A: Desde GitHub (recomendado)
+
+1. Sube el código a GitHub
+2. Ve a [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub**
+3. Selecciona tu repositorio
+4. Ve a **Variables** y añade todas las del `.env`
+5. Railway detecta `railway.toml` y despliega automáticamente
+
+### Opción B: Railway CLI
+
 ```bash
 npm install -g @railway/cli
 railway login
 railway init
 railway up
-railway variables set BINANCE_API_KEY=... TELEGRAM_TOKEN=... # etc.
-```
-
-### Variables obligatorias en Railway
-```
-BINANCE_API_KEY
-BINANCE_SECRET_KEY
-TELEGRAM_TOKEN
-TELEGRAM_CHAT_ID
+railway variables set BINGX_API_KEY=... BINGX_SECRET_KEY=... TELEGRAM_TOKEN=... TELEGRAM_CHAT_ID=...
 ```
 
 ---
 
-## 🧪 Paper Trading primero (OBLIGATORIO)
+## 🧪 Prueba local
 
-```env
-TESTNET=true
+```bash
+# Instalar dependencias
+pip install -r requirements.txt
+
+# Probar en modo seco (sin operar)
+DRY_RUN=true python main.py
 ```
-
-Binance Futures Testnet: https://testnet.binancefuture.com
-
-**Valida durante al menos 2 semanas antes de usar dinero real.**
 
 ---
 
-## 📊 Mensajes Telegram
+## 📊 Estrategia V35 — Cómo funciona
 
-| Evento | Contenido |
+Implementación exacta del Pine Script `//@version=6`:
+
+| Componente | Valor | Descripción |
+|---|---|---|
+| EMA Fast | 7 | Señal de momentum |
+| EMA Mid | 17 | Confirmación cruce |
+| EMA Slow | 21 | Take Profit institucional |
+| Pivot Len | 5 | Profundidad del ZigZag |
+| Vol Mult | 1.5x | Volumen institucional |
+| ADX Min | 20 | Tendencia mínima |
+| SL | valley − ATR×0.5 | Stop bajo estructura |
+| TP | EMA 21 | Objetivo institucional |
+| Time-Stop | 15 velas = 45 min | Evita quedarse atascado |
+
+**Señal LONG:** crossover(EMA7, EMA17) AND low < valley AND vol > 1.5x AND ADX > 20  
+**Señal SHORT:** crossunder(EMA7, EMA17) AND high > peak AND vol > 1.5x AND ADX > 20
+
+---
+
+## 🧠 Motor de aprendizaje
+
+El bot aprende automáticamente de sus resultados:
+
+- **Registra** cada trade con todos sus indicadores en `data/trades.json`
+- **Analiza** cada 5 trades: winrate, ADX medio en pérdidas, patrones
+- **Ajusta** automáticamente:
+  - Si WR < 40% → sube umbral ADX +2 y fuerza mínima +5%
+  - Si WR > 65% → relaja filtros levemente
+  - Si pérdidas correlacionan con ADX bajo → sube umbral
+- **Bloquea** símbolos con WR < 30% tras 5+ trades
+- **Notifica** en Telegram cada ajuste realizado
+
+---
+
+## 📱 Notificaciones Telegram
+
+| Evento | Trigger |
 |---|---|
-| 🚀 Arranque | Config, modo, pares, leverage |
-| 📈📉 Entrada | Precio, qty, TP, SL, régimen, ADX, probs Markov, RVOL, STC, VWAP, POC, RSI, score total, razones |
-| ✅❌ Salida | Motivo (TP/SL/Tiempo), PnL USDT, PnL %, balance |
-| 💓 Heartbeat | Cada hora: balance, PnL diario, DD, estado por par |
-| ⚠️ Error | Stack trace truncado |
+| 🚀 Startup | Al iniciar el bot |
+| ⚡ Trade abierto | Cada nueva posición |
+| ✅/❌ Trade cerrado | TP, SL o Time-Stop |
+| 🔍 Escaneo | Cada hora (top 20 pares) |
+| 🏆 Reporte diario | 00:01 UTC |
+| 🧠 Ajuste IA | Cada cambio de parámetros |
+| 🚫 Blacklist | Símbolo bloqueado |
+| ⚠️ Error | Cualquier excepción grave |
 
 ---
 
-## ⚠️ Avisos de riesgo
+## ⚠️ Disclaimer
 
-> **El trading con apalancamiento puede resultar en pérdida total del capital.**
-> Este software se proporciona sin garantías. Úsalo bajo tu propia responsabilidad.
-> Empieza siempre con capital que puedas permitirte perder.
-
-**Ajustes conservadores recomendados para empezar:**
-```env
-LEVERAGE=3
-RISK_PER_TRADE=1.0
-MAX_DAILY_LOSS_PCT=2.0
-ATR_MULT_TP=2.5
-ATR_MULT_SL=1.0
-```
-
----
-
-## 🔧 Ajuste de parámetros
-
-| Parámetro | Valor base | Mercado alcista | Mercado lateral |
-|---|---|---|---|
-| `PROB_THRESHOLD` | 40% | 35% | 50% |
-| `RVOL_MIN` | 1.5x | 1.3x | 2.0x |
-| `ATR_MULT_TP` | 2.0 | 2.5 | 1.5 |
-| `ADX_TREND` | 25 | 20 | 30 |
-
----
-
-## 📋 Logs
-
-Los logs se guardan en `logs/bot.log` con rotación automática.
-En Railway puedes verlos en tiempo real desde el panel → **Deployments → View Logs**.
+Este bot opera con **dinero real**. Usa `DRY_RUN=true` para probar.  
+El trading de futuros con apalancamiento implica **riesgo de pérdida total**.  
+Este software se proporciona sin garantías. Úsalo bajo tu propio riesgo.
