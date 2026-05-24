@@ -1,190 +1,344 @@
 """
-strategy.py — V35 Golden Equilibrium
-Indicadores implementados con numpy/pandas puro.
-Sin pandas-ta, sin ta-lib. Funciona en Railway con pandas 2.x.
+strategy.py — Motor de señales QF×JP v3
+Genera señal, score de convicción 0-10, SL y TP
 """
-import logging
 import numpy as np
 import pandas as pd
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
 
-from config import (
-    EMA_FAST, EMA_MID, EMA_SLOW,
-    PIVOT_LEN, VOL_MULT, ADX_MIN, ATR_SL_MULT,
-)
+import config as C
+import indicators as ind
 
-logger = logging.getLogger(__name__)
-
-
-# ──────────────────────────────────────────────────────────
-# Indicadores (numpy/pandas puro)
-# ──────────────────────────────────────────────────────────
-
-def _ema(series: pd.Series, n: int) -> pd.Series:
-    """EMA — idéntico a ta.ema() de Pine Script."""
-    return series.ewm(span=n, adjust=False).mean()
+log = logging.getLogger(__name__)
 
 
-def _sma(series: pd.Series, n: int) -> pd.Series:
-    return series.rolling(n).mean()
+@dataclass
+class Signal:
+    direction:   str    = "NONE"   # LONG | SHORT | NONE
+    level:       str    = "NONE"   # STD | FUEL | SUP
+    conviction:  int    = 0        # 0-10
+    entry:       float  = 0.0
+    sl:          float  = 0.0
+    tp:          float  = 0.0
+    atr:         float  = 0.0
+    sl_source:   float  = 0.0      # último swing para referencia
+    reasons:     list   = field(default_factory=list)
+    # Indicadores individuales para Telegram
+    score:       float  = 0.0
+    f_mom:       float  = 0.0
+    f_rev:       float  = 0.0
+    f_vol:       float  = 0.0
+    decay_pct:   float  = 0.0
+    bp_drain:    float  = 0.0
+    cvd_rising:  bool   = False
+    sq_on:       bool   = False
+    htf_bull:    bool   = False
+    htf_bear:    bool   = False
+    ses_label:   str    = "OFF"
+    funding:     float  = 0.0
 
 
-def _atr(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> pd.Series:
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low  - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(span=n, adjust=False).mean()
+class QFJPStrategy:
+    def __init__(self):
+        self._last_signals: dict = {}
 
+    # ─────────────────────────────────────────────────────────
+    def compute(self,
+                df: pd.DataFrame,
+                df_htf: pd.DataFrame,
+                funding_rate: float = 0.0,
+                ob_imbalance: float = 0.5) -> Signal:
+        """
+        df     : OHLCV 3min  (columnas: open, high, low, close, volume)
+        df_htf : OHLCV 15min
+        funding_rate : tasa de financiamiento actual
+        ob_imbalance : ratio bids/(bids+asks) del libro de órdenes 0-1
+        """
+        if len(df) < C.LOOKBACK // 2:
+            return Signal()
 
-def _adx(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> pd.Series:
-    """ADX de Wilder — replica ta.dmi() de Pine Script."""
-    prev_high  = high.shift(1)
-    prev_low   = low.shift(1)
-    prev_close = close.shift(1)
+        o = df["open"]
+        h = df["high"]
+        l = df["low"]
+        c = df["close"]
+        v = df["volume"]
 
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low  - prev_close).abs(),
-    ], axis=1).max(axis=1)
+        # ── L1 · ATR ─────────────────────────────────────────
+        atr_s = ind.atr(h, l, c, C.ATR_PERIOD)
 
-    up_move   = high - prev_high
-    down_move = prev_low - low
+        # ── L2 · Score compuesto ──────────────────────────────
+        norm_score, fm, fr, fv = ind.composite_score(
+            c, v,
+            C.MOM_LOOKBACK, C.REV_LOOKBACK, C.VOL_LOOKBACK,
+            C.W_MOM, C.W_REV, C.W_VOL,
+            C.SIGNAL_SMOOTH, C.DECAY_LEN
+        )
 
-    plus_dm  = pd.Series(
-        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
-        index=high.index, dtype=float)
-    minus_dm = pd.Series(
-        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
-        index=high.index, dtype=float)
+        # ── L3 · Decaimiento ─────────────────────────────────
+        sig_alive, decay_r = ind.signal_decay(
+            norm_score, c, C.DECAY_LEN, C.SIGNAL_SMOOTH, C.DECAY_THR
+        )
 
-    atr_s      = tr.ewm(span=n, adjust=False).mean()
-    plus_dm_s  = plus_dm.ewm(span=n, adjust=False).mean()
-    minus_dm_s = minus_dm.ewm(span=n, adjust=False).mean()
+        # ── L4 · Dark Pool ───────────────────────────────────
+        dp_buy, dp_sell, vac_up, vac_dn = ind.dark_pool(
+            h, l, c, o, v, atr_s, C.DP_VOL_MULT, C.DP_BASELINE
+        )
 
-    plus_di  = 100 * plus_dm_s  / atr_s.replace(0, np.nan)
-    minus_di = 100 * minus_dm_s / atr_s.replace(0, np.nan)
+        # ── L5 · Ejecución ───────────────────────────────────
+        exec_ok, bp_drain = ind.exec_cost(h, l, c, C.SPREAD_LEN, C.BP_THRESHOLD)
 
-    dx  = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    return dx.ewm(span=n, adjust=False).mean()
+        # ── L6 · Asimetría ───────────────────────────────────
+        asym_bull, asym_bear, rr_bull, rr_bear = ind.momentum_asymmetry(
+            h, l, c, o, C.ASYM_LEN, C.ASYM_BULL_RATIO, C.ASYM_BEAR_RATIO
+        )
 
+        # ── L7 · Pivotes y TL ────────────────────────────────
+        ph = ind.pivot_high(h, C.TL_LEFT, C.TL_RIGHT)
+        pl = ind.pivot_low(l, C.SWING_LOW_LEFT, C.SWING_LOW_RIGHT)
 
-def _pivot_high(high: pd.Series, n: int) -> pd.Series:
-    """ta.pivothigh(high, n, n) de Pine Script."""
-    result = pd.Series(np.nan, index=high.index, dtype=float)
-    arr = high.to_numpy()
-    for i in range(n, len(arr) - n):
-        window = arr[i - n: i + n + 1]
-        if arr[i] == window.max() and list(window).count(arr[i]) == 1:
-            result.iloc[i] = arr[i]
-    return result
+        tl_break_long, tl_break_short = ind.trendline_break(
+            h, l, c, atr_s, ph, pl,
+            C.TL_LOOKBACK, C.TL_LEFT, C.TL_RIGHT, C.TL_BUFFER
+        )
 
+        # ── L8 · Swing ───────────────────────────────────────
+        sell_ex, buy_ex, last_sl_s, last_sh_s = ind.swing_analysis(
+            pl, ph, C.SWING_WINDOW, C.HL_COUNT_MIN, C.LH_COUNT_MIN
+        )
 
-def _pivot_low(low: pd.Series, n: int) -> pd.Series:
-    """ta.pivotlow(low, n, n) de Pine Script."""
-    result = pd.Series(np.nan, index=low.index, dtype=float)
-    arr = low.to_numpy()
-    for i in range(n, len(arr) - n):
-        window = arr[i - n: i + n + 1]
-        if arr[i] == window.min() and list(window).count(arr[i]) == 1:
-            result.iloc[i] = arr[i]
-    return result
+        # ── L9 · FVG ─────────────────────────────────────────
+        _, _, in_bull_fvg, in_bear_fvg = ind.fair_value_gaps(
+            h, l, atr_s, C.FVG_MIN_ATR, C.FVG_MAX_BARS
+        )
 
+        # ── L10 · Order Blocks ───────────────────────────────
+        _, _, in_bull_ob, in_bear_ob = ind.order_blocks(
+            h, l, c, o, atr_s, C.OB_IMPULSE_ATR, C.OB_MAX_BARS
+        )
 
-# ──────────────────────────────────────────────────────────
-# Estrategia V35
-# ──────────────────────────────────────────────────────────
+        # ── L11 · CVD ────────────────────────────────────────
+        cvd_rising, cvd_bull_div, cvd_bear_div = ind.cvd_delta(
+            h, l, c, v, C.CVD_EMA_LEN, C.CVD_DIV_LEN
+        )
 
-class StrategyV35:
-    """
-    Port exacto del Pine Script V35: Golden Equilibrium.
+        # ── L12 · Squeeze ────────────────────────────────────
+        sq_on, sq_bull, sq_bear = ind.squeeze_momentum(
+            h, l, c, atr_s, C.SQ_LEN, C.SQ_BB_MULT, C.SQ_KC_MULT
+        )
 
-    LONG:  crossover(EMA7, EMA17) AND low < valley AND vol > 1.5x AND ADX > 20
-    SHORT: crossunder(EMA7, EMA17) AND high > peak  AND vol > 1.5x AND ADX > 20
-    SL  :  valley − ATR×0.5 (long)  |  peak + ATR×0.5 (short)
-    TP  :  EMA 21
-    """
+        # ── HTF Régimen ──────────────────────────────────────
+        htf_bull, htf_bear = self._htf_regime(df_htf)
 
-    def _add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df["ema7"]  = _ema(df["close"], EMA_FAST)
-        df["ema17"] = _ema(df["close"], EMA_MID)
-        df["ema21"] = _ema(df["close"], EMA_SLOW)
-        df["vol_ma"]      = _sma(df["volume"], 20)
-        df["is_inst_vol"] = df["volume"] > (df["vol_ma"] * VOL_MULT)
-        df["adx"] = _adx(df["high"], df["low"], df["close"], 14)
-        df["atr"] = _atr(df["high"], df["low"], df["close"], 14)
-        df["peak"]   = _pivot_high(df["high"], PIVOT_LEN).ffill()
-        df["valley"] = _pivot_low( df["low"],  PIVOT_LEN).ffill()
-        return df
+        # ── VWAP ─────────────────────────────────────────────
+        vwap = ind.vwap_rolling(h, l, c, v, 480)
+        above_vwap = c > vwap
 
-    def get_signal(self, df: pd.DataFrame, adx_override: float = None) -> dict:
-        NONE = {"signal": "NONE"}
-        if len(df) < 60:
-            return NONE
+        # ── Sesión UTC ───────────────────────────────────────
+        ses_label = self._session_label(df.index[-1])
 
-        df   = self._add_indicators(df)
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
+        # ── Valores en la última vela ─────────────────────────
+        i = -1  # última vela completa
 
-        for col in ["ema7", "ema17", "ema21", "adx", "atr", "peak", "valley", "vol_ma"]:
-            if pd.isna(last[col]) or pd.isna(prev[col]):
-                return NONE
+        def b(s):
+            try:
+                return bool(s.iloc[i])
+            except Exception:
+                return False
 
-        adx_min = adx_override if adx_override else ADX_MIN
-        if not bool(last["is_inst_vol"]):
-            return NONE
-        if float(last["adx"]) <= adx_min:
-            return NONE
+        def f(s):
+            try:
+                v2 = float(s.iloc[i])
+                return 0.0 if np.isnan(v2) else v2
+            except Exception:
+                return 0.0
 
-        cross_up   = float(prev["ema7"]) <= float(prev["ema17"]) and \
-                     float(last["ema7"])  >  float(last["ema17"])
-        cross_down = float(prev["ema7"]) >= float(prev["ema17"]) and \
-                     float(last["ema7"])  <  float(last["ema17"])
+        ns   = f(norm_score)
+        alive= b(sig_alive)
+        eok  = b(exec_ok)
+        hb   = htf_bull
+        he   = htf_bear
+        ab   = b(asym_bull)
+        ae   = b(asym_bear)
+        se   = b(sell_ex)
+        be   = b(buy_ex)
+        tlbl = b(tl_break_long)
+        tbsh = b(tl_break_short)
+        dpb  = b(dp_buy)
+        dps  = b(dp_sell)
+        ibfvg= b(in_bull_fvg)
+        iefvg= b(in_bear_fvg)
+        ibob = b(in_bull_ob)
+        ieob = b(in_bear_ob)
+        cvdr = b(cvd_rising)
+        cbdiv= b(cvd_bull_div)
+        csdiv= b(cvd_bear_div)
+        sqb  = b(sq_bull)
+        sqbe = b(sq_bear)
+        sqon = b(sq_on)
+        avwap= b(above_vwap)
 
-        if cross_up   and float(last["low"])  < float(last["valley"]):
-            signal = "LONG"
-        elif cross_down and float(last["high"]) > float(last["peak"]):
-            signal = "SHORT"
-        else:
-            return NONE
+        atr_v = f(atr_s)
+        price  = f(c)
+        sl_lng = f(last_sl_s)
+        sl_sht = f(last_sh_s)
+        decay  = f(decay_r)
+        bp     = f(bp_drain)
+        fm_v   = f(fm)
+        fr_v   = f(fr)
+        fv_v   = f(fv)
 
-        entry = float(last["close"])
-        atr   = float(last["atr"])
-        sl    = float(last["valley"]) - atr * ATR_SL_MULT if signal == "LONG" \
-                else float(last["peak"]) + atr * ATR_SL_MULT
-        tp    = float(last["ema21"])
+        # ── Filtro funding ────────────────────────────────────
+        funding_ok_long  = funding_rate <= C.MAX_FUNDING_LONG
+        funding_ok_short = funding_rate >= C.MIN_FUNDING_SHORT
 
-        if signal == "LONG"  and (sl >= entry or tp <= entry): return NONE
-        if signal == "SHORT" and (sl <= entry or tp >= entry): return NONE
+        # ── Filtro orderbook ──────────────────────────────────
+        # ob_imbalance > 0.55 = presión compradora
+        ob_bull = ob_imbalance >= 0.55
+        ob_bear = ob_imbalance <= 0.45
 
-        vol_ratio = float(last["volume"]) / float(last["vol_ma"]) \
-                    if float(last["vol_ma"]) > 0 else 0.0
+        # ── SEÑALES ───────────────────────────────────────────
+        long_std = (ns > 0.15 and alive and eok and hb and ab and se
+                    and funding_ok_long)
+        long_fuel= long_std and (tlbl or sqb or ((ibfvg or ibob) and cvdr))
+        long_sup = long_fuel and (dpb or cbdiv or (ob_bull and avwap))
 
-        return {
-            "signal":    signal,
-            "entry":     round(entry, 8),
-            "sl":        round(sl, 8),
-            "tp":        round(tp, 8),
-            "atr":       round(atr, 8),
-            "adx":       round(float(last["adx"]), 2),
-            "strength":  self._strength(last),
-            "peak":      round(float(last["peak"]),   8),
-            "valley":    round(float(last["valley"]), 8),
-            "vol_ratio": round(vol_ratio, 2),
-        }
+        short_std = (ns < -0.15 and alive and eok and he and ae and be
+                     and funding_ok_short)
+        short_fuel= short_std and (tbsh or sqbe or ((iefvg or ieob) and not cvdr))
+        short_sup = short_fuel and (dps or csdiv or (ob_bear and not avwap))
 
-    @staticmethod
-    def _strength(row) -> float:
-        score = 0.0
-        score += min(40.0, (float(row["adx"]) / 50.0) * 40.0)
-        if float(row["vol_ma"]) > 0:
-            score += min(30.0, (float(row["volume"]) / float(row["vol_ma"]) / 3.0) * 30.0)
-        e7, e17, e21 = float(row["ema7"]), float(row["ema17"]), float(row["ema21"])
-        if (e7 > e17 > e21) or (e7 < e17 < e21):
-            score += 30.0
-        elif e7 != e17:
-            score += 15.0
-        return round(score, 1)
+        # ── Score convicción 0-10 ─────────────────────────────
+        long_conv = sum([
+            ns > 0.15, alive, eok, hb, ab, se,
+            tlbl, dpb, cvdr,
+            (sqb or ibfvg or ibob),
+        ])
+        short_conv = sum([
+            ns < -0.15, alive, eok, he, ae, be,
+            tbsh, dps, not cvdr,
+            (sqbe or iefvg or ieob),
+        ])
+
+        # ── Construir señal ───────────────────────────────────
+        sig = Signal()
+        sig.atr       = atr_v
+        sig.score     = ns
+        sig.f_mom     = fm_v
+        sig.f_rev     = fr_v
+        sig.f_vol     = fv_v
+        sig.decay_pct = decay * 100
+        sig.bp_drain  = bp
+        sig.cvd_rising= cvdr
+        sig.sq_on     = sqon
+        sig.htf_bull  = hb
+        sig.htf_bear  = he
+        sig.ses_label = ses_label
+        sig.funding   = funding_rate
+
+        if long_std and long_conv >= C.MIN_CONVICTION:
+            sig.direction = "LONG"
+            sig.level     = "SUP" if long_sup else "FUEL" if long_fuel else "STD"
+            sig.conviction= long_conv
+            sig.entry     = price
+            sl_ref        = sl_lng if not np.isnan(sl_lng) else price - atr_v * C.SL_ATR_MULT
+            sig.sl        = min(sl_ref, price - atr_v * C.SL_ATR_MULT)
+            sig.sl_source = sl_lng
+            rr            = C.TP_RR_SUP if long_sup else C.TP_RR_FUEL if long_fuel else C.TP_RR_STD
+            risk          = price - sig.sl
+            sig.tp        = price + risk * rr
+            sig.reasons   = self._reasons_long(
+                ns, alive, eok, hb, ab, se, tlbl, sqb, dpb,
+                ibfvg, ibob, cvdr, cbdiv, ob_bull, avwap, funding_rate
+            )
+
+        elif short_std and short_conv >= C.MIN_CONVICTION:
+            sig.direction = "SHORT"
+            sig.level     = "SUP" if short_sup else "FUEL" if short_fuel else "STD"
+            sig.conviction= short_conv
+            sig.entry     = price
+            sl_ref        = sl_sht if not np.isnan(sl_sht) else price + atr_v * C.SL_ATR_MULT
+            sig.sl        = max(sl_ref, price + atr_v * C.SL_ATR_MULT)
+            sig.sl_source = sl_sht
+            rr            = C.TP_RR_SUP if short_sup else C.TP_RR_FUEL if short_fuel else C.TP_RR_STD
+            risk          = sig.sl - price
+            sig.tp        = price - risk * rr
+            sig.reasons   = self._reasons_short(
+                ns, alive, eok, he, ae, be, tbsh, sqbe, dps,
+                iefvg, ieob, not cvdr, csdiv, ob_bear, not avwap, funding_rate
+            )
+
+        if sig.direction != "NONE":
+            log.info(f"SEÑAL {sig.direction} {sig.level} | conv={sig.conviction}/10 "
+                     f"| entry={sig.entry:.4f} sl={sig.sl:.4f} tp={sig.tp:.4f}")
+
+        return sig
+
+    # ─────────────────────────────────────────────────────────
+    def _htf_regime(self, df_htf: pd.DataFrame):
+        if df_htf is None or len(df_htf) < C.HTF_SLOW + 2:
+            return False, False
+        c = df_htf["close"]
+        fast = c.ewm(span=C.HTF_FAST, adjust=False).mean()
+        slow = c.ewm(span=C.HTF_SLOW, adjust=False).mean()
+        htf_bull = bool(fast.iloc[-1] > slow.iloc[-1])
+        htf_bear = bool(fast.iloc[-1] < slow.iloc[-1])
+        return htf_bull, htf_bear
+
+    def _session_label(self, ts) -> str:
+        try:
+            h = pd.Timestamp(ts, tz="UTC").hour
+            in_asia   = 0 <= h < 8
+            in_london = 7 <= h < 16
+            in_ny     = 13 <= h < 22
+            if in_ny:     return "NY 🟢"
+            if in_london: return "LDN 🔴"
+            if in_asia:   return "ASIA 🔵"
+            return "OFF"
+        except Exception:
+            return "—"
+
+    def _reasons_long(self, ns, alive, eok, hb, ab, se,
+                      tlbl, sqb, dpb, ibfvg, ibob, cvdr, cbdiv,
+                      ob_bull, avwap, funding):
+        r = []
+        if ns > 0.15:  r.append(f"✅ Score {ns:+.2f}")
+        if alive:       r.append("✅ Señal viva")
+        if eok:         r.append("✅ Spread ok")
+        if hb:          r.append("✅ HTF alcista")
+        if ab:          r.append("✅ Asimetría bull")
+        if se:          r.append("✅ Vendedores agotados")
+        if tlbl:        r.append("🔥 Ruptura TL bajista")
+        if sqb:         r.append("💥 Squeeze liberado ↑")
+        if dpb:         r.append("🏦 Dark Pool compra")
+        if ibfvg:       r.append("📦 En FVG alcista")
+        if ibob:        r.append("🟩 Retest OB alcista")
+        if cvdr:        r.append("📈 CVD rising")
+        if cbdiv:       r.append("🔍 Divergencia CVD acum")
+        if ob_bull:     r.append("📊 Orderbook presión ↑")
+        if avwap:       r.append("📍 Sobre VWAP")
+        if funding < 0: r.append(f"💰 Funding negativo {funding*100:.3f}%")
+        return r
+
+    def _reasons_short(self, ns, alive, eok, he, ae, be,
+                       tbsh, sqbe, dps, iefvg, ieob, cvdf, csdiv,
+                       ob_bear, bvwap, funding):
+        r = []
+        if ns < -0.15: r.append(f"✅ Score {ns:+.2f}")
+        if alive:       r.append("✅ Señal viva")
+        if eok:         r.append("✅ Spread ok")
+        if he:          r.append("✅ HTF bajista")
+        if ae:          r.append("✅ Asimetría bear")
+        if be:          r.append("✅ Compradores agotados")
+        if tbsh:        r.append("🔥 Ruptura TL alcista")
+        if sqbe:        r.append("💥 Squeeze liberado ↓")
+        if dps:         r.append("🏦 Dark Pool venta")
+        if iefvg:       r.append("📦 En FVG bajista")
+        if ieob:        r.append("🟥 Retest OB bajista")
+        if cvdf:        r.append("📉 CVD falling")
+        if csdiv:       r.append("🔍 Divergencia CVD dist")
+        if ob_bear:     r.append("📊 Orderbook presión ↓")
+        if bvwap:       r.append("📍 Bajo VWAP")
+        if funding > 0: r.append(f"💰 Funding positivo {funding*100:.3f}%")
+        return r

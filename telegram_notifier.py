@@ -1,129 +1,137 @@
 """
-telegram_notifier.py — Notificaciones Telegram con HTML enriquecido.
-Cubre: startup, señales, cierres, escaneo, reporte diario y errores.
+telegram_notifier.py — Notificaciones Telegram con formato HTML
 """
 import logging
+from datetime import datetime, timezone
+
 import requests
-from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
-logger = logging.getLogger(__name__)
+import config as C
+from strategy import Signal
 
-BAR = "━━━━━━━━━━━━━━━━"
+log = logging.getLogger(__name__)
 
 
 class TelegramNotifier:
     def __init__(self):
-        self.token   = TELEGRAM_TOKEN
-        self.chat_id = TELEGRAM_CHAT_ID
+        self.token   = C.TELEGRAM_TOKEN
+        self.chat_id = C.TELEGRAM_CHAT_ID
         self._url    = f"https://api.telegram.org/bot{self.token}/sendMessage"
 
-    # ──────────────────────────────────────────────────────
-    # Core
-    # ──────────────────────────────────────────────────────
-    def send(self, text: str, parse_mode: str = "HTML") -> bool:
+    def _send(self, text: str):
         if not self.token or not self.chat_id:
-            logger.warning("Telegram no configurado — omitiendo notificación")
-            return False
+            log.warning("Telegram no configurado")
+            return
         try:
-            resp = requests.post(
-                self._url,
-                json={"chat_id": self.chat_id, "text": text, "parse_mode": parse_mode},
-                timeout=10,
-            )
-            ok = resp.json().get("ok", False)
-            if not ok:
-                logger.error(f"Telegram error: {resp.text}")
-            return ok
+            requests.post(self._url, json={
+                "chat_id":    self.chat_id,
+                "text":       text,
+                "parse_mode": "HTML",
+            }, timeout=10)
         except Exception as e:
-            logger.error(f"Telegram send exception: {e}")
-            return False
+            log.error(f"Telegram error: {e}")
 
-    # ──────────────────────────────────────────────────────
-    # Mensajes estructurados
-    # ──────────────────────────────────────────────────────
-    def notify_startup(self, balance: float, symbol_count: int, dry_run: bool = False):
-        mode = "⚠️ <b>DRY RUN — SIN DINERO REAL</b>" if dry_run else "✅ <b>MODO REAL</b>"
-        self.send(
-            f"🚀 <b>SNIPER BOT V35 INICIADO</b>\n{BAR}\n"
-            f"{mode}\n"
-            f"💰 Balance: <b>${balance:,.2f} USDT</b>\n"
-            f"🔍 Pares monitoreados: <b>{symbol_count}</b>\n"
-            f"⚙️ Estrategia: Golden Equilibrium\n"
-            f"📊 Filtros: Vol {1.5}x | ADX >20 | Time-Stop 45min\n"
-            f"🧠 Motor de aprendizaje: <b>ACTIVO</b>"
+    # ── Nivel de señal ─────────────────────────────────────────
+
+    @staticmethod
+    def _level_emoji(level: str) -> str:
+        return {"SUP": "⭐", "FUEL": "🔥", "STD": "▲"}.get(level, "")
+
+    @staticmethod
+    def _dir_emoji(direction: str) -> str:
+        return "🟢" if direction == "LONG" else "🔴"
+
+    # ── Mensajes ───────────────────────────────────────────────
+
+    def send_entry(self, symbol: str, sig: Signal, qty: float, balance: float):
+        e  = self._level_emoji(sig.level)
+        d  = self._dir_emoji(sig.direction)
+        rr = abs(sig.tp - sig.entry) / max(abs(sig.entry - sig.sl), 1e-9)
+
+        reasons_text = "\n".join(f"  {r}" for r in sig.reasons) if sig.reasons else "  —"
+
+        text = (
+            f"{e} {d} <b>{sig.direction} {sig.level}</b> — {symbol}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📍 Entrada:    <code>{sig.entry:.4f}</code>\n"
+            f"🛑 Stop Loss:  <code>{sig.sl:.4f}</code>\n"
+            f"🎯 Take Profit:<code>{sig.tp:.4f}</code>\n"
+            f"📐 RR:         <b>{rr:.2f}:1</b>\n"
+            f"🎲 Cantidad:   <code>{qty:.6f}</code>\n"
+            f"💎 Convicción: <b>{sig.conviction}/10</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>📊 Indicadores</b>\n"
+            f"  Score:  {sig.score:+.3f}  |  CVD: {'↑' if sig.cvd_rising else '↓'}\n"
+            f"  Squeeze: {'ON 🔲' if sig.sq_on else 'off'}  |  Sesión: {sig.ses_label}\n"
+            f"  Funding: {sig.funding*100:.4f}%  |  Spread: {sig.bp_drain:.4f}bp\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>✅ Confluencias</b>\n{reasons_text}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Balance: <code>{balance:.2f} USDT</code>\n"
+            f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
         )
+        self._send(text)
 
-    def notify_trade_open(self, symbol: str, signal: dict, trade: dict):
-        direction = "🟢 LONG" if signal["signal"] == "LONG" else "🔴 SHORT"
-        rr = abs(signal["tp"] - signal["entry"]) / abs(signal["entry"] - signal["sl"])
-        self.send(
-            f"⚡ <b>NUEVA OPERACIÓN V35</b>\n{BAR}\n"
-            f"📌 Par: <b>{symbol}</b>\n"
-            f"📊 Dirección: <b>{direction}</b>\n"
-            f"💰 Entrada: <b>${signal['entry']:.6f}</b>\n"
-            f"🛡️ Stop Loss: <b>${signal['sl']:.6f}</b>\n"
-            f"🎯 Take Profit: <b>${signal['tp']:.6f}</b>\n"
-            f"📐 R:R aprox: <b>1:{rr:.1f}</b>\n"
-            f"{BAR}\n"
-            f"📈 ADX: {signal['adx']}  |  Fuerza: {signal['strength']}%\n"
-            f"📊 Vol ratio: {signal.get('vol_ratio', '?')}x\n"
-            f"💵 Capital usado: ${trade.get('position_usdt', 0):.2f} USDT\n"
-            f"🔧 Apalancamiento: {trade.get('leverage', 5)}x\n"
-            f"⏰ Time-Stop: 45 min"
+    def send_close(self, symbol: str, direction: str, entry: float,
+                   close: float, pnl: float, reason: str, qty: float):
+        icon = "✅" if pnl >= 0 else "❌"
+        d    = self._dir_emoji(direction)
+        pct  = (pnl / (entry * qty)) * 100 if entry * qty > 0 else 0
+
+        text = (
+            f"{icon} <b>CIERRE {reason}</b> — {symbol}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{d} Dirección: <b>{direction}</b>\n"
+            f"📍 Entrada:  <code>{entry:.4f}</code>\n"
+            f"🏁 Salida:   <code>{close:.4f}</code>\n"
+            f"💵 PnL:      <b>{'+'if pnl>=0 else ''}{pnl:.2f} USDT ({pct:+.2f}%)</b>\n"
+            f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
         )
+        self._send(text)
 
-    def notify_trade_close(self, symbol: str, result: dict):
-        pnl  = result.get("pnl", 0)
-        emoji = "✅" if pnl > 0 else "❌"
-        sign  = "+" if pnl > 0 else ""
-        self.send(
-            f"{emoji} <b>OPERACIÓN CERRADA</b>\n{BAR}\n"
-            f"📌 Par: <b>{symbol}</b>\n"
-            f"💸 PnL: <b>{sign}{pnl:.4f} USDT</b>\n"
-            f"📋 Razón: {result.get('reason', 'TP/SL')}\n"
-            f"⏱️ Duración: {result.get('duration_min', 0):.0f} min"
+    def send_scan_result(self, results: list):
+        """Resumen del scanner multi-par"""
+        if not results:
+            return
+        lines = [f"🔍 <b>SCAN 3min</b> — {len(results)} señales\n"]
+        for r in results[:5]:
+            e = self._level_emoji(r["level"])
+            d = self._dir_emoji(r["direction"])
+            lines.append(
+                f"{e}{d} <b>{r['symbol']}</b> {r['direction']} {r['level']} "
+                f"conv={r['conviction']}/10"
+            )
+        self._send("\n".join(lines))
+
+    def send_daily_summary(self, pnl: float, n_trades: int, balance: float):
+        icon = "📈" if pnl >= 0 else "📉"
+        text = (
+            f"{icon} <b>Resumen diario</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💵 PnL hoy:   <b>{'+'if pnl>=0 else ''}{pnl:.2f} USDT</b>\n"
+            f"🔢 Trades:    {n_trades}\n"
+            f"💰 Balance:   <code>{balance:.2f} USDT</code>\n"
+            f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d')} UTC"
         )
+        self._send(text)
 
-    def notify_scan_results(self, top_symbols: list, scanner):
-        summary = scanner.summary_text(top_symbols, n=5)
-        self.send(
-            f"🔍 <b>ESCANEO DE MERCADO V35</b>\n{BAR}\n"
-            f"Top 5 de {len(top_symbols)} pares:\n"
-            f"{summary}\n{BAR}\n"
-            f"🤖 Bot activo y escaneando cada 3 min..."
+    def send_error(self, msg: str):
+        self._send(f"⚠️ <b>ERROR</b>\n{msg}")
+
+    def send_startup(self, symbol: str, balance: float, multi: bool):
+        mode = f"Multi-par TOP {C.TOP_PAIRS}" if multi else f"Single: {symbol}"
+        text = (
+            f"🚀 <b>QF×JP Bot v3 iniciado</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚙️  Modo:       {mode}\n"
+            f"⏱️  TF:         3min\n"
+            f"🔑  Apal.:      {C.LEVERAGE}x\n"
+            f"⚠️  Riesgo/op:  {C.RISK_PER_TRADE*100:.1f}%\n"
+            f"🛑  Límite día: {C.DAILY_LOSS_LIMIT*100:.0f}%\n"
+            f"💰  Balance:    <code>{balance:.2f} USDT</code>\n"
+            f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
         )
+        self._send(text)
 
-    def notify_daily_report(self, stats: dict):
-        wr    = stats.get("winrate", 0)
-        emoji = "🏆" if wr >= 55 else ("⚠️" if wr >= 40 else "🚨")
-        sign  = "+" if stats.get("total_pnl", 0) >= 0 else ""
-        self.send(
-            f"{emoji} <b>REPORTE DIARIO V35</b>\n{BAR}\n"
-            f"📊 Operaciones: {stats.get('total', 0)}\n"
-            f"✅ Ganadoras: {stats.get('wins', 0)}\n"
-            f"❌ Perdedoras: {stats.get('losses', 0)}\n"
-            f"📈 Winrate: <b>{wr:.1f}%</b>\n"
-            f"💰 PnL Total: <b>{sign}{stats.get('total_pnl', 0):.4f} USDT</b>\n"
-            f"{BAR}\n"
-            f"🧠 Aprendizaje activo:\n"
-            f"   {stats.get('learning_notes', 'Analizando...')}"
-        )
-
-    def notify_learning_update(self, old_params: dict, new_params: dict, reason: str):
-        self.send(
-            f"🧠 <b>AJUSTE AUTOMÁTICO V35</b>\n{BAR}\n"
-            f"Razón: {reason}\n"
-            f"ADX: {old_params.get('adx_min')} → <b>{new_params.get('adx_min')}</b>\n"
-            f"Fuerza mín: {old_params.get('min_strength')} → <b>{new_params.get('min_strength')}</b>"
-        )
-
-    def notify_blacklist(self, symbol: str, winrate: float, count: int):
-        self.send(
-            f"🚫 <b>PAR BLOQUEADO</b>\n{BAR}\n"
-            f"Símbolo: <b>{symbol}</b>\n"
-            f"WR: {winrate:.0f}% en {count} trades\n"
-            f"El bot evitará este par temporalmente."
-        )
-
-    def notify_error(self, error: str):
-        self.send(f"⚠️ <b>ERROR BOT V35</b>\n{BAR}\n<code>{error[:400]}</code>")
+    def send_blocked(self, reason: str):
+        self._send(f"⛔ <b>Operación bloqueada</b>\n{reason}")
