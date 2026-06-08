@@ -1,405 +1,621 @@
 """
-indicators.py — Implementación Python de todos los indicadores del QF×JP v3
-Equivalentes exactos de los cálculos Pine Script v6
+GUA-USDT Bot v3 — Indicadores Técnicos
+Fixes v3:
+  • EMA warm-up correcto: usa min_periods para señalizar NaN hasta tener datos reales
+  • MACD conectado al scorer (ya no se calcula y se ignora)
+  • MFI (Money Flow Index) como confirmación de volumen institucional
+  • pre_compression(): detecta acumulación silenciosa ANTES del breakout
+  • Tolerancia dinámica en liquidity sweeps (proporcional al ATR)
+  • detect_fvg mejorado: marca FVGs "frescos" (<10 velas) con mayor peso
+  • market_structure con zona de confluencia (precio ±0.1% del swing level)
 """
+
+from __future__ import annotations
 import numpy as np
-import pandas as pd
+from typing import Dict, List, Optional, Tuple
 
 
-# ── Helpers ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  CLÁSICOS
+# ══════════════════════════════════════════════════════════════════════
 
-def f_tanh(x: np.ndarray) -> np.ndarray:
-    x = np.clip(x, -10, 10)
-    e2x = np.exp(2 * x)
-    return (e2x - 1) / (e2x + 1)
-
-
-def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-
-def sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(window=period).mean()
-
-
-def stdev(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(window=period).std(ddof=0)
+def ema(values: List[float], period: int) -> np.ndarray:
+    arr = np.array(values, dtype=float)
+    k   = 2.0 / (period + 1)
+    out = np.full(len(arr), np.nan)
+    # Warm-up: primera media simple con period velas
+    if len(arr) < period:
+        return out
+    out[period - 1] = arr[:period].mean()
+    for i in range(period, len(arr)):
+        out[i] = arr[i] * k + out[i - 1] * (1 - k)
+    return out
 
 
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 10) -> pd.Series:
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low  - close.shift(1)).abs()
-    tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.ewm(span=period, adjust=False).mean()
-
-
-def obv(close: pd.Series, volume: pd.Series) -> pd.Series:
-    direction = np.sign(close.diff()).fillna(0)
-    return (direction * volume).cumsum()
-
-
-def rolling_corr(x: pd.Series, y: pd.Series, period: int) -> pd.Series:
-    return x.rolling(period).corr(y)
-
-
-def linreg_last(series: pd.Series, period: int) -> pd.Series:
-    """Rolling linear regression — valor en el punto final de cada ventana"""
-    result = pd.Series(np.nan, index=series.index)
-    arr = series.values
+def sma(values: List[float], period: int) -> np.ndarray:
+    arr = np.array(values, dtype=float)
+    out = np.full(len(arr), np.nan)
     for i in range(period - 1, len(arr)):
-        y = arr[i - period + 1 : i + 1]
-        if np.any(np.isnan(y)):
+        out[i] = arr[i - period + 1:i + 1].mean()
+    return out
+
+
+def rsi(closes: List[float], period: int = 14) -> np.ndarray:
+    arr = np.array(closes, dtype=float)
+    d   = np.diff(arr)
+    g   = np.where(d > 0, d, 0.0)
+    l_  = np.where(d < 0, -d, 0.0)
+    n   = len(arr)
+    ag  = np.zeros(n)
+    al  = np.zeros(n)
+    if n <= period:
+        return np.full(n, np.nan)
+    ag[period] = g[:period].mean()
+    al[period] = l_[:period].mean()
+    for i in range(period + 1, n):
+        ag[i] = (ag[i - 1] * (period - 1) + g[i - 1]) / period
+        al[i] = (al[i - 1] * (period - 1) + l_[i - 1]) / period
+    rs  = np.where(al == 0, 100.0, ag / al)
+    out = np.where(al == 0, 100.0, 100.0 - 100.0 / (1.0 + rs))
+    out[:period] = np.nan
+    return out
+
+
+def atr(highs: List[float], lows: List[float], closes: List[float],
+        period: int = 14) -> np.ndarray:
+    h  = np.array(highs,  dtype=float)
+    l  = np.array(lows,   dtype=float)
+    c  = np.array(closes, dtype=float)
+    pc = np.roll(c, 1); pc[0] = c[0]
+    tr  = np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
+    out = np.zeros(len(tr))
+    if len(tr) < period:
+        return out
+    out[period - 1] = tr[:period].mean()
+    for i in range(period, len(tr)):
+        out[i] = (out[i - 1] * (period - 1) + tr[i]) / period
+    return out
+
+
+def adx(highs: List[float], lows: List[float], closes: List[float],
+        period: int = 14) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    h  = np.array(highs,  dtype=float)
+    l  = np.array(lows,   dtype=float)
+    c  = np.array(closes, dtype=float)
+    n  = len(c)
+    pc = np.roll(c, 1); pc[0] = c[0]
+    ph = np.roll(h, 1); ph[0] = h[0]
+    pl = np.roll(l, 1); pl[0] = l[0]
+    tr   = np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
+    dmp  = np.where((h - ph) > (pl - l), np.maximum(h - ph, 0), 0)
+    dmm  = np.where((pl - l) > (h - ph), np.maximum(pl - l, 0), 0)
+    atr14 = np.zeros(n); dmp14 = np.zeros(n); dmm14 = np.zeros(n)
+    if n <= period:
+        return atr14, dmp14, dmm14
+    atr14[period] = tr[1:period + 1].sum()
+    dmp14[period] = dmp[1:period + 1].sum()
+    dmm14[period] = dmm[1:period + 1].sum()
+    for i in range(period + 1, n):
+        atr14[i] = atr14[i - 1] - atr14[i - 1] / period + tr[i]
+        dmp14[i] = dmp14[i - 1] - dmp14[i - 1] / period + dmp[i]
+        dmm14[i] = dmm14[i - 1] - dmm14[i - 1] / period + dmm[i]
+    dip  = np.where(atr14 == 0, 0, 100 * dmp14 / atr14)
+    dim  = np.where(atr14 == 0, 0, 100 * dmm14 / atr14)
+    den  = dip + dim
+    dx   = np.where(den == 0, 0, 100 * np.abs(dip - dim) / den)
+    adxv = np.zeros(n)
+    s    = 2 * period
+    if s < n:
+        adxv[s] = dx[period:s + 1].mean()
+        for i in range(s + 1, n):
+            adxv[i] = (adxv[i - 1] * (period - 1) + dx[i]) / period
+    return adxv, dip, dim
+
+
+def cvd(opens: List[float], closes: List[float], volumes: List[float],
+        window: int = 20) -> np.ndarray:
+    o     = np.array(opens,   dtype=float)
+    c     = np.array(closes,  dtype=float)
+    v     = np.array(volumes, dtype=float)
+    delta = np.where(c > o, v, np.where(c < o, -v, 0.0))
+    n = len(delta); out = np.zeros(n)
+    for i in range(n):
+        s = max(0, i - window + 1)
+        out[i] = delta[s:i + 1].sum()
+    return out
+
+
+def slope(arr: np.ndarray, n: int = 5) -> float:
+    y = arr[-n:]
+    x = np.arange(len(y), dtype=float)
+    return float(np.polyfit(x, y, 1)[0]) if len(y) >= 2 else 0.0
+
+
+def atr_percentile(atr_arr: np.ndarray, window: int = 50) -> float:
+    hist = atr_arr[-window:]
+    hist = hist[hist > 0]
+    if len(hist) < 5:
+        return 50.0
+    return float(np.mean(hist <= atr_arr[-1]) * 100)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  MFI — Money Flow Index (volumen institucional)
+# ══════════════════════════════════════════════════════════════════════
+
+def mfi(highs: List[float], lows: List[float], closes: List[float],
+        volumes: List[float], period: int = 14) -> np.ndarray:
+    """
+    Money Flow Index: RSI ponderado por volumen.
+    >70 → sobrecompra (presión compradora agotándose)
+    <30 → sobreventa (acumulación institucional posible)
+    Divergencia MFI vs precio = señal más potente que el RSI solo.
+    """
+    h  = np.array(highs,   dtype=float)
+    l  = np.array(lows,    dtype=float)
+    c  = np.array(closes,  dtype=float)
+    v  = np.array(volumes, dtype=float)
+    n  = len(c)
+    tp = (h + l + c) / 3.0
+    mf = tp * v  # raw money flow
+
+    out = np.full(n, np.nan)
+    for i in range(period, n):
+        pos_mf = sum(
+            mf[j] for j in range(i - period + 1, i + 1)
+            if tp[j] >= tp[j - 1]
+        )
+        neg_mf = sum(
+            mf[j] for j in range(i - period + 1, i + 1)
+            if tp[j] < tp[j - 1]
+        )
+        if neg_mf == 0:
+            out[i] = 100.0
+        else:
+            mfr = pos_mf / neg_mf
+            out[i] = 100.0 - (100.0 / (1.0 + mfr))
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  TTM SQUEEZE MOMENTUM
+# ══════════════════════════════════════════════════════════════════════
+
+def squeeze_momentum(
+    highs: List[float], lows: List[float], closes: List[float],
+    bb_period: int = 20, bb_mult: float = 2.0,
+    kc_period: int = 20, kc_mult: float = 1.5,
+    mom_period: int = 12,
+) -> Tuple[np.ndarray, np.ndarray]:
+    h  = np.array(highs,  dtype=float)
+    l  = np.array(lows,   dtype=float)
+    c  = np.array(closes, dtype=float)
+    n  = len(c)
+
+    bb_mid = sma(closes, bb_period)
+    bb_std = np.array([
+        c[max(0, i - bb_period + 1):i + 1].std() if i >= bb_period - 1 else 0
+        for i in range(n)
+    ])
+    bb_up = bb_mid + bb_mult * bb_std
+    bb_dn = bb_mid - bb_mult * bb_std
+
+    atr_kc = atr(highs, lows, closes, kc_period)
+    kc_up  = bb_mid + kc_mult * atr_kc
+    kc_dn  = bb_mid - kc_mult * atr_kc
+
+    sqz = (bb_up <= kc_up) & (bb_dn >= kc_dn)
+
+    don_hi  = np.array([h[max(0, i - mom_period):i + 1].max() for i in range(n)])
+    don_lo  = np.array([l[max(0, i - mom_period):i + 1].min() for i in range(n)])
+    don_mid = (don_hi + don_lo) / 2
+    delta   = c - (don_mid + bb_mid) / 2
+
+    mom = np.zeros(n)
+    for i in range(mom_period, n):
+        y = delta[i - mom_period:i]
+        x = np.arange(mom_period, dtype=float)
+        mom[i] = float(np.polyfit(x, y, 1)[0]) * mom_period
+
+    return sqz, mom
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  PRE-COMPRESSION DETECTOR
+#  Detecta acumulación ANTES del breakout — el edge que los otros bots no tienen
+# ══════════════════════════════════════════════════════════════════════
+
+def pre_compression(
+    highs: List[float], lows: List[float], volumes: List[float],
+    atr_arr: np.ndarray,
+    range_lookback: int = 8,
+    vol_lookback: int = 20,
+) -> Tuple[bool, str]:
+    """
+    Detecta compresión pre-breakout en 3 condiciones:
+      1. Rango de velas recientes < 40% del rango normal (compresión)
+      2. Volumen se mantiene ≥ 60% del promedio (acumulación activa)
+      3. ATR decreciente en las últimas N velas (squeeze estructural)
+
+    Devuelve (is_compressing, bias):
+      bias = "BULL" si los cierres están en el tercio superior del rango
+      bias = "BEAR" si están en el tercio inferior
+      bias = "NEUTRAL" si no hay sesgo claro
+
+    El edge: entrar mientras comprime, con SL al extremo del rango.
+    Los breakout-bots entran 2-5 velas después, a peor precio.
+    """
+    h   = np.array(highs,   dtype=float)
+    l   = np.array(lows,    dtype=float)
+    v   = np.array(volumes, dtype=float)
+    n   = len(h)
+
+    if n < vol_lookback + 2:
+        return False, "NEUTRAL"
+
+    # Rango reciente vs rango histórico
+    recent_ranges  = h[-range_lookback:] - l[-range_lookback:]
+    historic_range = (h[-vol_lookback:] - l[-vol_lookback:]).mean()
+    if historic_range == 0:
+        return False, "NEUTRAL"
+
+    avg_recent_range = recent_ranges.mean()
+    range_ratio      = avg_recent_range / historic_range
+
+    # Volumen: reciente vs histórico
+    recent_vol  = v[-range_lookback:].mean()
+    historic_vol = v[-vol_lookback:].mean()
+    vol_ratio   = recent_vol / historic_vol if historic_vol > 0 else 1.0
+
+    # ATR decreciente (comprimir energía)
+    atr_recent   = atr_arr[-range_lookback:]
+    atr_recent   = atr_recent[atr_recent > 0]
+    atr_declining = (len(atr_recent) >= 3 and
+                     float(np.polyfit(np.arange(len(atr_recent)), atr_recent, 1)[0]) < 0)
+
+    is_compressing = (
+        range_ratio < 0.40 and   # rango comprimido al 40% del normal
+        vol_ratio   >= 0.60 and  # volumen sostenido (no desvaneciéndose)
+        atr_declining             # ATR bajando = squeeze estructural
+    )
+
+    if not is_compressing:
+        return False, "NEUTRAL"
+
+    # Sesgo: ¿dónde están cerrando las velas dentro del rango comprimido?
+    closes_in_range = []
+    for i in range(-range_lookback, 0):
+        rng = h[i] - l[i]
+        if rng > 0:
+            pos = (h[i] - l[i])  # usamos highs como proxy del close relativo
+            # posición del close dentro del rango
+            closes_in_range.append((h[i] + l[i]) / 2)
+
+    if not closes_in_range:
+        return True, "NEUTRAL"
+
+    range_lo = l[-range_lookback:].min()
+    range_hi = h[-range_lookback:].max()
+    total_range = range_hi - range_lo
+    if total_range == 0:
+        return True, "NEUTRAL"
+
+    avg_mid = np.mean(closes_in_range)
+    position = (avg_mid - range_lo) / total_range  # 0=bajo, 1=alto
+
+    if position > 0.65:
+        bias = "BULL"   # acumulando en la parte alta → breakout alcista probable
+    elif position < 0.35:
+        bias = "BEAR"   # distribuyendo en la parte baja → breakdown probable
+    else:
+        bias = "NEUTRAL"
+
+    return True, bias
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  FUNDING RATE — Ventana pre-pago (45 min antes)
+# ══════════════════════════════════════════════════════════════════════
+
+def funding_window_active() -> bool:
+    """
+    True si estamos en la ventana de 45 min antes del funding payment.
+    BingX paga funding a las 00:00, 08:00, 16:00 UTC.
+    En esta ventana, quienes pagan (posiciones en extremo) cierran → predecible.
+    """
+    from datetime import datetime, timezone
+    now     = datetime.now(timezone.utc)
+    minutes = now.hour * 60 + now.minute
+    # 45 min antes de 00:00=0, 08:00=480, 16:00=960
+    payment_minutes = [0, 480, 960]
+    for pm in payment_minutes:
+        diff = (minutes - pm) % (24 * 60)
+        if diff >= (24 * 60 - 45) or diff <= 5:  # ventana ±45min antes + 5 después
+            return True
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  RVOL
+# ══════════════════════════════════════════════════════════════════════
+
+def rvol(volumes: List[float], period: int = 20) -> np.ndarray:
+    v   = np.array(volumes, dtype=float)
+    avg = sma(volumes, period)
+    return np.where(avg > 0, v / avg, 1.0)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  VWAP con bandas de desviación estándar
+# ══════════════════════════════════════════════════════════════════════
+
+def vwap_bands(
+    highs: List[float], lows: List[float], closes: List[float],
+    volumes: List[float], period: int = 60, band_mult: float = 1.5,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    h  = np.array(highs,   dtype=float)
+    l  = np.array(lows,    dtype=float)
+    c  = np.array(closes,  dtype=float)
+    v  = np.array(volumes, dtype=float)
+    tp = (h + l + c) / 3.0
+    n  = len(c)
+
+    vw = np.zeros(n); vw_up = np.zeros(n); vw_dn = np.zeros(n)
+    for i in range(period - 1, n):
+        s  = i - period + 1
+        sv = v[s:i + 1].sum()
+        if sv == 0:
+            vw[i] = tp[i]; vw_up[i] = tp[i]; vw_dn[i] = tp[i]; continue
+        vw[i]    = (tp[s:i + 1] * v[s:i + 1]).sum() / sv
+        dev      = np.sqrt(((tp[s:i + 1] - vw[i]) ** 2 * v[s:i + 1]).sum() / sv)
+        vw_up[i] = vw[i] + band_mult * dev
+        vw_dn[i] = vw[i] - band_mult * dev
+
+    return vw, vw_up, vw_dn
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  CVD DIVERGENCIA
+# ══════════════════════════════════════════════════════════════════════
+
+def cvd_divergence(closes: List[float], cvd_arr: np.ndarray,
+                   lookback: int = 10) -> Tuple[bool, bool]:
+    c  = np.array(closes, dtype=float)
+    lb = min(lookback, len(c) - 1)
+    price_slope = slope(c, lb)
+    cvd_slope   = slope(cvd_arr, lb)
+
+    bearish_div = (price_slope > 0) and (cvd_slope < 0)
+    bullish_div = (price_slope < 0) and (cvd_slope > 0)
+    return bearish_div, bullish_div
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  FVG — Fair Value Gaps (v3: marca "freshness")
+# ══════════════════════════════════════════════════════════════════════
+
+def detect_fvg(
+    highs: List[float], lows: List[float], closes: List[float],
+    lookback: int = 30, min_size_pct: float = 0.003,
+) -> Tuple[Optional[Dict], Optional[Dict]]:
+    """
+    Detecta FVGs no rellenados.
+    Ahora incluye campo "fresh" (True si age < 10 velas) para ponderar
+    en el scorer: FVG fresco = señal más potente.
+    """
+    h = np.array(highs,  dtype=float)
+    l = np.array(lows,   dtype=float)
+    c = np.array(closes, dtype=float)
+    n = len(c)
+
+    bear_fvg = None
+    bull_fvg = None
+
+    for i in range(n - 2, max(n - lookback - 2, 2), -1):
+        if bear_fvg is None:
+            if h[i] < l[i - 2]:
+                size = (l[i - 2] - h[i]) / max(h[i], 1e-9)
+                if size >= min_size_pct:
+                    mid = (l[i - 2] + h[i]) / 2
+                    if c[-1] < mid or c[-1] < l[i - 2]:
+                        age = n - 1 - i
+                        bear_fvg = {
+                            "top": l[i - 2], "bottom": h[i],
+                            "midpoint": mid, "age": age,
+                            "fresh": age < 10,
+                        }
+
+        if bull_fvg is None:
+            if l[i] > h[i - 2]:
+                size = (l[i] - h[i - 2]) / max(h[i - 2], 1e-9)
+                if size >= min_size_pct:
+                    mid = (l[i] + h[i - 2]) / 2
+                    if c[-1] > mid or c[-1] > h[i - 2]:
+                        age = n - 1 - i
+                        bull_fvg = {
+                            "top": l[i], "bottom": h[i - 2],
+                            "midpoint": mid, "age": age,
+                            "fresh": age < 10,
+                        }
+
+        if bear_fvg and bull_fvg:
+            break
+
+    return bear_fvg, bull_fvg
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ORDER BLOCKS
+# ══════════════════════════════════════════════════════════════════════
+
+def detect_order_blocks(
+    opens: List[float], highs: List[float], lows: List[float],
+    closes: List[float], lookback: int = 40, impulse_bars: int = 3,
+) -> Tuple[Optional[Dict], Optional[Dict]]:
+    o = np.array(opens,  dtype=float)
+    h = np.array(highs,  dtype=float)
+    l = np.array(lows,   dtype=float)
+    c = np.array(closes, dtype=float)
+    n = len(c)
+
+    bear_ob = None
+    bull_ob = None
+
+    for i in range(n - 1, max(n - lookback, impulse_bars + 2), -1):
+        if bear_ob is None:
+            reds = sum(1 for j in range(i, min(i + impulse_bars, n)) if c[j] < o[j])
+            if reds >= impulse_bars:
+                for k in range(i - 1, max(i - 6, 0), -1):
+                    if c[k] > o[k]:
+                        bear_ob = {
+                            "high": h[k], "low": l[k],
+                            "mid":  (h[k] + l[k]) / 2,
+                            "age":  n - 1 - k,
+                        }
+                        break
+
+        if bull_ob is None:
+            greens = sum(1 for j in range(i, min(i + impulse_bars, n)) if c[j] > o[j])
+            if greens >= impulse_bars:
+                for k in range(i - 1, max(i - 6, 0), -1):
+                    if c[k] < o[k]:
+                        bull_ob = {
+                            "high": h[k], "low": l[k],
+                            "mid":  (h[k] + l[k]) / 2,
+                            "age":  n - 1 - k,
+                        }
+                        break
+
+        if bear_ob and bull_ob:
+            break
+
+    return bear_ob, bull_ob
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  LIQUIDITY SWEEPS — Tolerancia dinámica (proporcional al ATR)
+# ══════════════════════════════════════════════════════════════════════
+
+def detect_liquidity_sweep(
+    highs: List[float], lows: List[float], closes: List[float],
+    opens: List[float], lookback: int = 25,
+    tolerance: float = 0.002,
+    atr_val: float = 0.0,    # NUEVO: tolerancia dinámica si se pasa ATR
+) -> Tuple[bool, bool]:
+    """
+    v3: Si se pasa atr_val, la tolerancia se ajusta dinámicamente:
+    tol = max(config_tol, atr_val / price * 0.5)
+    Esto evita falsos positivos en alta volatilidad y falsos negativos en baja.
+    """
+    h = np.array(highs,  dtype=float)
+    l = np.array(lows,   dtype=float)
+    c = np.array(closes, dtype=float)
+
+    price = c[-1] if c[-1] > 0 else 1.0
+    if atr_val > 0:
+        dyn_tol = atr_val / price * 0.5
+        tolerance = max(tolerance, min(dyn_tol, 0.008))  # cap a 0.8%
+
+    win  = h[-lookback - 2:-3]
+    wl   = l[-lookback - 2:-3]
+    cur_h, cur_l, cur_c = h[-2], l[-2], c[-2]
+
+    swept_highs = False
+    swept_lows  = False
+
+    if len(win) >= 2:
+        for i in range(len(win)):
+            for j in range(i + 1, len(win)):
+                if abs(win[i] - win[j]) / max(win[i], 1e-9) < tolerance:
+                    eq_level = (win[i] + win[j]) / 2
+                    if cur_h > eq_level * (1 + tolerance) and cur_c < eq_level:
+                        swept_highs = True
+                        break
+            if swept_highs:
+                break
+
+    if len(wl) >= 2:
+        for i in range(len(wl)):
+            for j in range(i + 1, len(wl)):
+                if abs(wl[i] - wl[j]) / max(wl[i], 1e-9) < tolerance:
+                    eq_level = (wl[i] + wl[j]) / 2
+                    if cur_l < eq_level * (1 - tolerance) and cur_c > eq_level:
+                        swept_lows = True
+                        break
+            if swept_lows:
+                break
+
+    return swept_highs, swept_lows
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  MACD
+# ══════════════════════════════════════════════════════════════════════
+
+def macd(closes: List[float], fast: int = 12, slow: int = 26,
+         signal: int = 9) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Devuelve (macd_line, signal_line, histogram)."""
+    e_fast = ema(closes, fast)
+    e_slow = ema(closes, slow)
+    # Enmascarar NaNs del warm-up
+    valid  = ~np.isnan(e_fast) & ~np.isnan(e_slow)
+    ml     = np.where(valid, e_fast - e_slow, np.nan)
+    ml_list = np.where(np.isnan(ml), 0.0, ml).tolist()
+    sl     = ema(ml_list, signal)
+    hist   = np.where(np.isnan(ml), np.nan, ml - sl)
+    return ml, sl, hist
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  MARKET STRUCTURE — BOS / CHoCH (v3: zona de confluencia ±0.1%)
+# ══════════════════════════════════════════════════════════════════════
+
+def market_structure(
+    highs: List[float], lows: List[float], closes: List[float],
+    swing_len: int = 5,
+) -> Dict[str, str]:
+    h = np.array(highs,  dtype=float)
+    l = np.array(lows,   dtype=float)
+    c = np.array(closes, dtype=float)
+    n = len(c)
+
+    win = min(30, n - swing_len - 1)
+
+    swing_highs = []
+    swing_lows  = []
+
+    for i in range(swing_len, win + swing_len):
+        idx = n - 1 - i
+        if idx < swing_len or idx >= n - swing_len:
             continue
-        x = np.arange(period, dtype=float)
-        m, b = np.polyfit(x, y, 1)
-        result.iloc[i] = m * (period - 1) + b
-    return result
-
-
-def pivot_high(high: pd.Series, left: int, right: int) -> pd.Series:
-    """Pivot highs — confirmados cuando hay `right` velas a la derecha"""
-    result = pd.Series(np.nan, index=high.index)
-    h = high.values
-    for i in range(left, len(h) - right):
-        window = h[i - left : i + right + 1]
-        if h[i] == window.max() and list(window).count(h[i]) == 1:
-            result.iloc[i] = h[i]
-    return result
-
-
-def pivot_low(low: pd.Series, left: int, right: int) -> pd.Series:
-    """Pivot lows — confirmados cuando hay `right` velas a la derecha"""
-    result = pd.Series(np.nan, index=low.index)
-    l = low.values
-    for i in range(left, len(l) - right):
-        window = l[i - left : i + right + 1]
-        if l[i] == window.min() and list(window).count(l[i]) == 1:
-            result.iloc[i] = l[i]
-    return result
-
-
-def vwap_rolling(high: pd.Series, low: pd.Series, close: pd.Series,
-                 volume: pd.Series, period: int = 480) -> pd.Series:
-    """VWAP rolling (480 velas ≈ 24h en 3min)"""
-    hlc3 = (high + low + close) / 3
-    cum_vol = volume.rolling(period).sum()
-    cum_pv  = (hlc3 * volume).rolling(period).sum()
-    return cum_pv / cum_vol
-
-
-# ── L2 · Motor de Factores ────────────────────────────────────
-
-def factor_momentum(close: pd.Series, period: int) -> pd.Series:
-    roc = (close - close.shift(period)) / close.shift(period)
-    vol_n = stdev(close, period) / sma(close, period)
-    return roc.where(vol_n != 0, 0) / vol_n.replace(0, np.nan).fillna(1)
-
-
-def factor_mean_rev(close: pd.Series, period: int) -> pd.Series:
-    basis = sma(close, period)
-    std   = stdev(close, period)
-    z     = -(close - basis) / std.replace(0, np.nan)
-    return z.fillna(0)
-
-
-def factor_volume(close: pd.Series, volume: pd.Series, period: int) -> pd.Series:
-    obv_s  = obv(close, volume)
-    obv_ma = ema(obv_s, period)
-    obv_sd = stdev(obv_s, period)
-    return ((obv_s - obv_ma) / obv_sd.replace(0, np.nan)).fillna(0)
-
-
-def composite_score(close: pd.Series, volume: pd.Series,
-                    mom_p: int, rev_p: int, vol_p: int,
-                    w1: float, w2: float, w3: float,
-                    smooth: int, decay_len: int) -> pd.Series:
-    fm  = factor_momentum(close, mom_p)
-    fr  = factor_mean_rev(close, rev_p)
-    fv  = factor_volume(close, volume, vol_p)
-    raw = w1 * fm + w2 * fr + w3 * fv
-    comp= ema(raw, smooth)
-    sc_std = stdev(comp, decay_len)
-    norm = (comp / sc_std.replace(0, np.nan)).fillna(0)
-    return pd.Series(f_tanh(norm.values), index=close.index), fm, fr, fv
-
-
-# ── L3 · Decaimiento ─────────────────────────────────────────
-
-def signal_decay(norm_score: pd.Series, close: pd.Series,
-                 decay_len: int, smooth: int, threshold: float):
-    fwd_ret  = close.pct_change()
-    ic_raw   = rolling_corr(norm_score.shift(1), fwd_ret, decay_len)
-    ic_roll  = ema(ic_raw.abs(), smooth)
-    ic_peak  = ic_roll.rolling(decay_len).max()
-    decay_r  = (ic_roll / ic_peak.replace(0, np.nan)).fillna(0.5)
-    sig_alive= decay_r >= threshold
-    return sig_alive, decay_r
-
-
-# ── L4 · Dark Pool ────────────────────────────────────────────
-
-def dark_pool(high: pd.Series, low: pd.Series, close: pd.Series,
-              open_: pd.Series, volume: pd.Series,
-              atr_s: pd.Series, vol_mult: float, baseline: int):
-    vol_base   = sma(volume, baseline)
-    vol_spike  = volume > vol_base * vol_mult
-    rng_narrow = (high - low) < atr_s * 0.6
-    dp_buy     = vol_spike & rng_narrow & (close > open_)
-    dp_sell    = vol_spike & rng_narrow & (close < open_)
-    vac_up     = ((high - low) > atr_s * 1.8) & (volume < vol_base * 0.6) & (close > open_)
-    vac_dn     = ((high - low) > atr_s * 1.8) & (volume < vol_base * 0.6) & (close < open_)
-    return dp_buy, dp_sell, vac_up, vac_dn
-
-
-# ── L5 · Coste de Ejecución ──────────────────────────────────
-
-def exec_cost(high: pd.Series, low: pd.Series, close: pd.Series,
-              spread_len: int, bp_thr: float):
-    hi_lo_r   = np.log(high / low)
-    spread_e  = sma(hi_lo_r, spread_len) * close
-    bp_drain  = (spread_e / close) * 100
-    exec_ok   = bp_drain < bp_thr
-    return exec_ok, bp_drain
-
-
-# ── L6 · Asimetría Momentum ──────────────────────────────────
-
-def momentum_asymmetry(high: pd.Series, low: pd.Series,
-                       close: pd.Series, open_: pd.Series,
-                       period: int, bull_thr: float, bear_thr: float):
-    up_rng = (high - low).where(close > open_, 0.0)
-    dn_rng = (high - low).where(close < open_, 0.0)
-    avg_up = sma(up_rng, period)
-    avg_dn = sma(dn_rng, period)
-    rr_bull = (avg_up / avg_dn.replace(0, np.nan)).fillna(1)
-    rr_bear = (avg_dn / avg_up.replace(0, np.nan)).fillna(1)
-    asym_bull = rr_bull >= bull_thr
-    asym_bear = rr_bear >= bear_thr
-    return asym_bull, asym_bear, rr_bull, rr_bear
-
-
-# ── L7 · Ruptura Trendline ───────────────────────────────────
-
-def trendline_break(high: pd.Series, low: pd.Series, close: pd.Series,
-                    atr_s: pd.Series, ph: pd.Series, pl: pd.Series,
-                    tl_lookback: int, tl_left: int, tl_right: int, tl_buf: float):
-    """Devuelve dos Series bool: tl_break_long, tl_break_short"""
-    n = len(close)
-    tl_break_long  = pd.Series(False, index=close.index)
-    tl_break_short = pd.Series(False, index=close.index)
-
-    # Recopilar pivots confirmados con su índice real
-    ph_vals = [(i, ph.iloc[i]) for i in range(len(ph)) if not np.isnan(ph.iloc[i])]
-    pl_vals = [(i, pl.iloc[i]) for i in range(len(pl)) if not np.isnan(pl.iloc[i])]
-
-    for i in range(tl_right + 2, n):
-        atr_i = atr_s.iloc[i]
-        c_now  = close.iloc[i]
-        c_prev = close.iloc[i - 1]
-
-        # TL bajista (pivot highs decrecientes)
-        ph_recent = [(idx, v) for idx, v in ph_vals
-                     if idx <= i - tl_right and (i - idx) <= tl_lookback]
-        if len(ph_recent) >= 2:
-            ph2_idx, ph2_v = ph_recent[-2]
-            ph1_idx, ph1_v = ph_recent[-1]
-            if ph2_v > ph1_v:
-                dx = max(ph1_idx - ph2_idx, 1)
-                slope = (ph1_v - ph2_v) / dx
-                tl_now  = ph1_v + slope * (i - ph1_idx)
-                tl_prev = ph1_v + slope * (i - 1 - ph1_idx)
-                buf = atr_i * tl_buf
-                if c_now > tl_now + buf and c_prev <= tl_prev + buf:
-                    tl_break_long.iloc[i] = True
-
-        # TL alcista (pivot lows crecientes)
-        pl_recent = [(idx, v) for idx, v in pl_vals
-                     if idx <= i - tl_right and (i - idx) <= tl_lookback]
-        if len(pl_recent) >= 2:
-            pl2_idx, pl2_v = pl_recent[-2]
-            pl1_idx, pl1_v = pl_recent[-1]
-            if pl2_v < pl1_v:
-                dx = max(pl1_idx - pl2_idx, 1)
-                slope = (pl1_v - pl2_v) / dx
-                tl_now  = pl1_v + slope * (i - pl1_idx)
-                tl_prev = pl1_v + slope * (i - 1 - pl1_idx)
-                buf = atr_i * tl_buf
-                if c_now < tl_now - buf and c_prev >= tl_prev - buf:
-                    tl_break_short.iloc[i] = True
-
-    return tl_break_long, tl_break_short
-
-
-# ── L8 · Swing Lows/Highs ────────────────────────────────────
-
-def swing_analysis(pl: pd.Series, ph: pd.Series,
-                   window: int, hl_min: int, lh_min: int):
-    n = len(pl)
-    sell_exhausted = pd.Series(False, index=pl.index)
-    buy_exhausted  = pd.Series(False, index=pl.index)
-    last_sl        = pd.Series(np.nan, index=pl.index)
-    last_sh        = pd.Series(np.nan, index=ph.index)
-
-    for i in range(window, n):
-        # Higher Lows en ventana
-        pls = [(j, pl.iloc[j]) for j in range(i - window, i + 1)
-               if not np.isnan(pl.iloc[j])]
-        hl_count = sum(1 for k in range(1, len(pls)) if pls[k][1] > pls[k-1][1])
-        sell_exhausted.iloc[i] = hl_count >= hl_min
-
-        # Lower Highs en ventana
-        phs = [(j, ph.iloc[j]) for j in range(i - window, i + 1)
-               if not np.isnan(ph.iloc[j])]
-        lh_count = sum(1 for k in range(1, len(phs)) if phs[k][1] < phs[k-1][1])
-        buy_exhausted.iloc[i] = lh_count >= lh_min
-
-        if pls:
-            last_sl.iloc[i] = pls[-1][1]
-        if phs:
-            last_sh.iloc[i] = phs[-1][1]
-
-    return sell_exhausted, buy_exhausted, last_sl, last_sh
-
-
-# ── L9 · Fair Value Gaps ─────────────────────────────────────
-
-def fair_value_gaps(high: pd.Series, low: pd.Series,
-                    atr_s: pd.Series, min_atr: float, max_bars: int):
-    n = len(high)
-    bull_fvg = pd.Series(False, index=high.index)
-    bear_fvg = pd.Series(False, index=high.index)
-    in_bull  = pd.Series(False, index=high.index)
-    in_bear  = pd.Series(False, index=high.index)
-
-    bfvg_top = bfvg_bot = np.nan
-    sfvg_top = sfvg_bot = np.nan
-    bfvg_age = sfvg_age = 0
-
-    for i in range(2, n):
-        c_close = (high.iloc[i] + low.iloc[i]) / 2  # proxy
-        atr_i   = atr_s.iloc[i]
-
-        # Detectar FVG alcista: low[0] > high[2]
-        if low.iloc[i] > high.iloc[i - 2] and (low.iloc[i] - high.iloc[i - 2]) > atr_i * min_atr:
-            bull_fvg.iloc[i] = True
-            bfvg_top = low.iloc[i]
-            bfvg_bot = high.iloc[i - 2]
-            bfvg_age = 0
-        else:
-            bfvg_age += 1
-            if bfvg_age > max_bars:
-                bfvg_top = bfvg_bot = np.nan
-
-        # Detectar FVG bajista: high[0] < low[2]
-        if high.iloc[i] < low.iloc[i - 2] and (low.iloc[i - 2] - high.iloc[i]) > atr_i * min_atr:
-            bear_fvg.iloc[i] = True
-            sfvg_top = low.iloc[i - 2]
-            sfvg_bot = high.iloc[i]
-            sfvg_age = 0
-        else:
-            sfvg_age += 1
-            if sfvg_age > max_bars:
-                sfvg_top = sfvg_bot = np.nan
-
-        # ¿Precio en zona FVG?
-        c = (high.iloc[i] + low.iloc[i]) / 2
-        if not np.isnan(bfvg_top) and bfvg_bot <= c <= bfvg_top:
-            in_bull.iloc[i] = True
-        if not np.isnan(sfvg_top) and sfvg_bot <= c <= sfvg_top:
-            in_bear.iloc[i] = True
-
-    return bull_fvg, bear_fvg, in_bull, in_bear
-
-
-# ── L10 · Order Blocks ───────────────────────────────────────
-
-def order_blocks(high: pd.Series, low: pd.Series,
-                 close: pd.Series, open_: pd.Series,
-                 atr_s: pd.Series, impulse_atr: float, max_bars: int):
-    n = len(close)
-    bull_ob_raw = pd.Series(False, index=close.index)
-    bear_ob_raw = pd.Series(False, index=close.index)
-    in_bull_ob  = pd.Series(False, index=close.index)
-    in_bear_ob  = pd.Series(False, index=close.index)
-
-    bob_hi = bob_lo = np.nan
-    sob_hi = sob_lo = np.nan
-    bob_age = sob_age = 0
-
-    for i in range(1, n):
-        atr_i = atr_s.iloc[i]
-        c_now = close.iloc[i]
-
-        strong_up = (close.iloc[i] - open_.iloc[i]) > atr_i * impulse_atr and c_now > close.iloc[i-1]
-        strong_dn = (open_.iloc[i] - close.iloc[i]) > atr_i * impulse_atr and c_now < close.iloc[i-1]
-
-        if strong_up and close.iloc[i-1] < open_.iloc[i-1]:
-            bull_ob_raw.iloc[i] = True
-            bob_hi  = open_.iloc[i-1]
-            bob_lo  = close.iloc[i-1]
-            bob_age = 0
-        else:
-            bob_age += 1
-            if bob_age > max_bars or (not np.isnan(bob_lo) and c_now < bob_lo):
-                bob_hi = bob_lo = np.nan
-
-        if strong_dn and close.iloc[i-1] > open_.iloc[i-1]:
-            bear_ob_raw.iloc[i] = True
-            sob_hi  = close.iloc[i-1]
-            sob_lo  = open_.iloc[i-1]
-            sob_age = 0
-        else:
-            sob_age += 1
-            if sob_age > max_bars or (not np.isnan(sob_hi) and c_now > sob_hi):
-                sob_hi = sob_lo = np.nan
-
-        if not np.isnan(bob_hi) and bob_lo <= c_now <= bob_hi:
-            in_bull_ob.iloc[i] = True
-        if not np.isnan(sob_hi) and sob_lo <= c_now <= sob_hi:
-            in_bear_ob.iloc[i] = True
-
-    return bull_ob_raw, bear_ob_raw, in_bull_ob, in_bear_ob
-
-
-# ── L11 · CVD Delta ──────────────────────────────────────────
-
-def cvd_delta(high: pd.Series, low: pd.Series,
-              close: pd.Series, volume: pd.Series,
-              ema_len: int, div_len: int):
-    hl = (high - low).replace(0, np.nan)
-    bvol = ((close - low) / hl * volume).fillna(volume * 0.5)
-    svol = ((high - close) / hl * volume).fillna(volume * 0.5)
-    delta = (bvol - svol).cumsum()
-    delta_ema   = ema(delta, ema_len)
-    cvd_rising  = delta > delta_ema
-    bull_div    = (close < close.shift(div_len)) & (delta > delta.shift(div_len))
-    bear_div    = (close > close.shift(div_len)) & (delta < delta.shift(div_len))
-    return cvd_rising, bull_div, bear_div
-
-
-# ── L12 · Squeeze Momentum ───────────────────────────────────
-
-def squeeze_momentum(high: pd.Series, low: pd.Series,
-                     close: pd.Series, atr_s: pd.Series,
-                     length: int, bb_mult: float, kc_mult: float):
-    basis   = sma(close, length)
-    dev     = stdev(close, length)
-    bb_hi   = basis + bb_mult * dev
-    bb_lo   = basis - bb_mult * dev
-    kc_mid  = ema(close, length)
-    kc_hi   = kc_mid + kc_mult * atr_s
-    kc_lo   = kc_mid - kc_mult * atr_s
-
-    sq_on   = (bb_hi < kc_hi) & (bb_lo > kc_lo)
-    sq_fire = ~sq_on & sq_on.shift(1).fillna(False)
-
-    hh = high.rolling(length).max()
-    ll = low.rolling(length).min()
-    mid_val = (hh + ll) / 2
-    delta_s = close - (mid_val + basis) / 2
-    sq_val  = linreg_last(delta_s, length)
-
-    sq_bull = sq_fire & (sq_val > 0)
-    sq_bear = sq_fire & (sq_val < 0)
-    return sq_on, sq_bull, sq_bear
+        if h[idx] == h[idx - swing_len:idx + swing_len + 1].max():
+            swing_highs.append((idx, h[idx]))
+        if l[idx] == l[idx - swing_len:idx + swing_len + 1].min():
+            swing_lows.append((idx, l[idx]))
+
+    bos   = "NONE"
+    choch = "NONE"
+    cur   = c[-2]
+
+    ZONE = 0.001  # ±0.1% confluencia (v3: evita señales espurias en zona)
+
+    if len(swing_highs) >= 2:
+        last_sh = swing_highs[0][1]
+        prev_sh = swing_highs[1][1]
+        # Rompe claramente el nivel (no apenas en la zona)
+        if cur > last_sh * (1 + ZONE):
+            if last_sh > prev_sh:
+                bos = "BULL"
+            else:
+                choch = "BULL"
+
+    if len(swing_lows) >= 2:
+        last_sl = swing_lows[0][1]
+        prev_sl = swing_lows[1][1]
+        if cur < last_sl * (1 - ZONE):
+            if last_sl < prev_sl:
+                bos = "BEAR"
+            else:
+                choch = "BEAR"
+
+    return {"bos": bos, "choch": choch}

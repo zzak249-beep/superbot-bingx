@@ -1,111 +1,125 @@
+"""
+GUA-USDT Bot v3 — Configuración
+v3 changes:
+  • LOOKBACK 150→250 (fix EMA200 warm-up en 3m, aunque EMA200 ya no se usa en scorer 3m)
+  • LOOKBACK_MACRO 72→210 (3.5 días de 1h — EMA200 necesita 200 velas de warm-up)
+  • MFI_PERIOD añadido
+  • COMP_RANGE_LB, COMP_VOL_LB para pre_compression
+"""
+
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── BingX ─────────────────────────────────────────────────────
-BINGX_API_KEY    = os.getenv("BINGX_API_KEY", "")
-BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "")
-BINGX_BASE_URL   = "https://open-api.bingx.com"
+# ── BingX API ──────────────────────────────────────────────────────────────────
+BINGX_API_KEY  = os.getenv("BINGX_API_KEY", "")
+BINGX_SECRET   = os.getenv("BINGX_SECRET", "")
+BASE_URL       = "https://open-api.bingx.com"
 
-# ── Telegram ──────────────────────────────────────────────────
+# ── Símbolo y temporalidades ───────────────────────────────────────────────────
+SYMBOL           = os.getenv("SYMBOL", "GUA-USDT")
+INTERVAL         = os.getenv("INTERVAL", "3m")
+INTERVAL_TREND   = os.getenv("INTERVAL_TREND", "15m")
+INTERVAL_MACRO   = os.getenv("INTERVAL_MACRO", "1h")
+
+# v3: LOOKBACK aumentado
+# 3m: 250 velas (aunque EMA200 no se usa en scorer, el warm-up extra mejora ATR/ADX)
+# 15m: 120 velas (2 sesiones completas de London+NY)
+# 1h: 210 velas — CRÍTICO para EMA200 en macro_bias (200 velas mínimo de warm-up)
+LOOKBACK         = 250
+LOOKBACK_TREND   = 120
+LOOKBACK_MACRO   = 210
+
+# ── Telegram ───────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ── Operativa ─────────────────────────────────────────────────
-SYMBOL           = os.getenv("SYMBOL", "BTC-USDT")
-LEVERAGE         = int(os.getenv("LEVERAGE", "10"))
-RISK_PER_TRADE   = float(os.getenv("RISK_PER_TRADE", "0.015"))   # 1.5% por operación
-MAX_POSITIONS    = int(os.getenv("MAX_POSITIONS", "2"))
-DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "0.06"))  # 6% máximo diario
+# ── Modo ───────────────────────────────────────────────────────────────────────
+MODE             = os.getenv("MODE", "SIGNAL")
 
-# ── Temporalidad ──────────────────────────────────────────────
-TIMEFRAME        = "3m"
-HTF_TIMEFRAME    = "15m"
-LOOKBACK         = 250   # velas históricas a cargar
+# ── Capital ────────────────────────────────────────────────────────────────────
+LEVERAGE         = int(os.getenv("LEVERAGE",        "5"))
+RISK_PCT         = float(os.getenv("RISK_PCT",      "0.02"))
+MAX_OPEN_TRADES  = int(os.getenv("MAX_OPEN_TRADES", "1"))
 
-# ── SL / TP ───────────────────────────────────────────────────
-SL_ATR_MULT      = float(os.getenv("SL_ATR_MULT",  "1.5"))
-TP_RR_STD        = float(os.getenv("TP_RR_STD",    "2.0"))  # RR para señal estándar
-TP_RR_FUEL       = float(os.getenv("TP_RR_FUEL",   "2.5"))  # RR para fuel
-TP_RR_SUP        = float(os.getenv("TP_RR_SUP",    "3.0"))  # RR para suprema
-TRAIL_ATR_MULT   = float(os.getenv("TRAIL_ATR_MULT","1.0"))  # trailing stop
+# ── ATR dinámico ──────────────────────────────────────────────────────────────
+ATR_SL_MULT      = float(os.getenv("ATR_SL_MULT",    "1.5"))
+ATR_TP1_MULT     = float(os.getenv("ATR_TP1_MULT",   "2.0"))
+ATR_TP2_MULT     = float(os.getenv("ATR_TP2_MULT",   "4.0"))
+ATR_TRAIL_MULT   = float(os.getenv("ATR_TRAIL_MULT",  "1.0"))
+ATR_HIGHVOL_MULT = float(os.getenv("ATR_HIGHVOL_MULT", "2.0"))
 
-# ── Filtros de riesgo ─────────────────────────────────────────
-MIN_CONVICTION   = int(os.getenv("MIN_CONVICTION", "5"))     # score mínimo 0-10
-MAX_FUNDING_LONG = float(os.getenv("MAX_FUNDING_LONG",  "0.0010"))  # evitar longs con funding alto
-MIN_FUNDING_SHORT= float(os.getenv("MIN_FUNDING_SHORT", "-0.0010")) # evitar shorts con funding negativo
-COOLDOWN_CANDLES = int(os.getenv("COOLDOWN_CANDLES", "3"))   # velas de espera tras pérdida
+# ── Indicadores clásicos ───────────────────────────────────────────────────────
+RSI_PERIOD       = 14
+RSI_OB           = float(os.getenv("RSI_OB",  "63"))
+RSI_OS           = float(os.getenv("RSI_OS",  "37"))
+EMA_FAST         = 9
+EMA_SLOW         = 21
+EMA_TREND        = 50
+EMA_MACRO        = 200   # Solo en 1h (candles_macro), NO en 3m scorer
+ADX_PERIOD       = 14
+ADX_MIN          = float(os.getenv("ADX_MIN", "18"))
 
-# ── Multi-par ─────────────────────────────────────────────────
-MULTI_PAIR       = os.getenv("MULTI_PAIR", "false").lower() == "true"
-TOP_PAIRS        = int(os.getenv("TOP_PAIRS", "30"))
-MIN_VOLUME_USDT  = float(os.getenv("MIN_VOLUME_USDT", "5000000"))  # 5M USDT volumen mínimo
+# ── MFI (v3) ──────────────────────────────────────────────────────────────────
+MFI_PERIOD       = 14
+MFI_OB           = float(os.getenv("MFI_OB", "70"))
+MFI_OS           = float(os.getenv("MFI_OS", "30"))
 
-# ── Railway ───────────────────────────────────────────────────
+# ── TTM Squeeze ────────────────────────────────────────────────────────────────
+BB_PERIOD        = 20
+BB_MULT          = 2.0
+KC_PERIOD        = 20
+KC_MULT          = 1.5
+MOM_PERIOD       = 12
+
+# ── VWAP ──────────────────────────────────────────────────────────────────────
+VWAP_PERIOD      = 60
+VWAP_BAND_MULT   = 1.5
+
+# ── RVOL ──────────────────────────────────────────────────────────────────────
+RVOL_PERIOD      = 20
+RVOL_MIN         = float(os.getenv("RVOL_MIN", "1.3"))
+
+# ── CVD ────────────────────────────────────────────────────────────────────────
+CVD_LB           = 20
+CVD_DIV_LB       = 10
+
+# ── FVG ────────────────────────────────────────────────────────────────────────
+FVG_LOOKBACK     = 30
+FVG_MIN_SIZE     = float(os.getenv("FVG_MIN_SIZE", "0.003"))
+
+# ── Order Blocks ───────────────────────────────────────────────────────────────
+OB_LOOKBACK      = 40
+OB_IMPULSE_BARS  = 3
+
+# ── Liquidity Sweeps ───────────────────────────────────────────────────────────
+LIQ_LOOKBACK     = 25
+LIQ_TOLERANCE    = float(os.getenv("LIQ_TOLERANCE", "0.002"))
+
+# ── ATR Percentil ─────────────────────────────────────────────────────────────
+ATR_PERCENTILE_LB = 50
+
+# ── Pre-Compression (v3) ──────────────────────────────────────────────────────
+COMP_RANGE_LB    = int(os.getenv("COMP_RANGE_LB", "8"))   # velas recientes para rango
+COMP_VOL_LB      = int(os.getenv("COMP_VOL_LB",  "20"))   # velas históricas para vol
+
+# ── Funding ────────────────────────────────────────────────────────────────────
+FUNDING_EXTREME_LONG  = float(os.getenv("FUNDING_EXTREME_LONG",  "0.0003"))
+FUNDING_EXTREME_SHORT = float(os.getenv("FUNDING_EXTREME_SHORT", "-0.0003"))
+
+# ── OI ─────────────────────────────────────────────────────────────────────────
+OI_HISTORY_LEN   = 5
+
+# ── Señal ──────────────────────────────────────────────────────────────────────
+SCORE_THR        = float(os.getenv("SCORE_THR", "0.58"))
+
+# ── Cooldown ───────────────────────────────────────────────────────────────────
+COOLDOWN_MIN     = int(os.getenv("COOLDOWN_MIN", "15"))
+
+# ── Sesiones (UTC) ─────────────────────────────────────────────────────────────
+SESSION_FILTER   = os.getenv("SESSION_FILTER", "true").lower() == "true"
+SESSION_HOURS    = [(7, 12), (13, 18)]
+
+# ── Health server ──────────────────────────────────────────────────────────────
 PORT             = int(os.getenv("PORT", "8080"))
-
-# ── Parámetros de estrategia QF×JP ───────────────────────────
-# L2 Factores
-MOM_LOOKBACK     = 20
-REV_LOOKBACK     = 8
-VOL_LOOKBACK     = 14
-ATR_PERIOD       = 10
-W_MOM            = 0.40
-W_REV            = 0.30
-W_VOL            = 0.30
-SIGNAL_SMOOTH    = 3
-
-# L3 Decaimiento
-DECAY_LEN        = 40
-DECAY_THR        = 0.50
-
-# L4 Dark Pool
-DP_VOL_MULT      = 2.5
-DP_BASELINE      = 20
-SPREAD_LEN       = 5
-
-# L5 Ejecución
-EXEC_BASELINE    = 12
-BP_THRESHOLD     = 0.18
-
-# L6 Asimetría
-ASYM_LEN         = 10
-ASYM_BULL_RATIO  = 1.40
-ASYM_BEAR_RATIO  = 1.40
-
-# L7 Trendline
-TL_LOOKBACK      = 30
-TL_LEFT          = 5
-TL_RIGHT         = 3
-TL_BUFFER        = 0.15
-
-# L8 Swing
-SWING_LOW_LEFT   = 5
-SWING_LOW_RIGHT  = 3
-SWING_HIGH_LEFT  = 5
-SWING_HIGH_RIGHT = 3
-HL_COUNT_MIN     = 2
-LH_COUNT_MIN     = 2
-SWING_WINDOW     = 40
-
-# L9 FVG
-FVG_MIN_ATR      = 0.3
-FVG_MAX_BARS     = 40
-
-# L10 Order Blocks
-OB_IMPULSE_ATR   = 1.5
-OB_MAX_BARS      = 50
-
-# L11 CVD
-CVD_EMA_LEN      = 20
-CVD_DIV_LEN      = 5
-
-# L12 Squeeze
-SQ_LEN           = 20
-SQ_BB_MULT       = 2.0
-SQ_KC_MULT       = 1.5
-
-# HTF
-HTF_FAST         = 9
-HTF_SLOW         = 21
