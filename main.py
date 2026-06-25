@@ -217,5 +217,5 @@ async def close_symbol(symbol: str):
 
 
 if __name__ == "__main__":
-    uvicorn.run("cascade_main:app", host="0.0.0.0", port=C.PORT,
+    uvicorn.run("main:app", host="0.0.0.0", port=C.PORT,
                 log_level="info", access_log=False)
