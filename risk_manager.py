@@ -1,5 +1,9 @@
 """
 Risk Manager — Cascade Bot (standalone, sin dependencias complejas)
+FIX: añadidos métodos async que position_manager.py v7.8 requiere:
+  - update_open_count(count)       → reconcilia open_count con BingX real
+  - on_trade_opened(symbol, dir)   → callback al abrir trade
+  - on_trade_closed(pnl, symbol)   → ahora async (era sync)
 """
 import asyncio
 import logging
@@ -33,24 +37,24 @@ class RiskManager:
 
     async def can_trade(self, unrealized_pnl: float = 0.0) -> tuple:
         self._reset_day_if_needed()
-        max_open = getattr(C, 'MAX_OPEN_TRADES', 3)
-        max_daily = getattr(C, 'MAX_DAILY_TRADES', 10)
+        max_open       = getattr(C, 'MAX_OPEN_TRADES', 3)
+        max_daily      = getattr(C, 'MAX_DAILY_TRADES', 10)
         daily_loss_pct = getattr(C, 'DAILY_LOSS_PCT', 5.0)
-        capital = getattr(C, 'CAPITAL', 400.0)
+        capital        = getattr(C, 'CAPITAL', 400.0)
 
         if self._open_count + self._reserved >= max_open:
             return False, f"max_open_trades({self._open_count + self._reserved}/{max_open})"
         if self._daily_count >= max_daily:
             return False, f"max_daily_trades({self._daily_count}/{max_daily})"
         total_pnl = self._daily_pnl + unrealized_pnl
-        max_loss = capital * daily_loss_pct / 100
+        max_loss  = capital * daily_loss_pct / 100
         if total_pnl <= -max_loss:
             return False, f"daily_loss_limit({total_pnl:.2f}/{-max_loss:.2f})"
 
-        self._reserved += 1
+        self._reserved   += 1
         self._open_count += 1
         self._daily_count += 1
-        log.info("Trade confirmado — open=%d pending=%d daily=%d symbol=",
+        log.info("Trade confirmado — open=%d reserved=%d daily=%d",
                  self._open_count, self._reserved, self._daily_count)
         return True, "ok"
 
@@ -60,10 +64,34 @@ class RiskManager:
         if self._open_count > 0:
             self._open_count -= 1
 
-    def on_trade_closed(self, pnl: float):
+    # ── FIX: métodos que position_manager v7.8 requiere ──────────────────────
+
+    async def update_open_count(self, count: int):
+        """
+        Reconcilia el contador interno con el real de BingX.
+        Llamado desde _check_all_positions() en cada ciclo del monitor.
+        """
+        if self._open_count != count:
+            log.debug("update_open_count: %d → %d (BingX real)", self._open_count, count)
+            self._open_count = count
+
+    async def on_trade_opened(self, symbol: str = "", direction: str = ""):
+        """Callback cuando un trade se registra exitosamente."""
+        log.info("on_trade_opened: %s %s | open=%d daily=%d",
+                 symbol, direction, self._open_count, self._daily_count)
+
+    async def on_trade_closed(self, pnl: float = 0.0, symbol: str = ""):
+        """
+        Callback cuando un trade se cierra.
+        FIX: ahora async (position_manager lo llama con await).
+        """
         self._daily_pnl += pnl
         if self._open_count > 0:
             self._open_count -= 1
+        log.info("on_trade_closed: %s pnl=%.4f | open=%d daily_pnl=%.4f",
+                 symbol, pnl, self._open_count, self._daily_pnl)
+
+    # ─────────────────────────────────────────────────────────────────────────
 
     def symbol_allowed(self, symbol: str) -> tuple:
         bl = getattr(C, 'BLACKLIST', set())
@@ -94,7 +122,6 @@ class RiskManager:
         capital  = getattr(C, 'CAPITAL', balance)
         max_not  = getattr(C, 'MAX_NOTIONAL_USDT', 40.0)
         min_not  = getattr(C, 'MIN_NOTIONAL_USDT', 10.0)
-        leverage = getattr(C, 'LEVERAGE', 5)
 
         if entry <= 0 or sl <= 0:
             return 0.0
@@ -105,8 +132,8 @@ class RiskManager:
         risk_usdt = capital * risk_pct
         notional  = min(risk_usdt / sl_dist, max_not)
         notional  = max(notional, min_not)
+        qty       = notional / entry
 
-        qty = notional / entry
         try:
             from bingx_client import BingXClient
             qty = BingXClient._round_qty_static(symbol, qty)
