@@ -1,11 +1,5 @@
 """
-Cascade Bot — config.py
-════════════════════════════════════════════════════════════════
-RENOMBRAR ESTE ARCHIVO A config.py EN EL REPO DEL CASCADE BOT.
-
-Variables marcadas con ← son las más importantes de ajustar.
-Las demás se pueden dejar con el valor por defecto inicial.
-════════════════════════════════════════════════════════════════
+Cascade Bot — config.py  (KIBITO fixed)
 """
 import os
 
@@ -34,7 +28,7 @@ def _str(key, default):
     return v if v else default
 
 
-# ── BingX API (cuenta de renewed-love / independiente) ───────────────────────
+# ── BingX API ─────────────────────────────────────────────────────────────────
 BINGX_API_KEY    = _str("BINGX_API_KEY", "")
 BINGX_SECRET_KEY = _str("BINGX_SECRET_KEY", "")
 BINGX_BASE_URL   = "https://open-api.bingx.com"
@@ -44,7 +38,7 @@ TELEGRAM_TOKEN   = _str("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = _str("TELEGRAM_CHAT_ID", "")
 
 # ── Modo ──────────────────────────────────────────────────────────────────────
-MODE = _str("MODE", "SIGNAL").upper()   # FIX: .upper() — "live" → "LIVE"
+MODE = _str("MODE", "SIGNAL").upper()
 
 # ── Capital y riesgo ──────────────────────────────────────────────────────────
 CAPITAL           = _float("CAPITAL", 400.0)
@@ -58,9 +52,14 @@ MAX_OPEN_TRADES  = _int("MAX_OPEN_TRADES", 3)
 MAX_DAILY_TRADES = _int("MAX_DAILY_TRADES", 10)
 
 # ── Scanner ───────────────────────────────────────────────────────────────────
-MIN_VOLUME_USDT      = _float("MIN_VOLUME_USDT", 500_000.0)  # FIX: faltaba esta línea
-CASCADE_UNIVERSE     = _int("CASCADE_UNIVERSE", 100)
+MIN_VOLUME_USDT       = _float("MIN_VOLUME_USDT", 500_000.0)
+CASCADE_UNIVERSE      = _int("CASCADE_UNIVERSE", 100)
+TOP_N_SYMBOLS         = _int("TOP_N_SYMBOLS", CASCADE_UNIVERSE)   # FIX: alias requerido
 CASCADE_SCAN_INTERVAL = _int("CASCADE_SCAN_INTERVAL", 60)
+
+# ── Sesión (24/7) ─────────────────────────────────────────────────────────────
+SESSION_START = _int("SESSION_START", 0)   # 0 = sin filtro horario
+SESSION_END   = _int("SESSION_END", 24)
 
 # ── Parámetros de cascade ─────────────────────────────────────────────────────
 CASCADE_MIN_SCORE = _float("CASCADE_MIN_SCORE", 60.0)
@@ -108,9 +107,9 @@ POSITION_CHECK_INTERVAL = _int("POSITION_CHECK_INTERVAL", 30)
 # ── Momentum exit ────────────────────────────────────────────────────────────
 MOMENTUM_EXIT_ENABLED = _bool("MOMENTUM_EXIT_ENABLED", False)
 
-# ── Complement (no aplica) ────────────────────────────────────────────────────
+# ── Complement ────────────────────────────────────────────────────────────────
 COMPLEMENT_MODE = "DISABLED"
 MASTER_URL      = ""
 
-# ── Diagnóstico ───────────────────────────────────────────────────────────────
+# ── Aliases ───────────────────────────────────────────────────────────────────
 SCAN_INTERVAL = CASCADE_SCAN_INTERVAL
