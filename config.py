@@ -62,7 +62,7 @@ SESSION_START = _int("SESSION_START", 0)   # 0 = sin filtro horario
 SESSION_END   = _int("SESSION_END", 24)
 
 # ── Parámetros de cascade ─────────────────────────────────────────────────────
-CASCADE_MIN_SCORE = _float("CASCADE_MIN_SCORE", 60.0)
+CASCADE_MIN_SCORE = _float("CASCADE_MIN_SCORE", 35.0)
 CASCADE_MIN_RR    = _float("CASCADE_MIN_RR", 1.5)
 CASCADE_SL_ATR    = _float("CASCADE_SL_ATR", 1.5)
 
