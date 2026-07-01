@@ -1,115 +1,54 @@
-"""
-Cascade Bot — config.py  (KIBITO fixed)
-"""
 import os
+def _f(k,d):
+    try: return float(os.getenv(k,str(d)).split("#")[0].strip())
+    except: return d
+def _i(k,d):
+    try: return int(float(os.getenv(k,str(d)).split("#")[0].strip()))
+    except: return d
+def _b(k,d):
+    return os.getenv(k,"").strip().lower().split("#")[0].strip() in ("1","true","yes") if os.getenv(k,"") else d
+def _s(k,d=""): return os.getenv(k,d).strip().split("#")[0].strip() or d
 
-def _float(key, default):
-    try:
-        v = os.getenv(key, "")
-        return float(v.split("#")[0].strip()) if v else default
-    except Exception:
-        return default
+BOT_NAME    = _s("BOT_NAME","mean-reversion")
+API_KEY     = _s("BINGX_API_KEY")
+SECRET_KEY  = _s("BINGX_SECRET_KEY")
+BASE_URL    = "https://open-api.bingx.com"
+TELEGRAM_TOKEN = _s("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT  = _s("TELEGRAM_CHAT_ID")
 
-def _int(key, default):
-    try:
-        v = os.getenv(key, "")
-        return int(float(v.split("#")[0].strip())) if v else default
-    except Exception:
-        return default
+SYMBOL      = _s("SYMBOL","")        # vacío = multi-symbol scan
+TIMEFRAME   = _s("TIMEFRAME","15m")
+LEVERAGE    = _i("LEVERAGE",5)
+DIRECTION   = _s("DIRECTION","BOTH") # LONG | SHORT | BOTH
 
-def _bool(key, default):
-    v = os.getenv(key, "").strip().lower().split("#")[0].strip()
-    if not v:
-        return default
-    return v in ("true", "1", "yes")
+# Mean Reversion params
+MR_ADX_MAX          = _f("MR_ADX_MAX",30.0)      # lateral si ADX < 25
+MR_RSI_SHORT        = _f("MR_RSI_SHORT",65.0)    # sobrecomprado
+MR_RSI_LONG         = _f("MR_RSI_LONG",35.0)     # sobrevendido
+MR_FUNDING_MIN_SHORT= _f("MR_FUNDING_MIN_SHORT",0.0) # funding >= 0 para short
 
-def _str(key, default):
-    v = os.getenv(key, "").strip()
-    return v if v else default
+# Risk
+FIXED_NOTIONAL_USDT = _f("FIXED_NOTIONAL_USDT",15.0)
+MIN_NOTIONAL_USDT   = _f("MIN_NOTIONAL_USDT",10.0)
+MAX_NOTIONAL_USDT   = _f("MAX_NOTIONAL_USDT",60.0)
+SL_ATR_MULT         = _f("SL_ATR_MULT",1.5)
+TP1_ATR_MULT        = _f("TP1_ATR_MULT",2.0)
+TRAIL_DISTANCE_ATR  = _f("TRAIL_DISTANCE_ATR",1.5)
+MAX_HOLD_MINUTES    = _i("MAX_HOLD_MINUTES",240)
+MAX_OPEN_TRADES     = _i("MAX_OPEN_TRADES",4)
+RISK_PCT            = _f("RISK_PCT",1.0)
+MAX_DAILY_LOSS_PCT  = _f("MAX_DAILY_LOSS_PCT",3.0)
 
+# Scanner
+TOP_N_SYMBOLS       = _i("TOP_N_SYMBOLS",150)
+MIN_VOLUME_USDT     = _f("MIN_VOLUME_USDT",500_000.0)
+SCAN_INTERVAL       = _i("SCAN_INTERVAL",60)
+TRAILING_CHECK_SEC  = _i("TRAILING_CHECK_SEC",30)
 
-# ── BingX API ─────────────────────────────────────────────────────────────────
-BINGX_API_KEY    = _str("BINGX_API_KEY", "")
-BINGX_SECRET_KEY = _str("BINGX_SECRET_KEY", "")
-BINGX_BASE_URL   = "https://open-api.bingx.com"
+# Session (24/7 by default)
+SESSION_START = _i("SESSION_START",0)
+SESSION_END   = _i("SESSION_END",24)
+PORT          = _i("PORT",8080)
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = _str("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = _str("TELEGRAM_CHAT_ID", "")
-
-# ── Modo ──────────────────────────────────────────────────────────────────────
-MODE = _str("MODE", "SIGNAL").upper()
-
-# ── Capital y riesgo ──────────────────────────────────────────────────────────
-CAPITAL           = _float("CAPITAL", 400.0)
-LEVERAGE          = _int("LEVERAGE", 5)
-RISK_PCT          = _float("RISK_PCT", 1.0)
-MAX_NOTIONAL_USDT = _float("MAX_NOTIONAL_USDT", 40.0)
-MIN_NOTIONAL_USDT = _float("MIN_NOTIONAL_USDT", 10.0)
-
-# ── Posiciones ────────────────────────────────────────────────────────────────
-MAX_OPEN_TRADES  = _int("MAX_OPEN_TRADES", 3)
-MAX_DAILY_TRADES = _int("MAX_DAILY_TRADES", 10)
-
-# ── Scanner ───────────────────────────────────────────────────────────────────
-MIN_VOLUME_USDT       = _float("MIN_VOLUME_USDT", 500_000.0)
-CASCADE_UNIVERSE      = _int("CASCADE_UNIVERSE", 100)
-TOP_N_SYMBOLS         = _int("TOP_N_SYMBOLS", CASCADE_UNIVERSE)   # FIX: alias requerido
-CASCADE_SCAN_INTERVAL = _int("CASCADE_SCAN_INTERVAL", 60)
-
-# ── Sesión (24/7) ─────────────────────────────────────────────────────────────
-SESSION_START = _int("SESSION_START", 0)   # 0 = sin filtro horario
-SESSION_END   = _int("SESSION_END", 24)
-
-# ── Parámetros de cascade ─────────────────────────────────────────────────────
-CASCADE_MIN_SCORE = _float("CASCADE_MIN_SCORE", 35.0)
-CASCADE_MIN_RR    = _float("CASCADE_MIN_RR", 1.5)
-CASCADE_SL_ATR    = _float("CASCADE_SL_ATR", 1.5)
-
-# ── Risk management ───────────────────────────────────────────────────────────
-DAILY_LOSS_PCT      = _float("DAILY_LOSS_PCT", 5.0)
-FIXED_NOTIONAL_USDT = _float("FIXED_NOTIONAL_USDT", 0.0)
-
-# ── Trailing stop ─────────────────────────────────────────────────────────────
-BREAKEVEN_ATR_MULT = _float("BREAKEVEN_ATR_MULT", 2.0)
-TRAIL_DISTANCE_ATR = _float("TRAIL_DISTANCE_ATR", 1.5)
-MAX_HOLD_MINUTES   = _int("MAX_HOLD_MINUTES", 480)
-
-# ── EMA exit ──────────────────────────────────────────────────────────────────
-EMA_EXIT_ENABLED = _bool("EMA_EXIT_ENABLED", True)
-EMA_EXIT_PERIOD  = _int("EMA_EXIT_PERIOD", 9)
-
-# ── Timeframes ────────────────────────────────────────────────────────────────
-TIMEFRAME      = _str("TIMEFRAME", "1h")
-HTF_TIMEFRAME  = _str("HTF_TIMEFRAME", "4h")
-HTF2_TIMEFRAME = _str("HTF2_TIMEFRAME", "1d")
-HTF5_TIMEFRAME = _str("HTF5_TIMEFRAME", "1w")
-
-# ── Blacklist ─────────────────────────────────────────────────────────────────
-_BL_RAW = _str("BLACKLIST", "ESPORTS,STABLEUSDT,EURUSD,SILVER,SILVERXAG,OILWTI,OILBRENT,PAXG,CUSDT,SYN,GOLD,GASOLINE")
-BLACKLIST = set(s.strip().upper() for s in _BL_RAW.split(",") if s.strip())
-
-# ── Puerto Railway ────────────────────────────────────────────────────────────
-PORT = _int("PORT", 8080)
-
-# ── Tier / SL ────────────────────────────────────────────────────────────────
-MIN_TIER    = _str("MIN_TIER", "STD")
-SL_ATR_MULT = _float("SL_ATR_MULT", CASCADE_SL_ATR)
-
-# ── Kelly sizing ──────────────────────────────────────────────────────────────
-KELLY_FRACTION = _float("KELLY_FRACTION", 0.25)
-KELLY_MAX_PCT  = _float("KELLY_MAX_PCT", 0.05)
-
-# ── Reconciliación ────────────────────────────────────────────────────────────
-RECONCILE_ON_STARTUP    = _bool("RECONCILE_ON_STARTUP", False)
-POSITION_CHECK_INTERVAL = _int("POSITION_CHECK_INTERVAL", 30)
-
-# ── Momentum exit ────────────────────────────────────────────────────────────
-MOMENTUM_EXIT_ENABLED = _bool("MOMENTUM_EXIT_ENABLED", False)
-
-# ── Complement ────────────────────────────────────────────────────────────────
-COMPLEMENT_MODE = "DISABLED"
-MASTER_URL      = ""
-
-# ── Aliases ───────────────────────────────────────────────────────────────────
-SCAN_INTERVAL = CASCADE_SCAN_INTERVAL
+BLACKLIST = set(s.strip().upper() for s in _s("BLACKLIST",
+    "EURUSD,GOLD,SILVER,OILWTI,OILBRENT,CUSDT,PAXG,STABLEUSDT").split(",") if s.strip())
