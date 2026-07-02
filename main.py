@@ -54,17 +54,22 @@ def _exit(pos_mgr: PositionManager, risk: RiskManager, tg: TelegramClient,
 # ── Position management ───────────────────────────────────────────────────────
 def _manage_positions(client: BingXClient, pos_mgr: PositionManager,
                       risk: RiskManager, tg: TelegramClient):
-    positions = client.get_positions()
-    for pos in positions:
-        sym   = pos["positionSide"]
-        sym   = pos["symbol"]
-        side  = pos["positionSide"]
+    """
+    FIX: itera state.get_tracked_positions() — posiciones propias —
+    en vez de client.get_positions() (toda la cuenta). Antes aplicaba
+    max_hold/bb_mid_exit/trail de este bot a cualquier posición de la
+    cuenta compartida, fuera de quien fuera.
+    """
+    for sym, side in state.get_tracked_positions():
+        pos = pos_mgr.get_position(sym, side)
+        if not pos:
+            state.clear(sym, side)
+            log.info(f"state.clear {sym} {side}: ya no existe en el exchange")
+            continue
+
         size  = pos["size"]
         entry = pos["entryPrice"]
         pnl   = pos["unrealizedPnl"]
-
-        if side not in ("LONG", "SHORT"):
-            continue
 
         try:
             mark    = client.get_mark_price(sym)
