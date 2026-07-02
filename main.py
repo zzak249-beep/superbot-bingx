@@ -1,221 +1,235 @@
 """
-Liquidation Cascade Bot v1.0 — Main
-══════════════════════════════════════════════════════════════════════════════
-Bot independiente en la cuenta BingX de renewed-love (400 USDT).
-NO comparte cuenta con joyful-art ni zesty.
-
-Deploy: Railway independiente, repo independiente.
-Config:  cascade_config.py → renombrar a config.py en el repo del bot.
-
-Diferencias vs main.py de joyful-art:
-  - Importa cascade_scanner.scan_loop en vez de scanner.scan_loop
-  - Banner muestra parámetros específicos de cascade
-  - Sin complement_engine ni copier_client (bot autónomo)
-  - Sin harvest scan (innecesario — el bot YA ES una estrategia de FR)
-══════════════════════════════════════════════════════════════════════════════
+Mean Reversion Scanner — KIBITO
+Estrategia: Bollinger Bands + RSI + ADX + Funding Rate
+Lateral markets | LONG + SHORT
 """
-import asyncio
 import logging
-import sys
-from contextlib import asynccontextmanager
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-
-import config as C
+import config
+import state
 from bingx_client import BingXClient
-from risk_manager import RiskManager
 from position_manager import PositionManager
-from cascade_scanner import scan_loop
-import telegram_client as tg
-from trade_journal import TradeJournal
+from risk_manager import RiskManager
+from strategy_mr import get_signal
+from telegram_client import TelegramClient
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)-16s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    stream=sys.stdout,
+    format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
 )
-log = logging.getLogger("cascade_main")
-
-client:  BingXClient     = None
-risk:    RiskManager     = None
-pos_mgr: PositionManager = None
-journal: TradeJournal    = None
+log = logging.getLogger("scanner")
 
 
-async def _run_scanner():
+# ── Health server ─────────────────────────────────────────────────────────────
+def _start_health_server():
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        def log_message(self, *a): pass
     try:
-        await scan_loop(client, risk, pos_mgr, journal=journal)
+        srv = HTTPServer(("0.0.0.0", config.PORT), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        log.info(f"Health server :{config.PORT}/health")
     except Exception as e:
-        log.critical("Cascade scanner crash: %s", e, exc_info=True)
-        await tg.notify_error("cascade_scanner_crash", str(e))
+        log.warning(f"Health server: {e}")
 
 
-async def _run_monitor():
-    if C.MODE == "LIVE":
+# ── Exit helper ───────────────────────────────────────────────────────────────
+def _exit(pos_mgr: PositionManager, risk: RiskManager, tg: TelegramClient,
+          sym: str, side: str, size: float, price: float, pnl: float, reason: str):
+    if side == "LONG":
+        ok = pos_mgr.close_long(sym, size, reason)
+    else:
+        ok = pos_mgr.close_short(sym, size, reason)
+    if ok:
+        risk.record_trade(pnl)
+        tg.exit_trade(config.BOT_NAME, sym, side, price, reason, pnl)
+
+
+# ── Position management ───────────────────────────────────────────────────────
+def _manage_positions(client: BingXClient, pos_mgr: PositionManager,
+                      risk: RiskManager, tg: TelegramClient):
+    positions = client.get_positions()
+    for pos in positions:
+        sym   = pos["positionSide"]
+        sym   = pos["symbol"]
+        side  = pos["positionSide"]
+        size  = pos["size"]
+        entry = pos["entryPrice"]
+        pnl   = pos["unrealizedPnl"]
+
+        if side not in ("LONG", "SHORT"):
+            continue
+
         try:
-            await pos_mgr.monitor_loop()
+            mark    = client.get_mark_price(sym)
+            candles = client.get_klines(sym, config.TIMEFRAME, 50)
+            if len(candles) < 20:
+                continue
+
+            sig = get_signal(candles, client.get_funding_rate(sym), config)
+            atr = sig["atr"]
+            if not atr:
+                continue
+
+            # 1. Max hold
+            if pos_mgr.is_max_hold_expired(sym, side):
+                _exit(pos_mgr, risk, tg, sym, side, size, mark, pnl, "max_hold")
+                continue
+
+            # 2. BB mid exit — reversión completada
+            if pos_mgr.should_bb_exit(sym, side):
+                _exit(pos_mgr, risk, tg, sym, side, size, mark, pnl, "bb_mid_exit")
+                continue
+
+            # 3. ATR trail stop
+            stop, hit = pos_mgr.tick_trail(sym, side, mark, atr)
+            if hit:
+                _exit(pos_mgr, risk, tg, sym, side, size, mark, pnl, "trail_stop")
+                continue
+
         except Exception as e:
-            log.critical("Cascade monitor crash: %s", e, exc_info=True)
-            await tg.notify_error("cascade_monitor_crash", str(e))
+            log.error(f"manage {sym} {side}: {e}")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global client, risk, pos_mgr, journal
-
-    log.info("═" * 60)
-    log.info("  💥 LIQUIDATION CASCADE BOT v1.0")
-    log.info("  Modo: %s | Capital: %.0f USDT", C.MODE, C.CAPITAL)
-    log.info("  Leverage: %dx | Max posiciones: %d",
-             C.LEVERAGE, C.MAX_OPEN_TRADES)
-    log.info("  CASCADE_MIN_SCORE: %.0f | CASCADE_MIN_RR: %.1f",
-             getattr(C, 'CASCADE_MIN_SCORE', 60),
-             getattr(C, 'CASCADE_MIN_RR', 1.5))
-    log.info("  CASCADE_SL_ATR: %.1f | Scan interval: %ds",
-             getattr(C, 'CASCADE_SL_ATR', 1.5),
-             getattr(C, 'CASCADE_SCAN_INTERVAL', 60))
-    log.info("  Universo: %d símbolos top volumen",
-             getattr(C, 'CASCADE_UNIVERSE', 100))
-    log.info("═" * 60)
-
-    journal  = TradeJournal()
-    client   = BingXClient()
-    risk     = RiskManager()
-    pos_mgr  = PositionManager(client, risk, journal=journal)
-
-    if not C.BINGX_API_KEY or not C.BINGX_SECRET_KEY:
-        log.error("BINGX_API_KEY / BINGX_SECRET_KEY no configurados")
-    if not C.TELEGRAM_TOKEN or not C.TELEGRAM_CHAT_ID:
-        log.warning("Telegram no configurado")
-
+# ── Signal scanning ───────────────────────────────────────────────────────────
+def _scan_and_enter(client: BingXClient, pos_mgr: PositionManager,
+                    risk: RiskManager, tg: TelegramClient,
+                    equity: float) -> int:
+    """Scan universe for MR signals. Returns number of new trades opened."""
+    opened = 0
     try:
-        balance = await client.get_balance()
-        log.info("Balance cascade account: %.4f USDT", balance)
+        symbols = client.get_top_symbols(config.TOP_N_SYMBOLS, config.MIN_VOLUME_USDT)
     except Exception as e:
-        log.warning("Balance no disponible: %s", e)
-        balance = 0.0
+        log.error(f"get_top_symbols: {e}")
+        return 0
 
-    if C.MODE == "LIVE":
+    for sym in symbols:
+        if sym in config.BLACKLIST:
+            continue
+
+        if pos_mgr.count_open() >= config.MAX_OPEN_TRADES:
+            break
+
+        allowed, reason = risk.can_trade(equity)
+        if not allowed:
+            log.warning(f"Risk block: {reason}")
+            break
+
+        # Skip if already in this symbol (either side)
+        has_long  = pos_mgr.has_position(sym, "LONG")
+        has_short = pos_mgr.has_position(sym, "SHORT")
+        if has_long and has_short:
+            continue
+
         try:
-            await pos_mgr.reconcile_on_startup()
+            candles = client.get_klines(sym, config.TIMEFRAME, 60)
+            if len(candles) < 30:
+                continue
+
+            funding = client.get_funding_rate(sym)
+            sig = get_signal(candles, funding, config)
+
+            if not sig["signal"]:
+                continue
+
+            direction = sig["signal"]
+            if direction == "LONG" and config.DIRECTION not in ("LONG", "BOTH"):
+                continue
+            if direction == "SHORT" and config.DIRECTION not in ("SHORT", "BOTH"):
+                continue
+            if direction == "LONG"  and has_long:
+                continue
+            if direction == "SHORT" and has_short:
+                continue
+
+            mark = client.get_mark_price(sym)
+            atr  = sig["atr"]
+            qty  = pos_mgr.calc_qty(sym, mark, atr, equity)
+            if qty is None:
+                continue
+
+            log.info(
+                f"MR signal {direction} {sym}  "
+                f"RSI={sig['rsi']:.1f}  ADX={sig['adx']:.1f}  "
+                f"BB={sig['bb_lower']:.4g}/{sig['bb_upper']:.4g}  "
+                f"move%={sig.get('move_pct', 0):.3f}  "
+                f"fund={funding:.4f}  atr={atr:.4g}"
+            )
+
+            if direction == "LONG":
+                ok = pos_mgr.open_long(sym, qty, atr)
+            else:
+                ok = pos_mgr.open_short(sym, qty, atr)
+
+            if ok:
+                pos_mgr.place_tp_sl(sym, direction, qty, mark, atr)
+                tg.entry(config.BOT_NAME, sym, direction, mark, qty, None, equity)
+                opened += 1
+
         except Exception as e:
-            log.warning("reconcile error: %s", e)
+            log.error(f"scan {sym}: {e}")
 
-    await tg.notify_status(risk.status(), balance, 0)
-
-    scanner_task = asyncio.create_task(_run_scanner())
-    monitor_task = asyncio.create_task(_run_monitor())
-    log.info("💥 Cascade Bot iniciado (scanner + monitor)")
-
-    yield
-
-    scanner_task.cancel()
-    monitor_task.cancel()
-    if client:
-        await client.close()
-    log.info("Cascade Bot detenido.")
+    return opened
 
 
-app = FastAPI(
-    title="Liquidation Cascade Bot v1.0",
-    docs_url=None,
-    redoc_url=None,
-    lifespan=lifespan,
-)
+# ── Main loop ─────────────────────────────────────────────────────────────────
+def main():
+    _start_health_server()
+    log.info(f"=== {config.BOT_NAME} starting  tf={config.TIMEFRAME}  dir={config.DIRECTION} ===")
 
+    client  = BingXClient(config.API_KEY, config.SECRET_KEY, config.BASE_URL)
+    pos_mgr = PositionManager(client)
+    risk    = RiskManager(config)
+    tg      = TelegramClient(config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT)
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "version": "cascade_1.0", "mode": C.MODE}
+    equity = client.get_equity()
+    risk.new_day(equity)
+    log.info(f"New day — equity: {equity:.2f} USDT")
 
+    last_scan_t = 0.0
+    iteration   = 0
 
-@app.get("/status")
-async def status():
-    if risk is None:
-        return JSONResponse({"error": "not_ready"}, status_code=503)
-    try:
-        balance = await client.get_balance()
-    except Exception:
-        balance = -1.0
-    try:
-        unrealized = await pos_mgr.get_unrealized_pnl() if pos_mgr else 0.0
-    except Exception:
-        unrealized = 0.0
+    while True:
+        try:
+            now    = time.time()
+            equity = client.get_equity()
 
-    # Top cascades detectadas actualmente
-    from oi_cascade_signal import oi_cascade_engine
-    top = oi_cascade_engine.get_top_cascades(10)
-    cascade_signals = {
-        sym: {"score": sig.score, "direction": sig.direction,
-              "fr": round(sig.fr_value * 100, 4),
-              "oi_4h_pct": round(sig.oi_delta_4h * 100, 2)}
-        for sym, sig in top
-    }
+            # Manage existing positions every tick
+            _manage_positions(client, pos_mgr, risk, tg)
 
-    tracked = pos_mgr.get_tracked() if pos_mgr else {}
-    return {
-        "version": "cascade_1.0",
-        "mode": C.MODE,
-        "balance": round(balance, 4),
-        "unrealized": round(unrealized, 4),
-        "risk": risk.status(unrealized_pnl=unrealized),
-        "open_positions": len(tracked),
-        "cascade_signals": cascade_signals,
-        "trades": {
-            sym: {
-                "direction": t.direction,
-                "entry": t.entry,
-                "sl": t.sl,
-                "tp1": t.tp1,
-                "trailing_active": t.trailing_active,
-            }
-            for sym, t in tracked.items()
-        },
-    }
+            # Scan for new entries on interval
+            if now - last_scan_t >= config.SCAN_INTERVAL:
+                last_scan_t = now
+                iteration  += 1
 
+                allowed, _ = risk.can_trade(equity)
+                if allowed:
+                    t0 = time.time()
+                    opened = _scan_and_enter(client, pos_mgr, risk, tg, equity)
+                    elapsed = time.time() - t0
+                    open_total = pos_mgr.count_open()
+                    log.info(
+                        f"scanner | Iter {iteration} | {config.TOP_N_SYMBOLS} símbolos "
+                        f"| {opened} abiertos | {elapsed:.1f}s "
+                        f"| posiciones={open_total}"
+                    )
 
-@app.get("/cascades")
-async def cascades():
-    """Ver top cascadas detectadas actualmente."""
-    from oi_cascade_signal import oi_cascade_engine
-    top = oi_cascade_engine.get_top_cascades(20)
-    return {
-        "count": len(top),
-        "signals": [
-            {
-                "symbol": sym,
-                "score": sig.score,
-                "direction": sig.direction,
-                "fr_pct": round(sig.fr_value * 100, 4),
-                "oi_4h_pct": round(sig.oi_delta_4h * 100, 2),
-                "reason": sig.reason,
-            }
-            for sym, sig in top
-        ],
-    }
+        except KeyboardInterrupt:
+            log.info("Stopping.")
+            break
+        except Exception as e:
+            log.error(f"Loop error: {e}")
+            tg.error(config.BOT_NAME, str(e)[:400])
+            time.sleep(30)
 
-
-@app.get("/journal")
-async def journal_stats():
-    if journal is None:
-        return JSONResponse({"error": "not_ready"}, status_code=503)
-    return journal.stats()
-
-
-@app.post("/close/{symbol}")
-async def close_symbol(symbol: str):
-    if C.MODE != "LIVE":
-        raise HTTPException(400, "Solo en modo LIVE")
-    symbol = symbol.upper()
-    if not pos_mgr.is_trading(symbol):
-        raise HTTPException(404, f"{symbol} sin posición")
-    await pos_mgr.close_position_emergency(symbol, reason="manual_close")
-    return {"status": "ok", "symbol": symbol}
+        time.sleep(config.TRAILING_CHECK_SEC)
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=C.PORT,
-                log_level="info", access_log=False)
+    main()
