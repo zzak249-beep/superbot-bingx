@@ -1,6 +1,12 @@
 """
 Position Manager — Mean Reversion Bot
 Exit adicional: cruce de media Bollinger (reversión completada)
+
+FIX: count_open() ahora cuenta state.get_tracked_positions() — solo
+posiciones propias — en vez de client.get_positions() (toda la
+cuenta). Con MAX_OPEN_TRADES=4, contar toda la cuenta compartida
+podía bloquear el escaneo sin que este bot tuviera ninguna posición
+propia abierta.
 """
 import math
 import time
@@ -70,7 +76,7 @@ class PositionManager:
         return self.get_position(symbol, side) is not None
 
     def count_open(self) -> int:
-        return len(self.client.get_positions())
+        return len(state.get_tracked_positions())   # FIX: solo propias
 
     # ── Entries ───────────────────────────────────────────────
     def open_long(self, symbol: str, qty: float, atr: float) -> bool:
@@ -194,7 +200,8 @@ class PositionManager:
             tp_qty = self._round_qty(symbol, qty * 0.5)
             if tp_qty >= self._min_qty(symbol):
                 opp_side = "SELL" if side == "LONG" else "BUY"
-                self.client.place_limit_order(symbol, opp_side, side, tp, tp_qty)
+                self.client.place_limit_order(symbol, opp_side, side, tp, tp_qty,
+                                              reduce_only=True)   # FIX
                 log.info(f"TP1 placed {symbol} {side}  tp={tp:.6g}  qty={tp_qty}")
         except Exception as e:
             log.error(f"place_tp1 {symbol}: {e}")
