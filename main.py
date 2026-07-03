@@ -174,7 +174,10 @@ def _scan_and_enter(client: BingXClient, pos_mgr: PositionManager,
 
             if ok:
                 pos_mgr.place_tp_sl(sym, direction, qty, mark, atr)
-                tg.entry(config.BOT_NAME, sym, direction, mark, qty, None, equity)
+                try:
+                    tg.entry(config.BOT_NAME, sym, direction, mark, qty, None, equity)
+                except Exception as e:
+                    log.warning(f"telegram entry {sym}: {e}")   # FIX: no debe cortar el flujo
                 opened += 1
 
         except Exception as e:
