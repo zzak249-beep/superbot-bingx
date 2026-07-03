@@ -1,5 +1,13 @@
-"""telegram_client.py — Telegram notifications."""
+"""
+Telegram notification client.
 
+FIX: entry() ahora acepta stop=None sin crashear. main.py llama a
+tg.entry(..., None, equity) siempre — este bot no calcula un stop
+explícito antes de notificar. Con f"{stop:.6g}" sin protección, esto
+llevaba crasheando en cada apertura exitosa desde siempre — el trade
+y el SL/TP ya se habían colocado antes de esta línea, así que no se
+perdía el trade, pero nunca llegaba el aviso de entrada a Telegram.
+"""
 import logging
 import requests
 
@@ -22,20 +30,26 @@ class TelegramClient:
                 timeout=8,
             )
         except Exception as e:
-            log.warning(f"Telegram: {e}")
+            log.warning(f"Telegram error: {e}")
 
-    def startup(self, bot: str, tf: str, lev: int):
-        self._send(f"🤖 <b>{bot}</b> iniciado\nTF: {tf}  Lev: {lev}x  SHORT_ONLY")
+    # ── Templates ─────────────────────────────────────────────
 
-    def entry(self, bot: str, symbol: str, side: str, price: float,
-              qty: float, stop: float, equity: float, score: int = 0):
+    def startup(self, bot: str, symbol: str, tf: str, lev: int):
         self._send(
-            f"🔴 <b>{bot}</b> — ENTRADA {side}\n"
-            f"<code>{symbol}</code>\n"
+            f"🤖 <b>{bot}</b> iniciado\n"
+            f"Symbol: <code>{symbol}</code>  TF: {tf}  Lev: {lev}x"
+        )
+
+    def entry(self, bot: str, symbol: str, side: str, price: float, qty: float,
+              stop: float, equity: float):
+        icon = "🟢" if side == "LONG" else "🔴"
+        stop_str = f"{stop:.6g}" if stop is not None else "N/A"   # FIX
+        self._send(
+            f"{icon} <b>{bot}</b> — ENTRADA {side}\n"
+            f"Symbol: <code>{symbol}</code>\n"
             f"Price:  {price:.6g}\n"
             f"Qty:    {qty}\n"
-            f"Stop:   {stop:.6g}\n"
-            f"Score:  {score}\n"
+            f"Stop:   {stop_str}\n"
             f"Equity: {equity:.2f} USDT"
         )
 
@@ -44,17 +58,25 @@ class TelegramClient:
         icon = "✅" if pnl >= 0 else "❌"
         self._send(
             f"{icon} <b>{bot}</b> — SALIDA {side}\n"
-            f"<code>{symbol}</code>\n"
+            f"Symbol: <code>{symbol}</code>\n"
             f"Price:  {price:.6g}\n"
             f"Razón:  {reason}\n"
             f"PnL:    {pnl:+.2f} USDT"
         )
 
+    def trail_update(self, bot: str, symbol: str, side: str,
+                     price: float, stop: float):
+        self._send(
+            f"🔄 <b>{bot}</b> Trail Stop\n"
+            f"<code>{symbol}</code> {side}\n"
+            f"Price: {price:.6g}  Stop: {stop:.6g}"
+        )
+
     def blocked(self, bot: str, reason: str):
         self._send(f"⛔ <b>{bot}</b> BLOQUEADO\n{reason}")
 
-    def error(self, bot: str, msg: str):
-        self._send(f"⚠️ <b>{bot}</b> ERROR\n{msg}")
+    def error(self, bot: str, message: str):
+        self._send(f"⚠️ <b>{bot}</b> ERROR\n{message}")
 
-    def info(self, bot: str, msg: str):
-        self._send(f"ℹ️ <b>{bot}</b>\n{msg}")
+    def info(self, bot: str, message: str):
+        self._send(f"ℹ️ <b>{bot}</b>\n{message}")
