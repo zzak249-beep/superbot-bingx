@@ -66,6 +66,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("crowding")
 
+_ultimo_ciclo = 0.0
+
 BASE = "https://open-api.bingx.com"
 UA = {"User-Agent": "crowding-signal-bot/1.0"}
 
@@ -92,9 +94,15 @@ CFG = {
     "SCAN_SEC": env("SCAN_SEC", 300),
     "MIN_VOL_24H": env("MIN_VOL_24H", 2_000_000.0),
     "MAX_SYMBOLS": env("MAX_SYMBOLS", 300),
-    "HIST_LEN": env("HIST_LEN", 300),      # muestras de basis/OI para el z
-    "MIN_HIST": env("MIN_HIST", 200),      # mínimo para emitir
-    "OI_LOOK": env("OI_LOOK", 24),
+    # EN HORAS, NO EN MUESTRAS. El bot toma una muestra por ciclo, y la
+    # duración del ciclo depende de cuántos símbolos escanee: con 300 salen
+    # 9,4 min, con 100 saldrían ~3. Si estos valores fueran contadores, cada
+    # cambio de MAX_SYMBOLS los reinterpretaría en silencio. En horas
+    # significan siempre lo mismo y el bot hace la conversión él.
+    "HIST_HORAS": env("HIST_HORAS", 168.0),   # retención (7 días)
+    "MIN_HORAS": env("MIN_HORAS", 30.0),      # antes de emitir
+    "MIN_MUESTRAS": env("MIN_MUESTRAS", 200), # y además esta cuenta mínima
+    "OI_LOOK_H": env("OI_LOOK_H", 6.0),       # ventana de variación de OI
     "Z_BASIS": env("Z_BASIS", 2.0),
     "Z_OI": env("Z_OI", 1.0),
     "EXT_PCT": env("EXT_PCT", 80.0),
@@ -277,6 +285,28 @@ class Virtual:
     barras: int = 0
 
 
+def _podar(h: deque, ahora: float, horas: float):
+    """Tira lo más viejo que la ventana de retención."""
+    limite = ahora - horas * 3600.0
+    while h and h[0][0] < limite:
+        h.popleft()
+
+
+def _valor_hace(h: deque, ahora: float, horas: float):
+    """Valor de hace ~N horas: la muestra más cercana a ese instante."""
+    if not h:
+        return None
+    objetivo = ahora - horas * 3600.0
+    if h[0][0] > objetivo:
+        return None                      # la historia no llega tan atrás
+    mejor = min(h, key=lambda p: abs(p[0] - objetivo))
+    return mejor[1]
+
+
+def _span_horas(h: deque) -> float:
+    return (h[-1][0] - h[0][0]) / 3600.0 if len(h) > 1 else 0.0
+
+
 class Estado:
     def __init__(self, path):
         self.path = path
@@ -290,9 +320,34 @@ class Estado:
         try:
             with open(self.path, encoding="utf-8") as f:
                 d = json.load(f)
-            n = int(CFG["HIST_LEN"])
-            self.basis = {k: deque(v, maxlen=n) for k, v in d.get("basis", {}).items()}
-            self.oi = {k: deque(v, maxlen=n) for k, v in d.get("oi", {}).items()}
+            # Migración del formato antiguo (lista de floats sin marca de
+            # tiempo): se les asignan tiempos hacia atrás a la cadencia
+            # nominal, para no tirar horas de calentamiento ya ganadas.
+            ahora = time.time()
+            paso = float(CFG["SCAN_SEC"]) + 260.0
+            migradas = 0
+
+            def _cargar(bloque):
+                nonlocal migradas
+                out = {}
+                for k, v in bloque.items():
+                    dq = deque()
+                    if v and not isinstance(v[0], (list, tuple)):
+                        migradas += 1
+                        base = ahora - len(v) * paso
+                        for i, x in enumerate(v):
+                            dq.append((base + i * paso, float(x)))
+                    else:
+                        for p in v:
+                            dq.append((float(p[0]), float(p[1])))
+                    out[k] = dq
+                return out
+
+            self.basis = _cargar(d.get("basis", {}))
+            self.oi = _cargar(d.get("oi", {}))
+            if migradas:
+                log.warning("Migradas %d series del formato antiguo (sin marca de "
+                            "tiempo): los tiempos son estimados", migradas)
             self.abiertas = {k: Virtual(**v) for k, v in d.get("abiertas", {}).items()}
             self.ultimo_informe = d.get("ultimo_informe", "")
             log.info("Estado cargado: %d símbolos con historia, %d virtuales abiertas",
@@ -308,8 +363,8 @@ class Estado:
             tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({
-                    "basis": {k: list(v) for k, v in self.basis.items()},
-                    "oi": {k: list(v) for k, v in self.oi.items()},
+                    "basis": {k: [list(p) for p in v] for k, v in self.basis.items()},
+                    "oi": {k: [list(p) for p in v] for k, v in self.oi.items()},
                     "abiertas": {k: asdict(v) for k, v in self.abiertas.items()},
                     "ultimo_informe": self.ultimo_informe,
                 }, f)
@@ -379,27 +434,38 @@ def evaluar(symbol, velas, st: Estado):
     if oi is None:
         return None, "sin open interest"
 
-    hb = st.basis.setdefault(symbol, deque(maxlen=int(CFG["HIST_LEN"])))
-    ho = st.oi.setdefault(symbol, deque(maxlen=int(CFG["HIST_LEN"])))
-    hb.append(p["basis"])
-    ho.append(oi)
+    ahora = time.time()
+    hb = st.basis.setdefault(symbol, deque())
+    ho = st.oi.setdefault(symbol, deque())
+    hb.append((ahora, p["basis"]))
+    ho.append((ahora, oi))
+    horas_ret = float(CFG["HIST_HORAS"])
+    _podar(hb, ahora, horas_ret)
+    _podar(ho, ahora, horas_ret)
 
-    if len(hb) < int(CFG["MIN_HIST"]):
-        return None, f"calentando ({len(hb)}/{CFG['MIN_HIST']})"
+    span = _span_horas(hb)
+    min_h = float(CFG["MIN_HORAS"])
+    min_n = int(CFG["MIN_MUESTRAS"])
+    if span < min_h or len(hb) < min_n:
+        return None, f"calentando ({span:.1f}/{min_h:.0f}h, {len(hb)}/{min_n})"
 
-    look = int(CFG["OI_LOOK"])
-    if len(ho) <= look:
+    look_h = float(CFG["OI_LOOK_H"])
+    oi_prev = _valor_hace(ho, ahora, look_h)
+    if oi_prev is None or oi_prev <= 0:
         return None, "sin ventana de OI"
-    oi_prev = list(ho)[-look - 1]
-    oi_chg = (oi - oi_prev) / oi_prev * 100.0 if oi_prev > 0 else 0.0
+    oi_chg = (oi - oi_prev) / oi_prev * 100.0
 
     # El z del cambio de OI se calcula contra los cambios pasados, no contra
     # el nivel: el OI crece con el interés del mercado y el nivel no es
-    # comparable consigo mismo de hace un mes.
+    # comparable consigo mismo de hace un mes. Cada cambio se mide contra el
+    # valor de hace look_h HORAS, no de hace N muestras.
     lo = list(ho)
-    cambios = [(lo[i] - lo[i - look]) / lo[i - look] * 100.0
-               for i in range(look, len(lo)) if lo[i - look] > 0]
-    zb = zscore(list(hb), p["basis"])
+    cambios = []
+    for i in range(len(lo)):
+        ref = _valor_hace(deque(lo[:i + 1]), lo[i][0], look_h)
+        if ref and ref > 0:
+            cambios.append((lo[i][1] - ref) / ref * 100.0)
+    zb = zscore([x[1] for x in hb], p["basis"])
     zo = zscore(cambios, oi_chg)
     if zb is None or zo is None:
         return None, "z no calculable"
@@ -580,8 +646,12 @@ def ciclo(st: Estado, simbolos: list[str]):
         finally:
             time.sleep(float(CFG["PACING"]))
     top = sorted(razones.items(), key=lambda kv: -kv[1])[:4]
-    log.info("Ciclo: %d símbolos · %d señales | %s", motivos, señales,
-             " · ".join(f"{k}: {v}" for k, v in top))
+    global _ultimo_ciclo
+    ahora = time.time()
+    cad = (ahora - _ultimo_ciclo) / 60.0 if _ultimo_ciclo else 0.0
+    _ultimo_ciclo = ahora
+    log.info("Ciclo: %d símbolos · %d señales · cadencia %.1f min | %s",
+             motivos, señales, cad, " · ".join(f"{k}: {v}" for k, v in top))
     st.guardar()
 
 

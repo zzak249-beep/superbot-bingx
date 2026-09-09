@@ -26,13 +26,32 @@ ella**:
 
 1. Proyecto nuevo desde este repo.
 2. **Monta un Volume en `/data`.** Sin él, cada redespliegue borra la
-   historia acumulada y el bot vuelve a calentar tres días desde cero.
+   historia acumulada y el bot vuelve a calentar 31 horas desde cero.
 3. Variables de entorno (ver abajo).
 
 ## Calentamiento
 
 BingX no sirve histórico de open interest, así que el bot acumula el suyo.
-Durante ~3 días dirá `calentando (X/200)` y no emitirá nada. Es correcto.
+Dirá `calentando (X/30h, N/200)` y no emitirá nada hasta cumplir **las dos
+condiciones**: 30 horas de historia Y 200 muestras.
+
+Con 300 símbolos el ciclo tarda ~9,4 min (4,4 de trabajo + `SCAN_SEC`), así
+que son unas **31 horas**, no tres días.
+
+## Los parámetros van en HORAS, no en muestras
+
+El bot toma una muestra por ciclo, y la duración del ciclo depende de
+cuántos símbolos escanee: con 300 son ~9,4 min; con 100 serían ~3. Si
+`OI_LOOK` fuera un contador de muestras, cada cambio de `MAX_SYMBOLS` lo
+reinterpretaría en silencio — una ventana de "24 muestras" pasaría de 3,7 h
+a 1,2 h sin que nada avisara.
+
+Por eso `OI_LOOK_H`, `HIST_HORAS` y `MIN_HORAS` están en horas y el bot
+hace la conversión con su cadencia real, que además registra en cada línea
+de log (`cadencia 9.4 min`).
+
+`MIN_MUESTRAS` sigue siendo una cuenta: hacen falta las dos cosas, tiempo
+suficiente y muestras suficientes para que el z-score sea estable.
 
 ## Variables
 
@@ -41,9 +60,10 @@ TIMEFRAME=15m
 SCAN_SEC=300
 MIN_VOL_24H=2000000
 MAX_SYMBOLS=300
-HIST_LEN=300
-MIN_HIST=200
-OI_LOOK=24
+HIST_HORAS=168
+MIN_HORAS=30
+MIN_MUESTRAS=200
+OI_LOOK_H=6
 Z_BASIS=2.0
 Z_OI=1.0
 EXT_PCT=80
