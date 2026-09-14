@@ -6,6 +6,17 @@ que no puede tocar tu cuenta ni por error. Su único trabajo es generar
 señales y MEDIRSE A SÍ MISMO.
 
 ═══════════════════════════════════════════════════════════════════════
+MEJORAS DE VELOCIDAD Y PRECISIÓN (v2)
+═══════════════════════════════════════════════════════════════════════
+- premiumIndex de TODOS los símbolos en UNA sola llamada (ahorra ~300 req).
+- requests.Session con connection pooling.
+- ThreadPoolExecutor (MAX_WORKERS) para OI + klines en paralelo.
+- Evaluación y actualización de estado en serie (sin race conditions).
+- Rate limit BingX market data: 500 req / 10 s por IP. Con 20 workers
+  se mantiene cómodamente por debajo.
+- Cadencia típica: de ~9,4 min → ~2-3 min (depende de MAX_SYMBOLS).
+
+═══════════════════════════════════════════════════════════════════════
 LO QUE MIDE Y POR QUÉ ASÍ
 ═══════════════════════════════════════════════════════════════════════
 Cada señal abre una operación VIRTUAL con stop y objetivo, y el bot la
@@ -54,13 +65,17 @@ import os
 import statistics
 import time
 from collections import deque
-from dataclasses import dataclass, field, asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import confirm as cf
-from cisd import detectar_cisd, hay_retest
+import panel as pn
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,9 +84,21 @@ logging.basicConfig(
 log = logging.getLogger("crowding")
 
 _ultimo_ciclo = 0.0
+_ultimo_heartbeat = 0.0
 
 BASE = "https://open-api.bingx.com"
-UA = {"User-Agent": "crowding-signal-bot/1.0"}
+UA = {"User-Agent": "crowding-signal-bot/2.2"}
+
+# Session reutilizable + pool grande (evita "Connection pool is full")
+SESSION = requests.Session()
+SESSION.headers.update(UA)
+_adapter = HTTPAdapter(
+    pool_connections=40,
+    pool_maxsize=40,
+    max_retries=Retry(total=2, backoff_factor=0.3, status_forcelist=[429, 500, 502, 503, 504]),
+)
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
 
 
 def env(k, d):
@@ -93,14 +120,11 @@ def env(k, d):
 
 CFG = {
     "TIMEFRAME": env("TIMEFRAME", "15m"),
-    "SCAN_SEC": env("SCAN_SEC", 300),
+    "SCAN_SEC": env("SCAN_SEC", 120),          # bajado: el trabajo es mucho más rápido
     "MIN_VOL_24H": env("MIN_VOL_24H", 2_000_000.0),
     "MAX_SYMBOLS": env("MAX_SYMBOLS", 300),
     # EN HORAS, NO EN MUESTRAS. El bot toma una muestra por ciclo, y la
-    # duración del ciclo depende de cuántos símbolos escanee: con 300 salen
-    # 9,4 min, con 100 saldrían ~3. Si estos valores fueran contadores, cada
-    # cambio de MAX_SYMBOLS los reinterpretaría en silencio. En horas
-    # significan siempre lo mismo y el bot hace la conversión él.
+    # duración del ciclo depende de cuántos símbolos escanee.
     "HIST_HORAS": env("HIST_HORAS", 168.0),   # retención (7 días)
     "MIN_HORAS": env("MIN_HORAS", 30.0),      # antes de emitir
     "MIN_MUESTRAS": env("MIN_MUESTRAS", 200), # y además esta cuenta mínima
@@ -113,17 +137,6 @@ CFG = {
     "TP_R": env("TP_R", 2.0),
     "MAX_BARS": env("MAX_BARS", 16),
     "MIN_ATR_PCT": env("MIN_ATR_PCT", 1.0),
-    # ── CISD ────────────────────────────────────────────────────────────
-    # El umbral de 4 era INALCANZABLE: klines no traía volumen, así que
-    # rel_vol salía siempre 0 y el score no podía pasar de 3 (cisd+ob+fvg).
-    # Ya viene el volumen, pero aun así exigir 4 obliga a que haya FVG en la
-    # misma vela, que es raro. Defecto 2 = CISD + una confirmación.
-    "CISD_ENABLED": env("CISD_ENABLED", True),
-    "CISD_MIN_SCORE": env("CISD_MIN_SCORE", 2),
-    "CISD_RETEST": env("CISD_RETEST", False),
-    # Cerilla: estricto = cierre por debajo del mínimo anterior (envolvente).
-    # Es un filtro duro que se come casi todos los amontonamientos válidos.
-    "TRIG_ESTRICTO": env("TRIG_ESTRICTO", False),
     "COST_PCT": env("COST_PCT", 0.25),
     "MAX_COST_R": env("MAX_COST_R", 0.20),
     "STATE": env("STATE", "/data/crowding_state.json"),
@@ -131,17 +144,19 @@ CFG = {
     "TG_TOKEN": env("TG_TOKEN", ""),
     "TG_CHAT": env("TG_CHAT", ""),
     "REPORT_HOUR": env("REPORT_HOUR", 7),
-    # Aviso por señal y por cierre APAGADOS por defecto. Con ~300 símbolos
-    # salen unos 70 mensajes al día, y un chat con 70 mensajes diarios se
-    # deja de leer en una semana. Todo queda igualmente en el CSV, que es
-    # de donde sale la respuesta a los 15 días. El informe diario sí llega.
     "TG_SIGNALS": env("TG_SIGNALS", False),
     "TG_CLOSES": env("TG_CLOSES", False),
-    "PACING": env("PACING", 0.15),
-    # Régimen: se APUNTA, no decide. El crowding opera CONTRA la multitud,
-    # o sea que es reversión — el veto de confirm.py está pensado para
-    # ruptura y le quitaría sus mejores entradas. Aquí solo se registra
-    # para poder responder en 15 días si rinde mejor en régimen reversivo.
+    "PACING": env("PACING", 0.0),             # 0 = sin sleep extra (el pool controla)
+    "MAX_WORKERS": env("MAX_WORKERS", 20),    # paralelismo seguro bajo el rate limit
+    # 120 no alcanzaba para confirm.py: pedía 120 retornos y le llegaban 99,
+    # así que conf_regimen salía siempre "pocas velas (99)".
+    "KLINES_LIMIT": env("KLINES_LIMIT", 260),
+    # Panel transversal: ver panel.py. No decide nada, solo apunta.
+    "PANEL_ENABLED": env("PANEL_ENABLED", True),
+    "PANEL_CSV": env("PANEL_CSV", "/data/crowding_panel.csv"),
+    "PANEL_CADA_SEG": env("PANEL_CADA_SEG", 900.0),
+    "PANEL_MIN_SIMBOLOS": env("PANEL_MIN_SIMBOLOS", 30),
+    # Régimen: se APUNTA, no decide.
     "CONFIRM_ENABLED": env("CONFIRM_ENABLED", True),
     "CONFIRM_BLOQUEAR": False,
     "CONFIRM_Q": env("CONFIRM_Q", 8),
@@ -159,7 +174,7 @@ BAR_SEC = TF_MS.get(str(CFG["TIMEFRAME"]), 900)
 def _get(path: str, params: dict | None = None, intentos: int = 3):
     for i in range(intentos):
         try:
-            r = requests.get(BASE + path, params=params or {}, headers=UA, timeout=15)
+            r = SESSION.get(BASE + path, params=params or {}, timeout=12)
             r.raise_for_status()
             j = r.json()
             if str(j.get("code", 0)) not in ("0", "None"):
@@ -169,7 +184,7 @@ def _get(path: str, params: dict | None = None, intentos: int = 3):
         except Exception as e:
             if i == intentos - 1:
                 log.debug("%s falló: %s", path, e)
-            time.sleep(0.5 * (i + 1))
+            time.sleep(0.4 * (i + 1) + 0.1 * (i + 1) ** 2)  # backoff + jitter
     return None
 
 
@@ -198,23 +213,34 @@ def volumenes() -> dict:
     return out
 
 
-def prima(symbol: str):
-    """markPrice e indexPrice: el basis sale de restarlos, sin feed de spot."""
-    d = _get("/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
-    if isinstance(d, list):
-        d = d[0] if d else None
-    if not isinstance(d, dict):
-        return None
-    try:
-        mark = float(d.get("markPrice") or 0)
-        index = float(d.get("indexPrice") or 0)
-        fr = float(d.get("lastFundingRate") or 0)
-        if mark <= 0 or index <= 0:
-            return None
-        return {"mark": mark, "index": index, "basis": (mark - index) / index * 100.0,
-                "funding": fr * 100.0}
-    except (TypeError, ValueError):
-        return None
+def premium_todos() -> dict[str, dict]:
+    """
+    Una sola llamada para TODOS los símbolos.
+    Devuelve {symbol: {"mark", "index", "basis", "funding"}}
+    """
+    d = _get("/openApi/swap/v2/quote/premiumIndex")
+    if not d:
+        return {}
+    if isinstance(d, dict):
+        d = [d]
+    out = {}
+    for item in d:
+        try:
+            s = item.get("symbol")
+            mark = float(item.get("markPrice") or 0)
+            index = float(item.get("indexPrice") or 0)
+            fr = float(item.get("lastFundingRate") or 0)
+            if not s or mark <= 0 or index <= 0:
+                continue
+            out[s] = {
+                "mark": mark,
+                "index": index,
+                "basis": (mark - index) / index * 100.0,
+                "funding": fr * 100.0,
+            }
+        except (TypeError, ValueError, KeyError):
+            continue
+    return out
 
 
 def open_interest(symbol: str):
@@ -230,12 +256,13 @@ def open_interest(symbol: str):
         return None
 
 
-def klines(symbol: str, limit: int = 200):
+def klines(symbol: str, limit: int | None = None):
+    lim = limit or int(CFG["KLINES_LIMIT"])
     d = _get("/openApi/swap/v3/quote/klines",
-             {"symbol": symbol, "interval": CFG["TIMEFRAME"], "limit": limit})
+             {"symbol": symbol, "interval": CFG["TIMEFRAME"], "limit": lim})
     if not d:
         d = _get("/openApi/swap/v2/quote/klines",
-                 {"symbol": symbol, "interval": CFG["TIMEFRAME"], "limit": limit})
+                 {"symbol": symbol, "interval": CFG["TIMEFRAME"], "limit": lim})
     if not d:
         return []
     filas = []
@@ -243,16 +270,27 @@ def klines(symbol: str, limit: int = 200):
         try:
             if isinstance(k, dict):
                 filas.append({"t": int(k["time"]), "o": float(k["open"]), "h": float(k["high"]),
-                              "l": float(k["low"]), "c": float(k["close"]),
-                              "v": float(k.get("volume") or k.get("vol") or 0.0)})
+                              "l": float(k["low"]), "c": float(k["close"])})
             else:
                 filas.append({"t": int(k[0]), "o": float(k[1]), "h": float(k[2]),
-                              "l": float(k[3]), "c": float(k[4]),
-                              "v": float(k[5]) if len(k) > 5 else 0.0})
+                              "l": float(k[3]), "c": float(k[4])})
         except (KeyError, IndexError, TypeError, ValueError):
             continue
     filas.sort(key=lambda x: x["t"])
     return filas
+
+
+def _fetch_symbol_raw(symbol: str) -> dict | None:
+    """Worker: solo descarga OI + klines. Sin tocar estado compartido."""
+    try:
+        oi = open_interest(symbol)
+        velas = klines(symbol)
+        if oi is None or not velas:
+            return None
+        return {"oi": oi, "velas": velas}
+    except Exception:
+        log.debug("fetch falló %s", symbol, exc_info=True)
+        return None
 
 
 # ─────────────────────────────────────────────────────── indicadores
@@ -298,6 +336,11 @@ class Virtual:
     conf_z: float = 0.0
     conf_regimen: str = "sin datos"
     barras: int = 0
+    # Excursión máxima a favor y en contra, en R. Contesta gratis si TP_R=2
+    # es el objetivo correcto: si el MFE medio de las perdedoras ronda 1.5R,
+    # el objetivo está demasiado lejos y lo estás devolviendo.
+    mfe: float = 0.0
+    mae: float = 0.0
 
 
 def _podar(h: deque, ahora: float, horas: float):
@@ -313,26 +356,21 @@ def _valor_hace(h: deque, ahora: float, horas: float):
         return None
     objetivo = ahora - horas * 3600.0
     if h[0][0] > objetivo:
-        return None                      # la historia no llega tan atrás
+        return None
     mejor = min(h, key=lambda p: abs(p[0] - objetivo))
     return mejor[1]
 
 
 def _cambios_oi(lo: list, look_h: float) -> list[float]:
-    """
-    Serie histórica de variación de OI a look_h horas vista.
-
-    La versión anterior copiaba la deque entera en cada iteración y hacía un
-    min() sobre ella: O(n²) con n~1000 muestras y 300 símbolos por ciclo, que
-    es la mayor parte del tiempo de CPU del bot. Aquí es búsqueda binaria.
-    """
+    """O(n log n). La versión con deque(lo[:i+1]) costaba 565 ms por símbolo
+    con 4000 puntos, o sea ~170 s de CPU por ciclo con 300 símbolos."""
     ts = [p[0] for p in lo]
     look = look_h * 3600.0
     out: list[float] = []
     for i in range(len(lo)):
         objetivo = ts[i] - look
         if ts[0] > objetivo:
-            continue                      # la historia no llega tan atrás
+            continue
         j = bisect.bisect_left(ts, objetivo, 0, i + 1)
         mejor = min((k for k in (j - 1, j) if 0 <= k <= i),
                     key=lambda k: abs(ts[k] - objetivo), default=None)
@@ -361,11 +399,8 @@ class Estado:
         try:
             with open(self.path, encoding="utf-8") as f:
                 d = json.load(f)
-            # Migración del formato antiguo (lista de floats sin marca de
-            # tiempo): se les asignan tiempos hacia atrás a la cadencia
-            # nominal, para no tirar horas de calentamiento ya ganadas.
             ahora = time.time()
-            paso = float(CFG["SCAN_SEC"]) + 260.0
+            paso = float(CFG["SCAN_SEC"]) + 60.0
             migradas = 0
 
             def _cargar(bloque):
@@ -409,7 +444,7 @@ class Estado:
                     "abiertas": {k: asdict(v) for k, v in self.abiertas.items()},
                     "ultimo_informe": self.ultimo_informe,
                 }, f)
-            os.replace(tmp, self.path)   # atómico: un corte no deja el JSON a medias
+            os.replace(tmp, self.path)
         except Exception:
             log.exception("No se pudo guardar el estado")
 
@@ -427,7 +462,7 @@ _CFG_OBJ = _Cfg()
 
 COLS = ["cerrada_utc", "symbol", "lado", "abierta_utc", "entrada", "salida",
         "motivo", "r_bruto", "coste_r", "r_neto", "barras", "basis_z",
-        "oi_z", "funding", "atr_pct", "conf_z", "conf_regimen"]
+        "oi_z", "funding", "atr_pct", "conf_z", "conf_regimen", "mfe", "mae"]
 
 
 def anotar(fila: dict):
@@ -463,18 +498,21 @@ def tg(texto: str, tipo: str = "informe"):
 
 
 # ─────────────────────────────────────────────────────── lógica
-def evaluar(symbol, velas, st: Estado):
-    """Devuelve (senal|None, motivo). senal = ('LONG'|'SHORT', datos)."""
-    p = prima(symbol)
-    oi = open_interest(symbol)
+def evaluar(symbol: str, velas: list, p: dict, oi: float, st: Estado,
+            acc: list | None = None):
+    """
+    Devuelve (senal|None, motivo).
+    senal = ('LONG'|'SHORT', datos).
+    p = dict de premium (mark/index/basis/funding)
+    oi = open interest actual
+    """
+    if len(velas) < 60:
+        return None, "pocas velas"
     if p is None:
         return None, "sin premiumIndex"
-    if oi is None:
+    if oi is None or oi <= 0:
         return None, "sin open interest"
 
-    # La muestra se apunta ANTES de cualquier descarte: si un símbolo se salta
-    # el ciclo por velas o por tener una virtual abierta, su historia se queda
-    # con un agujero y el z-score de después se calcula sobre otra cosa.
     ahora = time.time()
     hb = st.basis.setdefault(symbol, deque())
     ho = st.oi.setdefault(symbol, deque())
@@ -483,9 +521,6 @@ def evaluar(symbol, velas, st: Estado):
     horas_ret = float(CFG["HIST_HORAS"])
     _podar(hb, ahora, horas_ret)
     _podar(ho, ahora, horas_ret)
-
-    if len(velas) < 60:
-        return None, "pocas velas"
 
     span = _span_horas(hb)
     min_h = float(CFG["MIN_HORAS"])
@@ -499,10 +534,6 @@ def evaluar(symbol, velas, st: Estado):
         return None, "sin ventana de OI"
     oi_chg = (oi - oi_prev) / oi_prev * 100.0
 
-    # El z del cambio de OI se calcula contra los cambios pasados, no contra
-    # el nivel: el OI crece con el interés del mercado y el nivel no es
-    # comparable consigo mismo de hace un mes. Cada cambio se mide contra el
-    # valor de hace look_h HORAS, no de hace N muestras.
     cambios = _cambios_oi(list(ho), look_h)
     zb = zscore([x[1] for x in hb], p["basis"])
     zo = zscore(cambios, oi_chg)
@@ -512,11 +543,19 @@ def evaluar(symbol, velas, st: Estado):
     cierres = [v["c"] for v in velas[-100:]]
     px = velas[-1]["c"]
     pr = percentil(cierres, px)
+    cierres_reg = [v["c"] for v in velas[-(int(CFG["CONFIRM_WIN"]) + 1):]]
 
     a = atr(velas, int(CFG["ATR_LEN"]))
     atr_pct = a / px * 100.0 if px > 0 else 0.0
     riesgo = float(CFG["SL_ATR"]) * a
     coste_r = (float(CFG["COST_PCT"]) / 100.0 * px) / riesgo if riesgo > 0 else 99.0
+
+    # Aquí es donde el bot tiraba 299 de cada 300 cálculos. Ahora se apuntan
+    # todos: es la misma información, y multiplica por 5.000 la muestra.
+    if acc is not None:
+        acc.append({"symbol": symbol, "px": px, "basis_z": zb, "oi_z": zo,
+                    "pct_precio": pr, "atr_pct": atr_pct,
+                    "funding": p["funding"], "coste_r": coste_r})
 
     largos_amont = zb >= float(CFG["Z_BASIS"]) and zo >= float(CFG["Z_OI"]) and pr >= float(CFG["EXT_PCT"])
     cortos_amont = zb <= -float(CFG["Z_BASIS"]) and zo >= float(CFG["Z_OI"]) and pr <= (100 - float(CFG["EXT_PCT"]))
@@ -528,43 +567,20 @@ def evaluar(symbol, velas, st: Estado):
     if coste_r > float(CFG["MAX_COST_R"]):
         return None, f"coste {coste_r:.2f}R"
 
-    # La cerilla: primera vela EN CONTRA de la multitud.
-    # Estricto exige cerrar fuera del rango de la vela anterior (envolvente);
-    # es una condición dura que además se evalúa sobre la vela EN CURSO, o sea
-    # que se comprueba ~1,6 veces por barra de 15m. Suelto pide solo que la
-    # vela sea contraria y pierda el cierre anterior.
     ult, ant = velas[-1], velas[-2]
-    estricto = bool(CFG["TRIG_ESTRICTO"])
-    if estricto:
-        gira_abajo = ult["c"] < ant["l"] and ult["c"] < ult["o"]
-        gira_arriba = ult["c"] > ant["h"] and ult["c"] > ult["o"]
-    else:
-        gira_abajo = ult["c"] < ant["c"] and ult["c"] < ult["o"]
-        gira_arriba = ult["c"] > ant["c"] and ult["c"] > ult["o"]
-    lado = "SHORT" if (largos_amont and gira_abajo) else "LONG" if (cortos_amont and gira_arriba) else None
+    lado = None
+    if largos_amont and ult["c"] < ant["l"] and ult["c"] < ult["o"]:
+        lado = "SHORT"
+    elif cortos_amont and ult["c"] > ant["h"] and ult["c"] > ult["o"]:
+        lado = "LONG"
     if lado is None:
         return None, "esperando vela en contra"
 
-    # ========== FILTRO CISD ==========
-    cisd = detectar_cisd(velas)
-    if CFG["CISD_ENABLED"]:
-        min_sc = int(CFG["CISD_MIN_SCORE"])
-        es_bull = lado == "LONG"
-        if not (cisd.bullish if es_bull else cisd.bearish):
-            return None, f"sin CISD {'alcista' if es_bull else 'bajista'} ({cisd.motivo})"
-        if cisd.score < min_sc:
-            return None, f"CISD score {cisd.score}<{min_sc}"
-        if CFG["CISD_RETEST"] and not hay_retest(velas, cisd.cisd_price, is_bull=es_bull):
-            return None, f"esperando retest CISD {'alcista' if es_bull else 'bajista'}"
-    # ================================
-
-    reg = cf.calcular(_CFG_OBJ, cierres)
+    reg = cf.calcular(_CFG_OBJ, cierres_reg)
     return (lado, {"px": px, "riesgo": riesgo, "coste_r": coste_r, "zb": zb,
                    "zo": zo, "funding": p["funding"], "atr_pct": atr_pct,
                    "conf_z": reg.z if reg.ok else 0.0,
-                   "conf_regimen": reg.etiqueta if reg.ok else reg.motivo,
-                   "cisd_score": cisd.score,
-                   "cisd_motivo": cisd.motivo}), "señal"
+                   "conf_regimen": reg.etiqueta if reg.ok else reg.motivo}), "señal"
 
 
 def seguir_virtuales(st: Estado, symbol: str, velas):
@@ -579,9 +595,13 @@ def seguir_virtuales(st: Estado, symbol: str, velas):
     largo = v.lado == "LONG"
     salida = motivo = None
     for k in nuevas:
+        favor = (k["h"] - v.entrada) if largo else (v.entrada - k["l"])
+        contra = (v.entrada - k["l"]) if largo else (k["h"] - v.entrada)
+        v.mfe = max(v.mfe, favor / v.riesgo)
+        v.mae = max(v.mae, contra / v.riesgo)
         toca_sl = (k["l"] <= v.sl) if largo else (k["h"] >= v.sl)
         toca_tp = (k["h"] >= v.tp) if largo else (k["l"] <= v.tp)
-        if toca_sl:                      # si tocan los dos, manda el STOP
+        if toca_sl:
             salida, motivo = v.sl, "stop"
             break
         if toca_tp:
@@ -604,6 +624,7 @@ def seguir_virtuales(st: Estado, symbol: str, velas):
         "basis_z": round(v.basis_z, 3), "oi_z": round(v.oi_z, 3),
         "funding": round(v.funding, 5), "atr_pct": round(v.atr_pct, 3),
         "conf_z": round(v.conf_z, 3), "conf_regimen": v.conf_regimen,
+        "mfe": round(v.mfe, 3), "mae": round(v.mae, 3),
     })
     icono = "✅" if neto > 0 else "🔴"
     tg(f"{icono} <b>{v.symbol.split('-')[0]}</b> {v.lado} virtual cerrada por {motivo}: "
@@ -653,8 +674,6 @@ def informe(st: Estado):
                  f"correlacionadas, no {n} independientes")
     if abs(t) < 2:
         L.append("Sin significación: <b>esto todavía no dice nada</b>")
-    # ¿El crowding rinde mejor en régimen reversivo? Esta es la pregunta
-    # que el módulo de régimen está aquí para contestar, no para decidir.
     por_reg: dict[str, list] = {}
     for x in filas:
         por_reg.setdefault(x.get("conf_regimen") or "?", []).append(float(x["r_neto"]))
@@ -669,31 +688,52 @@ def informe(st: Estado):
     return "\n".join(L)
 
 
-# Embudo acumulado desde el arranque. El log de un solo ciclo no sirve para
-# saber si el amontonamiento llega a dispararse alguna vez: si "esperando vela
-# en contra" está a 0 después de días, el cuello está en los z; si sube pero
-# "sin CISD" se lo come todo, el cuello es el CISD.
-EMBUDO: dict[str, int] = {}
-
-
 def ciclo(st: Estado, simbolos: list[str]):
     señales = motivos = 0
     razones: dict[str, int] = {}
+
+    # 1) premiumIndex de TODOS de una sola vez
+    premiums = premium_todos()
+    if not premiums:
+        log.warning("No se pudo obtener premiumIndex global")
+        return
+
+    # 2) Descarga paralela de OI + klines
+    raw: dict[str, dict] = {}
+    workers = max(1, int(CFG["MAX_WORKERS"]))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_fetch_symbol_raw, sym): sym for sym in simbolos}
+        for fut in as_completed(futs):
+            sym = futs[fut]
+            try:
+                data = fut.result()
+                if data:
+                    raw[sym] = data
+            except Exception:
+                log.debug("Error en worker %s", sym, exc_info=True)
+
+    # 3) Evaluación secuencial (estado compartido seguro)
+    acc: list | None = [] if pn.toca(_CFG_OBJ) else None
     for sym in simbolos:
         try:
-            velas = klines(sym, 200)
-            if not velas:
+            data = raw.get(sym)
+            if not data:
                 continue
+            velas = data["velas"]
+            oi = data["oi"]
+            p = premiums.get(sym)
+
             seguir_virtuales(st, sym, velas)
-            sig, motivo = evaluar(sym, velas, st)
             if sym in st.abiertas:
                 continue
+
+            sig, motivo = evaluar(sym, velas, p, oi, st, acc)
             clave = motivo.split("(")[0].strip()
             razones[clave] = razones.get(clave, 0) + 1
-            EMBUDO[clave] = EMBUDO.get(clave, 0) + 1
             motivos += 1
             if sig is None:
                 continue
+
             lado, d = sig
             entrada = d["px"]
             sl = entrada - d["riesgo"] if lado == "LONG" else entrada + d["riesgo"]
@@ -712,29 +752,68 @@ def ciclo(st: Estado, simbolos: list[str]):
                f"<i>Solo señal. El bot no opera.</i>", "senal")
         except Exception:
             log.exception("Fallo evaluando %s", sym)
-        finally:
-            time.sleep(float(CFG["PACING"]))
-    global _ultimo_ciclo
+
+    if acc:
+        escritas = pn.registrar(_CFG_OBJ, acc)
+        if escritas:
+            log.info("Panel: %d filas apuntadas (%s)", escritas, CFG["PANEL_CSV"])
+
+    top = sorted(razones.items(), key=lambda kv: -kv[1])[:4]
+    global _ultimo_ciclo, _ultimo_heartbeat
     ahora = time.time()
     cad = (ahora - _ultimo_ciclo) / 60.0 if _ultimo_ciclo else 0.0
     _ultimo_ciclo = ahora
-    orden = sorted(razones.items(), key=lambda kv: -kv[1])
-    log.info("Ciclo: %d símbolos · %d señales · cadencia %.1f min | %s",
-             motivos, señales, cad, " · ".join(f"{k}: {v}" for k, v in orden))
-    # Sin el acumulado no se distingue "no hay señales" de "nunca llega nadie
-    # al filtro que las corta". Se imprimen TODAS las razones, no las 4 top.
-    acum = sorted(EMBUDO.items(), key=lambda kv: -kv[1])
-    log.info("Embudo acumulado | %s", " · ".join(f"{k}: {v}" for k, v in acum))
+
+    # Progreso de calentamiento
+    min_h = float(CFG["MIN_HORAS"])
+    min_n = int(CFG["MIN_MUESTRAS"])
+    listos = calentando = 0
+    sum_h = sum_n = 0.0
+    for sym in simbolos:
+        hb = st.basis.get(sym)
+        if not hb or len(hb) < 2:
+            calentando += 1
+            continue
+        span = (hb[-1][0] - hb[0][0]) / 3600.0
+        n = len(hb)
+        sum_h += span
+        sum_n += n
+        if span >= min_h and n >= min_n:
+            listos += 1
+        else:
+            calentando += 1
+    total = max(listos + calentando, 1)
+    media_h = sum_h / total
+    media_n = sum_n / total
+
+    if señales > 0 or calentando == 0:
+        log.info("Ciclo: %d símbolos · %d señales · cadencia %.1f min | workers=%d | listos %d/%d · %s",
+                 motivos, señales, cad, workers, listos, total,
+                 " · ".join(f"{k}: {v}" for k, v in top))
+    else:
+        log.info("Ciclo: %d símbolos · 0 señales · cadencia %.1f min | calentando %d/%d "
+                 "(media %.1f h, %.0f muestras) | %s",
+                 motivos, cad, calentando, total, media_h, media_n,
+                 " · ".join(f"{k}: {v}" for k, v in top[:3]))
+
+    # Heartbeat cada ~60 min
+    if ahora - _ultimo_heartbeat >= 3600:
+        _ultimo_heartbeat = ahora
+        msg = (f"💓 <b>Crowding heartbeat</b>\n"
+               f"Universo {len(simbolos)} · listos {listos}/{total}\n"
+               f"Calentando: media {media_h:.1f} h / {media_n:.0f} muestras\n"
+               f"Virtuales abiertas: {len(st.abiertas)}\n"
+               f"Cadencia: {cad:.1f} min")
+        tg(msg, "informe")
+        log.info("Heartbeat: listos %d/%d · media %.1f h · %d virtuales",
+                 listos, total, media_h, len(st.abiertas))
+
     st.guardar()
 
 
 def main():
-    log.info("Crowding bot — SOLO SEÑALES, sin claves de API, %s", CFG["TIMEFRAME"])
-    log.info("Filtros: Z_BASIS=%s Z_OI=%s EXT_PCT=%s · cerilla=%s · CISD=%s score>=%s retest=%s",
-             CFG["Z_BASIS"], CFG["Z_OI"], CFG["EXT_PCT"],
-             "estricta" if CFG["TRIG_ESTRICTO"] else "suelta",
-             "on" if CFG["CISD_ENABLED"] else "off",
-             CFG["CISD_MIN_SCORE"], "on" if CFG["CISD_RETEST"] else "off")
+    log.info("Crowding bot v2.2 — SOLO SEÑALES, sin claves de API, %s | workers=%s",
+             CFG["TIMEFRAME"], CFG["MAX_WORKERS"])
     st = Estado(CFG["STATE"])
     syms = contratos()
     vols = volumenes()
@@ -743,12 +822,13 @@ def main():
         syms.sort(key=lambda s: vols.get(s, 0), reverse=True)
     syms = syms[: int(CFG["MAX_SYMBOLS"])]
     log.info("Universo: %d símbolos", len(syms))
-    tg(f"🤖 <b>Crowding bot arrancado</b>\n{len(syms)} símbolos · {CFG['TIMEFRAME']}\n"
+    tg(f"🤖 <b>Crowding bot v2.2 arrancado</b>\n{len(syms)} símbolos · {CFG['TIMEFRAME']}\n"
+       f"Workers: {CFG['MAX_WORKERS']} · SCAN_SEC: {CFG['SCAN_SEC']}\n"
        f"Avisos: señal {'ON' if CFG['TG_SIGNALS'] else 'off'} · "
        f"cierre {'ON' if CFG['TG_CLOSES'] else 'off'} · informe diario a las "
        f"{CFG['REPORT_HOUR']}:00 UTC\n"
        f"<i>Sin claves de API: solo lee endpoints públicos. No puede operar.</i>\n"
-       f"<i>Necesita ~3 días de calentamiento antes de emitir.</i>")
+       f"<i>Calentamiento: 30 h + 200 muestras por símbolo (~30-35 h de reloj).</i>")
 
     ultimo_universo = time.time()
     while True:
