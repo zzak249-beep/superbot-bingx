@@ -45,6 +45,7 @@ es correcto que no haga nada.
 """
 from __future__ import annotations
 
+import bisect
 import csv
 import json
 import logging
@@ -59,6 +60,7 @@ from datetime import datetime, timezone
 import requests
 
 import confirm as cf
+from cisd import detectar_cisd, hay_retest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -111,6 +113,17 @@ CFG = {
     "TP_R": env("TP_R", 2.0),
     "MAX_BARS": env("MAX_BARS", 16),
     "MIN_ATR_PCT": env("MIN_ATR_PCT", 1.0),
+    # ── CISD ────────────────────────────────────────────────────────────
+    # El umbral de 4 era INALCANZABLE: klines no traía volumen, así que
+    # rel_vol salía siempre 0 y el score no podía pasar de 3 (cisd+ob+fvg).
+    # Ya viene el volumen, pero aun así exigir 4 obliga a que haya FVG en la
+    # misma vela, que es raro. Defecto 2 = CISD + una confirmación.
+    "CISD_ENABLED": env("CISD_ENABLED", True),
+    "CISD_MIN_SCORE": env("CISD_MIN_SCORE", 2),
+    "CISD_RETEST": env("CISD_RETEST", False),
+    # Cerilla: estricto = cierre por debajo del mínimo anterior (envolvente).
+    # Es un filtro duro que se come casi todos los amontonamientos válidos.
+    "TRIG_ESTRICTO": env("TRIG_ESTRICTO", False),
     "COST_PCT": env("COST_PCT", 0.25),
     "MAX_COST_R": env("MAX_COST_R", 0.20),
     "STATE": env("STATE", "/data/crowding_state.json"),
@@ -230,10 +243,12 @@ def klines(symbol: str, limit: int = 200):
         try:
             if isinstance(k, dict):
                 filas.append({"t": int(k["time"]), "o": float(k["open"]), "h": float(k["high"]),
-                              "l": float(k["low"]), "c": float(k["close"])})
+                              "l": float(k["low"]), "c": float(k["close"]),
+                              "v": float(k.get("volume") or k.get("vol") or 0.0)})
             else:
                 filas.append({"t": int(k[0]), "o": float(k[1]), "h": float(k[2]),
-                              "l": float(k[3]), "c": float(k[4])})
+                              "l": float(k[3]), "c": float(k[4]),
+                              "v": float(k[5]) if len(k) > 5 else 0.0})
         except (KeyError, IndexError, TypeError, ValueError):
             continue
     filas.sort(key=lambda x: x["t"])
@@ -301,6 +316,32 @@ def _valor_hace(h: deque, ahora: float, horas: float):
         return None                      # la historia no llega tan atrás
     mejor = min(h, key=lambda p: abs(p[0] - objetivo))
     return mejor[1]
+
+
+def _cambios_oi(lo: list, look_h: float) -> list[float]:
+    """
+    Serie histórica de variación de OI a look_h horas vista.
+
+    La versión anterior copiaba la deque entera en cada iteración y hacía un
+    min() sobre ella: O(n²) con n~1000 muestras y 300 símbolos por ciclo, que
+    es la mayor parte del tiempo de CPU del bot. Aquí es búsqueda binaria.
+    """
+    ts = [p[0] for p in lo]
+    look = look_h * 3600.0
+    out: list[float] = []
+    for i in range(len(lo)):
+        objetivo = ts[i] - look
+        if ts[0] > objetivo:
+            continue                      # la historia no llega tan atrás
+        j = bisect.bisect_left(ts, objetivo, 0, i + 1)
+        mejor = min((k for k in (j - 1, j) if 0 <= k <= i),
+                    key=lambda k: abs(ts[k] - objetivo), default=None)
+        if mejor is None:
+            continue
+        ref = lo[mejor][1]
+        if ref > 0:
+            out.append((lo[i][1] - ref) / ref * 100.0)
+    return out
 
 
 def _span_horas(h: deque) -> float:
@@ -424,9 +465,6 @@ def tg(texto: str, tipo: str = "informe"):
 # ─────────────────────────────────────────────────────── lógica
 def evaluar(symbol, velas, st: Estado):
     """Devuelve (senal|None, motivo). senal = ('LONG'|'SHORT', datos)."""
-    if len(velas) < 60:
-        return None, "pocas velas"
-
     p = prima(symbol)
     oi = open_interest(symbol)
     if p is None:
@@ -434,6 +472,9 @@ def evaluar(symbol, velas, st: Estado):
     if oi is None:
         return None, "sin open interest"
 
+    # La muestra se apunta ANTES de cualquier descarte: si un símbolo se salta
+    # el ciclo por velas o por tener una virtual abierta, su historia se queda
+    # con un agujero y el z-score de después se calcula sobre otra cosa.
     ahora = time.time()
     hb = st.basis.setdefault(symbol, deque())
     ho = st.oi.setdefault(symbol, deque())
@@ -442,6 +483,9 @@ def evaluar(symbol, velas, st: Estado):
     horas_ret = float(CFG["HIST_HORAS"])
     _podar(hb, ahora, horas_ret)
     _podar(ho, ahora, horas_ret)
+
+    if len(velas) < 60:
+        return None, "pocas velas"
 
     span = _span_horas(hb)
     min_h = float(CFG["MIN_HORAS"])
@@ -459,12 +503,7 @@ def evaluar(symbol, velas, st: Estado):
     # el nivel: el OI crece con el interés del mercado y el nivel no es
     # comparable consigo mismo de hace un mes. Cada cambio se mide contra el
     # valor de hace look_h HORAS, no de hace N muestras.
-    lo = list(ho)
-    cambios = []
-    for i in range(len(lo)):
-        ref = _valor_hace(deque(lo[:i + 1]), lo[i][0], look_h)
-        if ref and ref > 0:
-            cambios.append((lo[i][1] - ref) / ref * 100.0)
+    cambios = _cambios_oi(list(ho), look_h)
     zb = zscore([x[1] for x in hb], p["basis"])
     zo = zscore(cambios, oi_chg)
     if zb is None or zo is None:
@@ -490,20 +529,42 @@ def evaluar(symbol, velas, st: Estado):
         return None, f"coste {coste_r:.2f}R"
 
     # La cerilla: primera vela EN CONTRA de la multitud.
+    # Estricto exige cerrar fuera del rango de la vela anterior (envolvente);
+    # es una condición dura que además se evalúa sobre la vela EN CURSO, o sea
+    # que se comprueba ~1,6 veces por barra de 15m. Suelto pide solo que la
+    # vela sea contraria y pierda el cierre anterior.
     ult, ant = velas[-1], velas[-2]
-    lado = None
-    if largos_amont and ult["c"] < ant["l"] and ult["c"] < ult["o"]:
-        lado = "SHORT"
-    elif cortos_amont and ult["c"] > ant["h"] and ult["c"] > ult["o"]:
-        lado = "LONG"
+    estricto = bool(CFG["TRIG_ESTRICTO"])
+    if estricto:
+        gira_abajo = ult["c"] < ant["l"] and ult["c"] < ult["o"]
+        gira_arriba = ult["c"] > ant["h"] and ult["c"] > ult["o"]
+    else:
+        gira_abajo = ult["c"] < ant["c"] and ult["c"] < ult["o"]
+        gira_arriba = ult["c"] > ant["c"] and ult["c"] > ult["o"]
+    lado = "SHORT" if (largos_amont and gira_abajo) else "LONG" if (cortos_amont and gira_arriba) else None
     if lado is None:
         return None, "esperando vela en contra"
+
+    # ========== FILTRO CISD ==========
+    cisd = detectar_cisd(velas)
+    if CFG["CISD_ENABLED"]:
+        min_sc = int(CFG["CISD_MIN_SCORE"])
+        es_bull = lado == "LONG"
+        if not (cisd.bullish if es_bull else cisd.bearish):
+            return None, f"sin CISD {'alcista' if es_bull else 'bajista'} ({cisd.motivo})"
+        if cisd.score < min_sc:
+            return None, f"CISD score {cisd.score}<{min_sc}"
+        if CFG["CISD_RETEST"] and not hay_retest(velas, cisd.cisd_price, is_bull=es_bull):
+            return None, f"esperando retest CISD {'alcista' if es_bull else 'bajista'}"
+    # ================================
 
     reg = cf.calcular(_CFG_OBJ, cierres)
     return (lado, {"px": px, "riesgo": riesgo, "coste_r": coste_r, "zb": zb,
                    "zo": zo, "funding": p["funding"], "atr_pct": atr_pct,
                    "conf_z": reg.z if reg.ok else 0.0,
-                   "conf_regimen": reg.etiqueta if reg.ok else reg.motivo}), "señal"
+                   "conf_regimen": reg.etiqueta if reg.ok else reg.motivo,
+                   "cisd_score": cisd.score,
+                   "cisd_motivo": cisd.motivo}), "señal"
 
 
 def seguir_virtuales(st: Estado, symbol: str, velas):
@@ -608,6 +669,13 @@ def informe(st: Estado):
     return "\n".join(L)
 
 
+# Embudo acumulado desde el arranque. El log de un solo ciclo no sirve para
+# saber si el amontonamiento llega a dispararse alguna vez: si "esperando vela
+# en contra" está a 0 después de días, el cuello está en los z; si sube pero
+# "sin CISD" se lo come todo, el cuello es el CISD.
+EMBUDO: dict[str, int] = {}
+
+
 def ciclo(st: Estado, simbolos: list[str]):
     señales = motivos = 0
     razones: dict[str, int] = {}
@@ -617,11 +685,12 @@ def ciclo(st: Estado, simbolos: list[str]):
             if not velas:
                 continue
             seguir_virtuales(st, sym, velas)
+            sig, motivo = evaluar(sym, velas, st)
             if sym in st.abiertas:
                 continue
-            sig, motivo = evaluar(sym, velas, st)
             clave = motivo.split("(")[0].strip()
             razones[clave] = razones.get(clave, 0) + 1
+            EMBUDO[clave] = EMBUDO.get(clave, 0) + 1
             motivos += 1
             if sig is None:
                 continue
@@ -645,18 +714,27 @@ def ciclo(st: Estado, simbolos: list[str]):
             log.exception("Fallo evaluando %s", sym)
         finally:
             time.sleep(float(CFG["PACING"]))
-    top = sorted(razones.items(), key=lambda kv: -kv[1])[:4]
     global _ultimo_ciclo
     ahora = time.time()
     cad = (ahora - _ultimo_ciclo) / 60.0 if _ultimo_ciclo else 0.0
     _ultimo_ciclo = ahora
+    orden = sorted(razones.items(), key=lambda kv: -kv[1])
     log.info("Ciclo: %d símbolos · %d señales · cadencia %.1f min | %s",
-             motivos, señales, cad, " · ".join(f"{k}: {v}" for k, v in top))
+             motivos, señales, cad, " · ".join(f"{k}: {v}" for k, v in orden))
+    # Sin el acumulado no se distingue "no hay señales" de "nunca llega nadie
+    # al filtro que las corta". Se imprimen TODAS las razones, no las 4 top.
+    acum = sorted(EMBUDO.items(), key=lambda kv: -kv[1])
+    log.info("Embudo acumulado | %s", " · ".join(f"{k}: {v}" for k, v in acum))
     st.guardar()
 
 
 def main():
     log.info("Crowding bot — SOLO SEÑALES, sin claves de API, %s", CFG["TIMEFRAME"])
+    log.info("Filtros: Z_BASIS=%s Z_OI=%s EXT_PCT=%s · cerilla=%s · CISD=%s score>=%s retest=%s",
+             CFG["Z_BASIS"], CFG["Z_OI"], CFG["EXT_PCT"],
+             "estricta" if CFG["TRIG_ESTRICTO"] else "suelta",
+             "on" if CFG["CISD_ENABLED"] else "off",
+             CFG["CISD_MIN_SCORE"], "on" if CFG["CISD_RETEST"] else "off")
     st = Estado(CFG["STATE"])
     syms = contratos()
     vols = volumenes()
