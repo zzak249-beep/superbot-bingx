@@ -251,6 +251,20 @@ def run(frames: dict, btc_pos: dict | None, p: Params):
     return pd.DataFrame(days), pd.DataFrame(trades)
 
 
+def telegram_doc(path: str, caption: str = ""):
+    """Manda el informe completo como archivo (en Railway el disco se borra al terminar)."""
+    tok = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+    chat = os.getenv("TELEGRAM_CHAT_ID")
+    if not tok or not chat or not os.path.exists(path):
+        return
+    try:
+        with open(path, "rb") as f:
+            requests.post(f"https://api.telegram.org/bot{tok}/sendDocument",
+                          data=dict(chat_id=chat, caption=caption[:1000]), files=dict(document=f), timeout=60)
+    except requests.RequestException as e:
+        print(f"Telegram: {e}", file=sys.stderr)
+
+
 def telegram(text: str):
     tok = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
     chat = os.getenv("TELEGRAM_CHAT_ID")
@@ -372,6 +386,8 @@ def main(argv=None, frames_override=None):
         f.write(report)
     print(report)
     telegram("📊 ESTUDIO P12\n" + head.replace("# ", "").strip() + "\n\n" + "\n".join(ver))
+    for fn in ("informe.md", "operaciones.csv", "variantes.csv"):
+        telegram_doc(os.path.join(a.out, fn), "P12 · " + fn)
     return days, trades, report
 
 
