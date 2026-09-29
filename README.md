@@ -13,7 +13,7 @@ La primera vez tarda unos minutos, porque descarga ~105.000 velas por símbolo. 
 
 ```
 python study.py --symbols BTC,ETH,TAO,AAVE --days 540
-python study.py --source bingx --symbols AMP,TRUST     # monedas que no están en Binance
+python study.py --source bingx --symbols AMP,TRUST     # solo si no están en Binance: BingX da ~45 días
 python study.py --no-variants                          # más rápido, sin el barrido de filtros
 ```
 
@@ -21,14 +21,15 @@ python study.py --no-variants                          # más rápido, sin el ba
 
 `railway.json` ya pone `restartPolicyType: NEVER`, así que se ejecuta una vez y para.
 
-**Región Europa.** Binance bloquea las IP de EE. UU. y la región por defecto de Railway es EE. UU.: pon la región en Europa o usa `SOURCE=bingx`.
+**Fuente de datos.** Con `SOURCE=auto` usa la API de Binance y, si esta bloquea la región (Railway está en EE. UU. por defecto), cambia sola al archivo público `data.binance.vision`, que no tiene ese bloqueo. En los dos casos baja el año completo. **No uses `bingx` para el estudio: su API solo da unos 45 días de velas de 5m.**
 
 Variables (raw editor):
 
 ```
 SYMBOLS=BTC,ETH,SOL,XRP,DOGE,BNB,ADA,AVAX,LINK,SUI,TAO,LTC,AAVE,NEAR,TRUMP,ENA,WIF,ARB,ZEC,LDO
 DAYS=365
-SOURCE=binance
+SOURCE=auto
+PYTHONUNBUFFERED=1
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 ```

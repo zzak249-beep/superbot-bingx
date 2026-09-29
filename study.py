@@ -4,7 +4,7 @@ muchos meses con la MISMA lógica que el Pine v4.1.
 
   python study.py                                   # 20 símbolos, 365 días, Binance
   python study.py --symbols BTC,ETH,TAO --days 540
-  python study.py --source bingx --symbols AMP,TRUST
+  python study.py --source bingx --symbols AMP,TRUST   # BingX: solo ~45 días de 5m
 
 Salida: informe en consola + out/informe.md, out/dias.csv, out/operaciones.csv,
 out/variantes.csv. Si TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID existen, manda el veredicto.
@@ -282,7 +282,7 @@ def main(argv=None, frames_override=None):
     ap = argparse.ArgumentParser(description="Estudio P12")
     ap.add_argument("--symbols", default=os.getenv("SYMBOLS", DEFAULT_SYMBOLS))
     ap.add_argument("--days", type=int, default=int(os.getenv("DAYS", "365")))
-    ap.add_argument("--source", default=os.getenv("SOURCE", "binance"), choices=["binance", "bingx"])
+    ap.add_argument("--source", default=os.getenv("SOURCE", "auto").lower(), choices=["auto", "binance", "vision", "bingx"])
     ap.add_argument("--out", default=os.getenv("OUT_DIR", "out"))
     ap.add_argument("--no-variants", action="store_true")
     a = ap.parse_args(argv)
@@ -291,7 +291,7 @@ def main(argv=None, frames_override=None):
     t0 = time.time()
 
     # ── datos
-    frames, failed = {}, []
+    frames, failed, short = {}, [], []
     if frames_override is not None:
         frames = frames_override
     else:
@@ -300,9 +300,14 @@ def main(argv=None, frames_override=None):
             syms.append("BTC")  # referencia para el filtro/desglose BTC
         for s in syms:
             try:
-                df = data.load(s, a.days, a.source)
+                df, src = data.load(s, a.days, a.source)
                 frames[data.norm_symbol(s, "binance")] = df
-                print(f"  {s}: {len(df):,} velas")
+                span = (df.index.max() - df.index.min()).days if len(df) else 0
+                warn = ""
+                if span < a.days * 0.8:
+                    warn = f"  ⚠ solo {span} días de {a.days} (listada hace poco o la fuente no da más)"
+                    short.append(f"{s} {span}d")
+                print(f"  {s}: {len(df):,} velas · {span} días · {src}{warn}", flush=True)
             except Exception as e:
                 failed.append(f"{s} ({e})")
                 print(f"  {s}: FALLO {e}", file=sys.stderr)
@@ -373,6 +378,8 @@ def main(argv=None, frames_override=None):
             f"{dates.min():%Y-%m-%d} → {dates.max():%Y-%m-%d}\n\n" if not days.empty else "# Estudio P12\n\n")
     if failed:
         head += "Símbolos sin datos: " + ", ".join(failed) + "\n\n"
+    if short:
+        head += "Historial más corto de lo pedido: " + ", ".join(short) + "\n\n"
     report = (head + "## Veredicto\n\n" + "\n".join(ver) +
               "\n\n## 1. Afirmaciones del hilo contra la tasa base\n\n" + claims_txt +
               "\n\n## 2. ¿Cuándo se forma el extremo del día?\n\n" + hours_txt +
