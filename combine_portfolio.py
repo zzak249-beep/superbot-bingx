@@ -137,7 +137,7 @@ def worst_week(daily_pnl: pd.Series) -> float:
         return float("nan")
     full_idx = pd.date_range(daily_pnl.index.min(), daily_pnl.index.max(), freq="D")
     s = daily_pnl.reindex(full_idx, fill_value=0.0)
-    rolling7 = s.rolling(7).sum()
+    rolling7 = s.rolling(7, min_periods=1).sum()
     return round(rolling7.min(), 2)
 
 
@@ -161,9 +161,13 @@ def main():
     systems = {}
     for path in args.csvs:
         label = path.stem
+        if label in systems:
+            label = f"{path.stem}_{path.parent.name}"
+        if not path.exists():
+            sys.exit(f"ERROR: no encuentro el archivo {path} (revisa la ruta/nombre).")
         try:
             trades = load_tv_trades(path)
-        except ValueError as e:
+        except Exception as e:
             sys.exit(f"ERROR en {path}: {e}")
         systems[label] = trades
         print(f"[{label}] {len(trades)} operaciones cerradas leídas de {path.name}")
