@@ -9,6 +9,28 @@ EXAMEN del bot de tendencia. Responde tres preguntas antes de arriesgar dinero:
   python backtest.py                         # 40 candidatas, ~5,5 años
   python backtest.py --days 1500 --n 10
 
+CAMBIOS DE ESTA VERSIÓN (ver notas al final del archivo):
+  · --seeds por defecto 5 → 200: con 5 semillas el percentil 95 del ruido es un
+    dato casi tan inestable como el que intenta medir (visto en dos tiradas
+    reales con datos casi idénticos: p95 pasó de 1.08 a 1.23).
+  · El ruido ahora se recalcula POR VARIANTE (antes solo existía para el bot
+    base; comparar "Cesta de 20" contra el p95 de una cesta de 10 no es una
+    comparación válida, porque el ruido de una cartera de 20 activos no es
+    el mismo que el de una de 10).
+  · --shuffle-mode {iid,block}: 'iid' es el barajado original (cada moneda por
+    su cuenta) — destruye también la correlación real entre monedas, no solo
+    la tendencia. 'block' baraja BLOQUES de días completos IGUALES para todas
+    las monedas a la vez, así que un bloque real de 30 días donde BTC y ETH se
+    movieron juntos se sigue moviendo junto en el barajado, solo cambia de
+    sitio en el calendario. Esto es un tira y afloja real, no un blindaje:
+    con bloques pequeños, algo de tendencia real de corto plazo sobrevive
+    DENTRO del bloque (favorece a los lookbacks cortos); con bloques grandes
+    apenas se baraja nada (pocas combinaciones posibles). No hay un tamaño de
+    bloque "correcto" universal — se deja como parámetro para que compares
+    'iid' contra 'block' con un par de tamaños y veas tú mismo cuánto cambia
+    el p95. Si cambia mucho, es una señal de que el resultado depende de qué
+    null se use, no solo de la estrategia.
+
 Salida: consola + out/examen.md, out/equity.csv, out/variantes.csv (+ Telegram si hay token).
 """
 from __future__ import annotations
@@ -110,9 +132,11 @@ def alpha_vs(r: pd.Series, b: pd.Series) -> tuple[float, float, float]:
     return coef[0] * 365, coef[0] / math.sqrt(cov[0, 0]), coef[1]
 
 
-def shuffle_panel(panel: dict, seed: int) -> dict:
-    """Control: baraja los retornos diarios de cada moneda (mismas magnitudes, mismo
-    periodo de cotización, CERO tendencias persistentes)."""
+def shuffle_panel_iid(panel: dict, seed: int) -> dict:
+    """Barajado ORIGINAL: cada moneda con su propia semilla, de forma independiente.
+    Mismas magnitudes y mismo periodo de cotización por moneda, CERO tendencia — pero
+    TAMBIÉN cero correlación real entre monedas (en cripto, alta). Cada moneda 'inventa'
+    su suerte por su cuenta; en la realidad, cuando el mercado se mueve, se mueve junto."""
     rng = np.random.default_rng(seed)
     close = panel["close"].copy()
     for s in close.columns:
@@ -124,6 +148,57 @@ def shuffle_panel(panel: dict, seed: int) -> dict:
         lr = rng.permutation(lr)
         close.loc[v, s] = c[v].iloc[0] * np.exp(np.r_[0, np.cumsum(lr)])
     return dict(index=panel["index"], close=close, qvol=panel["qvol"])
+
+
+def shuffle_panel_block(panel: dict, seed: int, block: int = 30) -> dict:
+    """Alternativa: baraja BLOQUES de `block` días completos, aplicando el MISMO
+    reordenamiento a todas las monedas a la vez. Si BTC y ETH subieron juntos en un
+    bloque real de 30 días, ese bloque se mueve entero a otra fecha, pero siguen
+    subiendo juntos ahí — conserva la correlación cruzada real. Lo que se destruye es
+    la persistencia de tendencia MÁS LARGA que el bloque, no toda tendencia: con
+    block=30, un lookback de 5-20 días puede seguir 'viendo' tendencia real dentro
+    de un bloque, aunque esté en un sitio distinto del calendario. Por eso no hay un
+    tamaño de bloque único correcto: compara un par de tamaños y mira cuánto cambia
+    el resultado antes de fiarte de uno solo."""
+    rng = np.random.default_rng(seed)
+    close = panel["close"]
+    T = len(close)
+    logret = np.log(close).diff()
+    logret.iloc[0] = 0.0
+    starts = list(range(0, T, block))
+    order = rng.permutation(len(starts))
+    row_map = np.concatenate([np.arange(starts[i], min(starts[i] + block, T)) for i in order])
+    row_map = row_map[:T]
+    logret_shuf = pd.DataFrame(logret.to_numpy()[row_map], index=logret.index, columns=logret.columns)
+    new_close = pd.DataFrame(index=close.index, columns=close.columns, dtype=float)
+    for s in close.columns:
+        v = close[s].notna().to_numpy()
+        if v.sum() < 3:
+            continue
+        lr = logret_shuf[s].to_numpy()[v]
+        lr = lr.copy()
+        lr[0] = 0.0
+        new_close.loc[v, s] = close[s][v].iloc[0] * np.exp(np.cumsum(lr))
+    return dict(index=panel["index"], close=new_close, qvol=panel["qvol"])
+
+
+def shuffle_panel(panel: dict, seed: int, mode: str = "iid", block: int = 30) -> dict:
+    if mode == "block":
+        return shuffle_panel_block(panel, seed, block)
+    return shuffle_panel_iid(panel, seed)
+
+
+def noise_sharpe(panel: dict, fund: pd.DataFrame, p: Params, start, seeds: int, mode: str, block: int) -> np.ndarray:
+    """Sharpe de la ESTRATEGIA (no de una cartera pasiva) sobre `seeds` barajados,
+    con los parámetros `p` exactos que se están evaluando (misma cesta, mismos
+    lookbacks...). Se recalcula para cada variante: el ruido de una cesta de 20
+    monedas no es el mismo que el de una de 10."""
+    out = np.full(seeds, np.nan)
+    for sd in range(seeds):
+        pn = shuffle_panel(panel, sd, mode, block)
+        rn = run_all(pn, fund, p).loc[start:]
+        out[sd] = stats(rn["net"])["sharpe"]
+    return out
 
 
 def fmt(x, f="{:+.2f}"):
@@ -171,7 +246,11 @@ def main(argv=None, frames_override=None, fund_override=None):
     ap.add_argument("--source", default=os.getenv("SOURCE", "auto").lower())
     ap.add_argument("--n", type=int, default=int(os.getenv("N_COINS", "10")))
     ap.add_argument("--out", default=os.getenv("OUT_DIR", "out"))
-    ap.add_argument("--seeds", type=int, default=5)
+    ap.add_argument("--seeds", type=int, default=200,
+                    help="Semillas del control de ruido. Con 5, el p95 es casi tan ruidoso como lo que mide.")
+    ap.add_argument("--shuffle-mode", choices=["iid", "block"], default="iid",
+                    help="iid = cada moneda por separado (original). block = bloques de días compartidos entre monedas (conserva correlación real, deja algo de tendencia corta dentro del bloque).")
+    ap.add_argument("--block-size", type=int, default=30, help="Tamaño de bloque en días, solo para --shuffle-mode block.")
     ap.add_argument("--no-variants", action="store_true")
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
@@ -220,13 +299,8 @@ def main(argv=None, frames_override=None, fund_override=None):
     s_tr, s_te = stats(res["net"].iloc[:k]), stats(res["net"].iloc[k:])
     bh_tr, bh_te = stats(bh["net"].iloc[:k]), stats(bh["net"].iloc[k:])
 
-    # ── control de ruido
-    noise = []
-    for sd in range(a.seeds):
-        pn = shuffle_panel(panel, sd)
-        rn = run_all(pn, fund, p).loc[start:]
-        noise.append(stats(rn["net"])["sharpe"])
-    noise = np.array(noise)
+    # ── control de ruido (del bot BASE, con sus propios n_coins)
+    noise = noise_sharpe(panel, fund, p, start, a.seeds, a.shuffle_mode, a.block_size)
     noise_p95 = np.nanpercentile(noise, 95) if len(noise) else np.nan
 
     # ── por año
@@ -237,7 +311,7 @@ def main(argv=None, frames_override=None, fund_override=None):
                       fmt(((1 + btc.loc[g.index].fillna(0)).prod() - 1) * 100, "{:+.0f}%") if btc is not None else "—",
                       fmt(res["exposure"].loc[g.index].mean() * 100, "{:.0f}%")])
 
-    # ── variantes
+    # ── variantes (ahora con SU PROPIO ruido, no el del bot base)
     vrows, vdata = [], []
     if not a.no_variants:
         for name, kw in VARIANTS:
@@ -248,9 +322,14 @@ def main(argv=None, frames_override=None, fund_override=None):
             av, avt, _ = alpha_vs(rv["net"], bv["net"])
             kk = int(len(rv) * 0.7)
             st_, se_ = stats(rv["net"].iloc[:kk]), stats(rv["net"].iloc[kk:])
+            nz_ = noise if not kw else noise_sharpe(panel, fund, pv, start, a.seeds, a.shuffle_mode, a.block_size)
+            nz_p95 = np.nanpercentile(nz_, 95) if len(nz_) else np.nan
+            beats_noise = (not np.isnan(sv["sharpe"])) and (not np.isnan(nz_p95)) and sv["sharpe"] > nz_p95
             vrows.append([name, fmt(sv["cagr"] * 100, "{:+.1f}%"), fmt(sv["sharpe"]), fmt(sv["maxdd"] * 100, "{:.0f}%"),
-                          fmt(av * 100, "{:+.1f}%"), fmt(avt), fmt(st_["sharpe"]), fmt(se_["sharpe"])])
-            vdata.append(dict(variante=name, **sv, alpha=av, alpha_t=avt, sharpe_train=st_["sharpe"], sharpe_test=se_["sharpe"]))
+                          fmt(av * 100, "{:+.1f}%"), fmt(avt), fmt(st_["sharpe"]), fmt(se_["sharpe"]),
+                          fmt(nz_p95), "✅" if beats_noise else "❌"])
+            vdata.append(dict(variante=name, **sv, alpha=av, alpha_t=avt, sharpe_train=st_["sharpe"],
+                               sharpe_test=se_["sharpe"], noise_p95=nz_p95, beats_noise=beats_noise))
         pd.DataFrame(vdata).to_csv(os.path.join(a.out, "variantes.csv"), index=False)
 
     # ── veredicto
@@ -263,7 +342,8 @@ def main(argv=None, frames_override=None, fund_override=None):
                f"caída máx {fmt(s_str['maxdd']*100,'{:.0f}%')} → " + ("✅ gana" if ok_net else "❌ no gana con claridad"))
     ver.append(f"• ¿Aporta la TENDENCIA sobre siempre-comprado con el mismo escalado? alfa {fmt(a_ann*100,'{:+.1f}%')}/año, "
                f"t {fmt(a_t)} (Sharpe {fmt(s_str['sharpe'])} vs {fmt(s_bh['sharpe'])}) → " + ("✅ sí" if ok_trend else "❌ no demostrado"))
-    ver.append(f"• ¿Supera al RUIDO? Sharpe {fmt(s_str['sharpe'])} vs percentil 95 del ruido {fmt(noise_p95)} → " + ("✅ sí" if ok_noise else "❌ no"))
+    ver.append(f"• ¿Supera al RUIDO? Sharpe {fmt(s_str['sharpe'])} vs percentil 95 del ruido {fmt(noise_p95)} "
+               f"({a.seeds} semillas, modo {a.shuffle_mode}) → " + ("✅ sí" if ok_noise else "❌ no"))
     ver.append(f"• ¿Aguanta en el tramo reciente (30% final)? Sharpe {fmt(s_te['sharpe'])} (siempre-comprado {fmt(bh_te['sharpe'])}) → " + ("✅" if ok_test else "❌"))
     n_ok = sum([ok_net, ok_trend, ok_noise, ok_test])
     final = ("🟢 PASA: se puede pasar a DEMO y después a REAL con tamaño pequeño" if n_ok == 4 else
@@ -282,11 +362,13 @@ def main(argv=None, frames_override=None, fund_override=None):
                  ["", "CAGR", "vol", "Sharpe", "caída máx", "t"]) +
               f"\n\nCostes pagados: comisiones {res['cost'].sum()*100:.1f}% del capital · funding {res['funding'].sum()*100:.1f}% · "
               f"exposición media {res['exposure'].mean()*100:.0f}% · beta frente a siempre-comprado {fmt(beta)}" +
-              f"\n\nRuido (retornos barajados, {a.seeds} semillas): Sharpe medio {fmt(np.nanmean(noise))}, p95 {fmt(noise_p95)}" +
+              f"\n\nRuido ({a.shuffle_mode}, {a.seeds} semillas" + (f", bloque {a.block_size}d" if a.shuffle_mode == "block" else "") +
+              f"): Sharpe medio {fmt(np.nanmean(noise))}, p95 {fmt(noise_p95)}" +
               "\n\n## 2. Por año\n\n" + md(yrows, ["Año", "Tendencia", "Siempre comprado", "BTC", "Exposición media"]) +
               ("\n\n## 3. Variantes\n\n" + md(vrows, ["Variante", "CAGR", "Sharpe", "caída", "alfa vs comprado", "t alfa",
-                                                    "Sharpe entren.", "Sharpe prueba"]) +
-               f"\n\n*{len(VARIANTS)} variantes: alguna saldrá mejor por azar. Solo cambies la configuración si mejora en entrenamiento Y en prueba.*"
+                                                    "Sharpe entren.", "Sharpe prueba", "ruido p95 (propio)", "¿bate su ruido?"]) +
+               f"\n\n*{len(VARIANTS)} variantes: alguna saldrá mejor por azar. Solo cambies la configuración si mejora en "
+               f"entrenamiento Y en prueba Y bate su PROPIO ruido (cada variante tiene un p95 distinto, no el del bot base).*"
                if vrows else "") +
               f"\n\n---\nParámetros: {p.to_dict()}\nTiempo: {time.time()-t0:.0f}s\n")
     res.assign(benchmark=bh["net"]).to_csv(os.path.join(a.out, "equity.csv"))
@@ -300,3 +382,50 @@ def main(argv=None, frames_override=None, fund_override=None):
 
 if __name__ == "__main__":
     main()
+
+# ═══════════════════════════════════════════════════════════════════════
+# NOTAS DE LA REVISIÓN
+# ═══════════════════════════════════════════════════════════════════════
+# 1. --seeds 5 → 200. Con 5 semillas, el p95 (que ya de por sí es un estimador
+#    de cola, más ruidoso que una media) se mueve por azar casi tanto como el
+#    resultado que se mide. En dos tiradas reales con datos casi idénticos
+#    (un día de diferencia), el p95 pasó de 1.08 a 1.23 — un salto del 14%
+#    que no puede venir de un día más de datos. 200 semillas no lo arregla
+#    del todo pero lo estabiliza mucho; tiene un coste: 200× más tiempo en
+#    esa parte. Si 200 es demasiado lento en Railway, prueba 50 como mínimo
+#    razonable y compara un par de veces con el mismo `--out` para ver cuánto
+#    todavía se mueve el p95 solo por azar.
+#
+# 2. El ruido ahora se recalcula para CADA variante, con sus propios n_coins/
+#    lookbacks/etc. Antes, la tabla de variantes no comparaba nada contra
+#    ruido; si alguna vez comparaste a ojo el Sharpe de "Cesta de 20" contra
+#    el p95 del bot base (cesta de 10), no era una comparación válida — el
+#    ruido de una cesta de 20 activos no es el mismo que el de una de 10.
+#    Esto es más lento (recalcula `seeds` barajados por cada una de las 11
+#    variantes), así que con 200 semillas y 11 variantes el examen tardará
+#    bastante más que antes. Si hace falta, usa --no-variants para la
+#    exploración rápida y actívalas solo en la tirada final.
+#
+# 3. --shuffle-mode {iid,block}: el barajado original baraja cada moneda por
+#    su cuenta. Eso destruye la tendencia (correcto) pero TAMBIÉN destruye la
+#    correlación real entre monedas (en cripto, alta) — en el ruido, las 10
+#    monedas ya no se mueven juntas nunca, cuando en la realidad sí. No sé
+#    decirte con certeza en qué dirección sesga el p95 sin probarlo: podría
+#    hacer el ruido más fácil de batir (si la falta de diversificación real
+#    en el mercado hace que la estrategia sufra más simultáneamente de lo que
+#    el barajado independiente refleja) o más difícil (si el barajado
+#    independiente infla el Sharpe del ruido al diversificar más de la cuenta
+#    entre 10 sucesos de suerte no correlacionados). Por eso añado 'block'
+#    como alternativa que SÍ conserva la correlación real dentro de cada
+#    bloque de N días, en vez de asegurar una respuesta que no puedo
+#    verificar sin tus datos reales. Es un tira y afloja, no una solución
+#    perfecta: con bloques pequeños (ej. 20-30 días) algo de tendencia real
+#    de corto plazo sobrevive dentro del bloque, favoreciendo a los
+#    lookbacks cortos (5-30) incluso en el "ruido". Con bloques grandes se
+#    baraja tan poco que hay pocas combinaciones distintas posibles.
+#    RECOMENDACIÓN: corre el examen con --shuffle-mode iid y otra vez con
+#    --shuffle-mode block --block-size 30 (y quizá 90), y compara los p95.
+#    Si el veredicto cambia según el modo, es una señal real de que el
+#    resultado es sensible a una decisión metodológica, no un hecho sólido
+#    — y eso en sí mismo es información valiosa antes de arriesgar dinero.
+# ═══════════════════════════════════════════════════════════════════════
